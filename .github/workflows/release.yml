@@ -1,0 +1,62 @@
+name: release
+
+# Publishing is driven by a tag, and only by a tag. npm Trusted Publishing exchanges this
+# workflow's OIDC identity for a short-lived credential, so there is no long-lived
+# NPM_TOKEN anywhere in this repository.
+#
+# Before the first run: on npmjs.com, Package -> Settings -> Trusted Publisher, add this
+# repository, workflow `release.yml`, and create a GitHub environment named `npm` with
+# whatever reviewers the project wants. Requires npm CLI 11.5.1+ (setup-node's bundled
+# npm is new enough as of Node 22).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22"}
+      - run: npm test
+
+      # The tag and the packaged version must agree. Without this, `git tag v0.2.0` on a
+      # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise,
+      # and the mistake is only visible after it is public and immutable.
+      - name: The tag must match the version in package.json
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          built=$(node -p "require('./package.json').version")
+          if [ "$tagged" != "$built" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $built" >&2
+            exit 1
+          fi
+
+      - run: npm pack
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tarball
+          path: "*.tgz"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write      # npm Trusted Publishing and the attestation
+      attestations: write  # build provenance, so a consumer can verify where a file came from
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22", registry-url: "https://registry.npmjs.org"}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tarball
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: "*.tgz"
+      - run: npm publish ./*.tgz --provenance --access public
