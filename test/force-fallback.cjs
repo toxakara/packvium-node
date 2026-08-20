@@ -14,7 +14,19 @@
 
 const Module = require('node:module');
 
+// Exactly what `index.js` probes, and nothing else -- `force-fallback.test.mjs` asserts
+// the two lists stay identical, which is what makes "this hook blocks the package's
+// native backend" a checkable claim rather than a comment.
 const NATIVE_CANDIDATES = ['./packvium-native.node', '@packvium/native'];
+
+// Paths only a test reaches for: the in-workspace build directory the commerce suite
+// loads when it compares the native and fallback backends against each other. Blocked
+// too, because "forced fallback" has to mean forced everywhere -- a suite that loaded
+// the addon by a path this hook did not know would measure the wrong backend and pull a
+// file outside `package.json`'s `files` into the coverage report.
+const TEST_ONLY_CANDIDATES = ['../../packvium-rust/bindings/node'];
+
+const BLOCKED = [...NATIVE_CANDIDATES, ...TEST_ONLY_CANDIDATES];
 
 class NativeBackendBlockedError extends Error {
   constructor(specifier) {
@@ -26,8 +38,8 @@ class NativeBackendBlockedError extends Error {
 
 const nextResolveFilename = Module._resolveFilename;
 Module._resolveFilename = function resolveWithoutNativeBackend(request, parent, isMain, options) {
-  if (NATIVE_CANDIDATES.includes(request)) throw new NativeBackendBlockedError(request);
+  if (BLOCKED.includes(request)) throw new NativeBackendBlockedError(request);
   return nextResolveFilename.call(this, request, parent, isMain, options);
 };
 
-module.exports = { NATIVE_CANDIDATES, NativeBackendBlockedError };
+module.exports = { NATIVE_CANDIDATES, TEST_ONLY_CANDIDATES, NativeBackendBlockedError };

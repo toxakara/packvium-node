@@ -15,7 +15,7 @@ production.
 ## Quick start
 
 ```js
-import { backend, pack } from '@packvium/engine';
+import { backend, commerce, pack } from '@packvium/engine';
 
 const result = pack({
   items: [{
@@ -31,6 +31,79 @@ const result = pack({
 console.log(backend());       // "rust" or "javascript"
 console.log(result.status);   // "feasible"
 console.log(result.containers);
+
+const commerceDocument = { tariffs: [{
+  carrier_id: 'acme', service_id: 'ground',
+  versions: [{
+    effective_at: 0, dimensional_weight_divisor: 5000,
+    cost_per_dimensional_kg_minor: { 'zone-a': 450 },
+    minimum_charge_minor: 900, fuel_surcharge_permille: 120,
+  }],
+}] };
+const quote = commerce.quote(commerceDocument, {
+  carrier_id: 'acme', service_id: 'ground', tariff_version: 1,
+  zone: 'zone-a', actual_weight_g: 1200, volume_mm3: 6000000,
+});
+console.log(quote.quote.total_minor);
+```
+
+## Quotes, policy and catalog versions
+
+`commerce` has three functions, all deterministic and all over one document you supply —
+no clock, no network, no hidden state. A history is a list and a version's number is its
+position in that list starting at 1, so `tariff_version: 2` always means "the second
+entry under this carrier and service".
+
+```js
+import { commerce } from '@packvium/engine';
+
+// Which version applies: pin it, or ask what was in force at an instant. Never both.
+commerce.quote(document, { /* ... */ tariff_version: 1 });
+commerce.quote(document, { /* ... */ as_of: 1500 });
+
+// The decision, and the rule id and version that made it.
+const { decision } = commerce.evaluatePolicy(document, {
+  scope: 'hazmat', context: { un_class: '1.4' }, as_of: 0,
+});
+decision.allowed;              // false
+decision.citation.rule_id;     // "no-hazmat-air"
+
+// Which catalog version a pin resolves to, what it holds, whether it was a rollback.
+const { catalog } = commerce.catalogVersionInfo(document, {
+  catalog_id: 'dc-12', version: 2, resolved_at: 1700,
+});
+catalog.entry_counts;          // { items: 1, cartons: 1, pallets: 0, ... }
+catalog.rolled_back_from;      // 1, or null for an ordinary publication
+
+// Store, log and compare results in the canonical form, not JSON.stringify.
+commerce.canonicalJson(result);
+```
+
+Two kinds of failure, and they are not interchangeable:
+
+- a **malformed** document or request is your bug and throws `CommerceInputError`;
+- a request the model simply **cannot answer** — no tariff effective at that instant, no
+  rate for that zone — is a successful call returning `"status": "rejected"` with a code
+  from a closed set and structured fields naming what was missing.
+
+`commerce.backend()` reports whether the native addon or the JavaScript implementation
+answered; both return the same result for the same input. A runnable walk-through of all
+three functions is in [examples/commerce.mjs](examples/commerce.mjs), and the full
+contract — document format, every result shape, all ten rejection codes, complexity and
+limitations — is `docs/COMMERCE-API.md`.
+
+## Examples
+
+Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
+and execute without a project around it.
+
+| File | What it shows |
+| --- | --- |
+| [`basic.mjs`](examples/basic.mjs) | Pack an order, read placements, and see why an item was refused. |
+| [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+
+```bash
+node examples/basic.mjs
 ```
 
 ## Features
@@ -41,6 +114,8 @@ console.log(result.containers);
 - JSON input/output through `pack()` or `packJson()`.
 - Optional payload rebalancing with `rebalanceWeight()`.
 - Loading and removal sequence helpers for already placed boxes.
+- Deterministic carrier quotes, policy evaluation and effective-dated catalog lookup
+  through `commerce`.
 
 The native addon is optional. `npm install` works on unsupported platforms too; call
 `backend()` if your application needs to know which implementation handled a request.
@@ -48,7 +123,8 @@ The native addon is optional. `npm install` works on unsupported platforms too; 
 ## API and support
 
 TypeScript declarations are included. See the package's `index.d.ts` for the complete
-request and result types. Report security issues through [SECURITY.md](SECURITY.md).
+request and result types, and `docs/COMMERCE-API.md` for the commercial/control-plane
+contract. Report security issues through [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -72,6 +72,9 @@ function chargeMinor(table,grams){
 // property of the request -- this depends on how the search happened to fill the box,
 // so it must lose a candidate rather than abort the run.
 const UNPRICEABLE=Number.MAX_SAFE_INTEGER;
+// One wording for the refusal wherever it fires (outermost solve frame, rebalancing),
+// so the four engines stay literally comparable.
+const unpriceableRefusal=({id,grams,bound})=>new RangeError(`container ${JSON.stringify(id)} bills at ${grams} g, above its rate table's last bracket (${bound} g); the shipment has no published price`);
 const addLanded=(total,template,billedTicks)=>{
   if(total===UNPRICEABLE)return total;
   const charge=template.rate==null?null:chargeMinor(template.rate,billedGrams(billedTicks));
@@ -523,10 +526,12 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
     templates.push({...container,d:inner,outerD:outer,max:container.max_payload==null?null:scalar(container.max_payload,'g',WT),
       tare:scalar(container.tare_weight??0,'g',WT),rate:parseRateTable(container.rate_table)})
   }
-  // `lowest_landed_cost` shares this key with `shipping_cost` deliberately: when a
-  // container is opened its final billed weight is not yet known, so the tariff has
-  // nothing to price. Billable weight is the monotone proxy the key already used, and
-  // the finished answer is priced exactly below.
+  // `lowest_landed_cost` never reaches this path: packFallback forces `compact=null`
+  // for that objective (see the exclusion beside the policy-rule gate), because this
+  // path commits to one container from the billed-weight proxy with no priced
+  // alternative to correct it. The branch below is kept only so the key stays whole for
+  // `shipping_cost`, whose proxy it is; re-enabling compact for landed cost would
+  // resurrect the MAX_SAFE_INTEGER leak, since this return path has no refusal.
   templates.sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'
     ?dimensionalWeight(a.outerD)-dimensionalWeight(b.outerD)||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))
     :(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d)));
@@ -663,6 +668,10 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
       const inner=volume(template.d);if(inner>0n)scoreUnused+=Number((inner-used)*1000000n/inner);
       if(template.d[2]>0)scoreHeight+=Number(BigInt(layers*best.envelope[2])*1000000n/BigInt(template.d[2]));
       scoreAchievedHeight+=layers*best.envelope[2];
+      // `lowest_landed_cost` cannot reach this path (packFallback excludes compact for
+      // it); if it ever could again, `addLanded`'s UNPRICEABLE sentinel would flow into
+      // `score` unrefused -- this return path never checks the finished answer against
+      // the tariff the way the outermost general-path frame does.
       if(objective==='shipping_cost'||objective==='lowest_landed_cost'){
         const billed=Math.max(payload+template.tare,dimensionalWeight(template.outerD));
         if(objective==='shipping_cost')scoreBillable+=billed;else scoreLanded=addLanded(scoreLanded,template,billed);
@@ -774,6 +783,19 @@ const restartLimit=effort?.max_restarts??Number.MAX_SAFE_INTEGER;
 // a k-start request consume up to k*time_limit_ms while still reporting one portfolio
 // deadline, which is both a determinism and an observability defect.
 const deadline=sharedDeadline??new Deadline(req.configuration?.time_limit_ms??1000,clock);
+//  second review: the lowest_landed_cost refusal fires once, at the single
+// outermost frame, on the packing actually selected for return -- the same choke point
+// Rust, Python and PHP refuse at. A child solver/start run instead hands its result
+// back sentinel and all, so a portfolio sibling with a priceable answer is not aborted
+// by one run's refusal. Idempotent: the quality re-entry finalizes inside its callee.
+const finalizeOutermost=result=>{
+  if(solverAlias!==null||startIndex!==null)return result;
+  if(result.unpriceableDetail!=null)throw unpriceableRefusal(result.unpriceableDetail);
+  // Belt and braces behind the portfolio branch's own filter: a sentinel-scored run
+  // must never leave the outermost frame by any route.
+  if(result.alternatives?.length)result.alternatives=result.alternatives.filter(a=>!a.unpriceableDetail);
+  return result
+};
 if(solverAlias===null&&requestedSolvers.length===0&&(req.configuration?.solver_profile??'balanced')==='quality'){
   const child={...req,configuration:{...(req.configuration??{}),solvers:['homogeneous_blocks','extreme_points','maximal_spaces','layer']}};
   return packFallback(child,clock,null,null,deadline)
@@ -803,8 +825,9 @@ if(solverAlias===null&&requestedSolvers.length){
   winner.termination=aggregateTermination(starts);
   winner.algorithm=withPortfolioEffort(winner,runs);
   const alternativeLimit=Math.max(0,(req.configuration?.alternatives??3)-1);
-  winner.alternatives=runs.filter((_,index)=>index!==winnerIndex).sort((a,b)=>compareScore(a.score,b.score)).slice(0,alternativeLimit);
-  return winner;
+  // The sentinel is a search device, never an answer -- alternatives included ( review).
+  winner.alternatives=runs.filter((run,index)=>index!==winnerIndex&&!run.unpriceableDetail).sort((a,b)=>compareScore(a.score,b.score)).slice(0,alternativeLimit);
+  return finalizeOutermost(winner);
 }
 // This value used to be accepted and never read: raising it produced no extra
 // work and no extra start record, so a caller asking for eight restarts got one. Each
@@ -829,7 +852,7 @@ if(startIndex===null&&multiStartOrders>1){
   winner.termination=aggregateTermination(starts);
   winner.algorithm=withPortfolioEffort(winner,runs);
   if(winnerIndex>0)winner.algorithm={...winner.algorithm,solver:`${winner.algorithm.solver}:seeded_${winnerIndex}`};
-  return winner;
+  return finalizeOutermost(winner);
 }
 const u=req.units?.length??'mm',ou=req.output?.length_unit??u,ow=req.output?.weight_unit??'g',clear=scalar(req.configuration?.clearance??0,u,LEN);
 const objective=req.configuration?.objective??'default';if(!['default','lowest_cost','shipping_cost','lowest_landed_cost','open_dimension_height','maximum_value'].includes(objective))throw new RangeError(`unknown objective ${JSON.stringify(objective)}`);
@@ -1177,7 +1200,10 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
     const weights=future.map(item=>profiles.get(item.id).weight).sort((a,b)=>a-b);
     const grossWeight=weights.slice(0,placeable).reduce((sum,value)=>sum+value,work.state.payload+tmpl.tare);
     const billable=objective==='shipping_cost'||objective==='lowest_landed_cost'?Math.max(grossWeight,dimensionalWeight(tmpl.outerD)):0;
-    const landed=objective==='lowest_landed_cost'?addLanded(0,tmpl,billable):0;
+    // A promotional bracket may be cheaper than a lighter bracket, so pricing the
+    // lightest possible completion is not an admissible lower bound. Tariff charges are
+    // non-negative; zero is the general money floor and only loosens this exact search.
+    const landed=0;
     const cost=tmpl.cost_minor??0;
     if(objective==='lowest_cost')return [unpackedFloor,cost,1,unused,height];
     if(objective==='shipping_cost')return [unpackedFloor,billable,1,unused,height];
@@ -1315,7 +1341,21 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
     const trial=packIntoTemplate(tmpl,remaining);
     if(!trial.state.placements.length)continue;
     let score,better;
-    if(solverAlias==='exact_small'){
+    // `lowest_landed_cost` ranks the round in money: the trial's charge first, then
+    // estimated rounds remaining, then progress -- the key order Rust, Python and PHP
+    // use. `planScore`'s finished vector leads with unpacked count, which is
+    // right for whole plans but inverted for one round: an unpriceable-but-roomier
+    // trial out-ranked a priceable one on progress, refusing or over-paying requests
+    // the other three engines ship. The greedy loop commits the trial verbatim, so
+    // its billed weight is final here and the tariff can be read now; an unpriceable
+    // trial still sorts behind every priceable alternative via `addLanded`'s sentinel.
+    if(objective==='lowest_landed_cost'){
+      const placed=trial.state.placements.length;
+      const billed=Math.max(trial.state.payload+tmpl.tare,dimensionalWeight(tmpl.outerD));
+      score=[addLanded(0,tmpl,billed),Math.ceil(remaining.length/Math.max(placed,1)),-placed];
+      const comparison=winnerScore==null?-1:compareScore(score,winnerScore);
+      better=comparison<0||(comparison===0&&tmpl.id<winner.tmpl.id)
+    }else if(solverAlias==='exact_small'){
       score=planScore({packed:[trial.state],remaining:trial.next});
       const comparison=winnerScore==null?-1:compareScore(score,winnerScore);
       better=comparison<0||(comparison===0&&tmpl.id<winner.tmpl.id)
@@ -1365,12 +1405,33 @@ for(const c of packed){scoreCost+=c.tmpl.cost_minor??0;
   if(objective==='shipping_cost'||objective==='lowest_landed_cost'){
     const billed=Math.max(c.payload+c.tmpl.tare,dimensionalWeight(c.tmpl.outerD));
     if(objective==='shipping_cost')scoreBillable+=billed;else scoreLanded=addLanded(scoreLanded,c.tmpl,billed);}}
+// The search ranks an unpriceable packing worst so that any priceable alternative beats
+// it; reaching here means none existed in this run. Returning such a packing would
+// quote a number the carrier never published -- the one outcome `chargeMinor` refuses
+// to invent -- so the refusal fires, but once, at the outermost frame, on the packing
+// actually selected for return: a portfolio sibling with a priceable answer must not be
+// aborted by this run's refusal. Rust, Python and PHP refuse at the same single choke
+// point ( second review). The detail rides the result as a non-enumerable property
+// below, a search device that never serializes.
+let unpriceableDetail=null;
+if(objective==='lowest_landed_cost')for(const c of packed){
+  const grams=billedGrams(Math.max(c.payload+c.tmpl.tare,dimensionalWeight(c.tmpl.outerD))),table=c.tmpl.rate;
+  if(table!=null&&chargeMinor(table,grams)!=null)continue;
+  // A missing table is already refused at admission, so `0` here is unreachable rather
+  // than a real bound -- but reading a bracket off `null` would replace the refusal
+  // with a TypeError, which is the one thing a refusal must not do. Rust, Python and PHP
+  // report the same `0` on the same unreachable branch.
+  unpriceableDetail={id:c.tmpl.id,grams,bound:table==null?0:table.brackets[table.brackets.length-1]};
+  break
+}
 const status=unpacked.length?(timeLimitReached?'time_limit':'best_found'):'feasible',complete=!unpacked.length,effortLimitReached=effortExceeded();
 const solverName=solverAlias?`${solverAlias}:javascript_fallback`:'javascript_fallback';
 const starts=[{id:solverName,started:true,completed:!timeLimitReached&&!effortLimitReached,truncated:timeLimitReached||effortLimitReached,selected:true,global_deadline_reached:timeLimitReached}],termination=aggregateTermination(starts);if(effortLimitReached&&!timeLimitReached)termination.code='effort_limit';
 const scoreValueForgone=remaining.reduce((sum,i)=>sum+(i.value??0),0);
 const defaultScore=[unpacked.length,containers.length,scoreCost,scoreUnused,scoreHeight],score=objective==='lowest_cost'?[defaultScore[0],defaultScore[2],defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='shipping_cost'?[defaultScore[0],scoreBillable,defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='lowest_landed_cost'?[defaultScore[0],scoreLanded,defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='open_dimension_height'?[defaultScore[0],scoreAchievedHeight,defaultScore[1],defaultScore[2],defaultScore[3]]:objective==='maximum_value'?[defaultScore[0],scoreValueForgone,defaultScore[1],defaultScore[2],defaultScore[3]]:defaultScore;
-return {status,feasibility:{code:complete?'feasible':'unknown'},termination,optimality:{code:complete?'not_proven':'best_found'},complete,objective,algorithm:{profile:req.configuration?.solver_profile??'balanced',solver:solverName,duration_ms:0,seed:req.configuration?.seed??42,time_limit_reached:timeLimitReached,effort_limit_reached:effortLimitReached,candidates_evaluated:metrics.feasible_candidates,placements_attempted:metrics.orientations_considered,metrics},summary:{container_count:containers.length,packed_item_count:items.length-unpacked.length,unpacked_item_count:unpacked.length},score,containers,unpacked_items:unpacked,catalog_versions_used:catalogVersionsUsed(req.catalog_versions_used),warnings:['JavaScript fallback is active; build the Rust addon for the native portfolio'],alternatives:[]}}
+const result={status,feasibility:{code:complete?'feasible':'unknown'},termination,optimality:{code:complete?'not_proven':'best_found'},complete,objective,algorithm:{profile:req.configuration?.solver_profile??'balanced',solver:solverName,duration_ms:0,seed:req.configuration?.seed??42,time_limit_reached:timeLimitReached,effort_limit_reached:effortLimitReached,candidates_evaluated:metrics.feasible_candidates,placements_attempted:metrics.orientations_considered,metrics},summary:{container_count:containers.length,packed_item_count:items.length-unpacked.length,unpacked_item_count:unpacked.length},score,containers,unpacked_items:unpacked,catalog_versions_used:catalogVersionsUsed(req.catalog_versions_used),warnings:['JavaScript fallback is active; build the Rust addon for the native portfolio'],alternatives:[]};
+if(unpriceableDetail!=null)Object.defineProperty(result,'unpriceableDetail',{value:unpriceableDetail,enumerable:false,writable:false,configurable:true});
+return finalizeOutermost(result)}
 
 function resultTicks(value,name){
   const ticks=value&&typeof value==='object'&&Number.isSafeInteger(value.ticks)?value.ticks:null;
@@ -1519,8 +1580,39 @@ function publicRebalancedContainers(req,context){
  */
 export function rebalanceWeight(req,result,{maxMoves=64}={}){
   if(!Number.isSafeInteger(maxMoves)||maxMoves<0)throw new RangeError('maxMoves must be a non-negative safe integer');
+  const objective=req.configuration?.objective??'default',dimDivisor=req.configuration?.dimensional_weight_divisor??null;
+  if((objective==='shipping_cost'||objective==='lowest_landed_cost')&&dimDivisor==null)throw new RangeError(`the ${objective} objective requires configuration.dimensional_weight_divisor`);
+  if(objective==='lowest_landed_cost'){
+    const unrated=(req.containers??[]).find(container=>container.rate_table==null);
+    if(unrated!=null)throw new RangeError(`the lowest_landed_cost objective requires a rate_table on every container; ${JSON.stringify(unrated.id)} has none`)
+  }
   const context=rebalanceContext(req,result),moves=[];
   if(!rebalanceValid(context,result))throw new TypeError('result is not a valid packing of this request');
+  //  second review: under `lowest_landed_cost` a move is a re-pricing -- shifting
+  // payload can push a destination past its rate table's last bracket, leaving the
+  // "balanced" packing with no published price. States are priced with the same helpers
+  // the packer bills with: an unpriceable input is refused up front in the standard
+  // words, and a trial that turns any state unpriceable fails exactly like an invalid
+  // one. Gated on the objective and divisor so every other request is byte-identical.
+  let statesPriceable=null;
+  if(objective==='lowest_landed_cost'){
+    const lengthUnit=req.configuration?.dimensional_weight_length_unit??'in',weightUnit=req.configuration?.dimensional_weight_weight_unit??'lb';
+    const dimensionalTicks=d=>Number(volume(d)*BigInt(WT[weightUnit])/(BigInt(LEN[lengthUnit])**3n*BigInt(dimDivisor)));
+    // rebalanceContext keeps the raw rate_table; parse it once per container type with
+    // the packer's own parser so both entry points refuse the same malformed tariffs.
+    const pricing=new Map();
+    const priceEntry=tmpl=>{
+      let entry=pricing.get(tmpl.id);
+      if(entry===undefined){entry={rate:parseRateTable(tmpl.rate_table),dimTicks:dimensionalTicks(tmpl.outerD)};pricing.set(tmpl.id,entry)}
+      return entry};
+    const unpriceableState=state=>{
+      const entry=priceEntry(state.tmpl),payload=state.placements.reduce((total,placement)=>total+placement.item.w,0);
+      const grams=billedGrams(Math.max(payload+state.tmpl.tare,entry.dimTicks));
+      if(entry.rate!=null&&chargeMinor(entry.rate,grams)!=null)return null;
+      return {id:state.tmpl.id,grams,bound:entry.rate==null?0:entry.rate.brackets[entry.rate.brackets.length-1]}};
+    statesPriceable=()=>context.states.every(state=>unpriceableState(state)==null);
+    for(const state of context.states){const detail=unpriceableState(state);if(detail!=null)throw unpriceableRefusal(detail)}
+  }
   for(let moveNumber=0;moveNumber<maxMoves;moveNumber++){
     if(context.states.length<2)break;
     const weights=context.states.map(state=>state.placements.reduce((total,placement)=>total+placement.item.w,0));
@@ -1540,7 +1632,7 @@ export function rebalanceWeight(req,result,{maxMoves=64}={}){
           const [relocated]=trial[sourceIndex].placements.splice(placementIndex,1);
           relocated.x=x;relocated.y=y;relocated.z=z;trial[destinationIndex].placements.push(relocated);
           const originalStates=context.states;context.states=trial;
-          if(rebalanceValid(context,result)){
+          if(rebalanceValid(context,result)&&(statesPriceable==null||statesPriceable())){
             committed={item_id:moving.item.id,from_container_id:originalStates[sourceIndex].publicContainer.id,to_container_id:originalStates[destinationIndex].publicContainer.id};
             break search
           }

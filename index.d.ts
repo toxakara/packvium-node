@@ -51,3 +51,15 @@ export function packJson(input:string):string;
 export function rebalanceWeight(request:PackingRequest,result:PackingResult,options?:{maxMoves?:number}):RebalanceResult;
 export function backend():"rust"|"javascript";
 export function version():string;
+/** One canonical commerce result document: see docs/COMMERCE-API.md. */
+export type CommerceResult=Record<string,unknown>;
+export class CommerceInputError extends Error{readonly name:'CommerceInputError'}
+export const commerce:{
+  backend():"rust"|"javascript";
+  readonly API_VERSION:number;
+  readonly REJECTION_CODES:readonly string[];
+  canonicalJson(result:CommerceResult):string;
+  quote(document:unknown,request:unknown):CommerceResult;
+  evaluatePolicy(document:unknown,request:unknown):CommerceResult;
+  catalogVersionInfo(document:unknown,request:unknown):CommerceResult;
+};
