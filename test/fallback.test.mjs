@@ -1142,11 +1142,124 @@ test('a bracket step makes two different billed weights cost exactly the same', 
   assert.notDeepEqual(billable[0], billable[1]);
 });
 
-test('a weight the tariff does not price ranks worst, never free', () => {
+test('a weight the tariff does not price is never reported as an answer', () => {
   // Billed 1000 g against a ladder that stops at 500 g. Scoring an unpriceable container
-  // as 0 would make this objective actively prefer the packing the caller cannot ship.
-  const result = packFallback(landed({ weight_brackets_g: [500], prices_minor: [700] }, '200 g'));
-  assert.equal(result.score[1], Number.MAX_SAFE_INTEGER);
+  // as 0 would make this objective actively prefer the packing the caller cannot ship,
+  // so it still ranks worst *during* search -- that is what lets a priceable container
+  // win a round. This asks the other half: with no priceable alternative on offer, the
+  // sentinel must not surface. It used to -- the run returned `feasible` with a
+  // landed cost of MAX_SAFE_INTEGER, quoting a price the carrier never published.
+  assert.throws(
+    () => packFallback(landed({ weight_brackets_g: [500], prices_minor: [700] }, '200 g')),
+    /container "c" bills at 1000 g, above its rate table's last bracket \(500 g\); the shipment has no published price/,
+  );
+});
+
+test('an unpriceable container loses to a priceable one in the general greedy path', () => {
+  // Eight units is past the single-item shape the compact path takes, and `try_grid`
+  // stands down for this objective anyway, so this lands in the general per-round key.
+  // That key was `[-placed, cost_minor, unused]` -- it never looked at the objective at
+  // all -- so it chose the snuggest box, and the snuggest box here is the one whose
+  // tariff runs out at 2000 g while it bills at 5400 g. The looser container prices the
+  // same load at 1500. The money-first round key prices each trial instead;
+  // Rust reaches the identical answer through `container_selection_key`.
+  const req = request(
+    [cube('box', 100, { weight: '500 g', quantity: 8 })],
+    [
+      box('alpha_unpriceable', 300, 300, 300, { rate_table: { weight_brackets_g: [2000], prices_minor: [900] } }),
+      box('beta_priceable', 400, 400, 400, { rate_table: { weight_brackets_g: [20000], prices_minor: [1500] } }),
+    ],
+    {
+      configuration: {
+        objective: 'lowest_landed_cost',
+        dimensional_weight_divisor: 5000,
+        dimensional_weight_length_unit: 'cm',
+        dimensional_weight_weight_unit: 'kg',
+      },
+    },
+  );
+  const result = packFallback(req);
+  assert.equal(result.containers.length, 1);
+  assert.equal(result.containers[0].container_type, 'beta_priceable');
+  assert.equal(result.score[1], 1500);
+  assert.equal(result.unpacked_items.length, 0);
+});
+
+test('a bracket step makes the cheaper shipment the heavier one', () => {
+  // Ranking by billed weight and ranking by money agree only while price rises smoothly
+  // with weight. `heavy_but_cheap` bills at 12800 g for 400; `light_but_dear` bills at
+  // 5400 g -- less than half -- for 900. The objective is named lowest_landed_*cost*.
+  const req = request(
+    [cube('box', 100, { weight: '500 g', quantity: 8 })],
+    [
+      box('light_but_dear', 300, 300, 300, { rate_table: { weight_brackets_g: [20000], prices_minor: [900] } }),
+      box('heavy_but_cheap', 400, 400, 400, { rate_table: { weight_brackets_g: [20000], prices_minor: [400] } }),
+    ],
+    {
+      configuration: {
+        objective: 'lowest_landed_cost',
+        dimensional_weight_divisor: 5000,
+        dimensional_weight_length_unit: 'cm',
+        dimensional_weight_weight_unit: 'kg',
+      },
+    },
+  );
+  const result = packFallback(req);
+  assert.equal(result.containers[0].container_type, 'heavy_but_cheap');
+  assert.equal(result.score[1], 400);
+});
+
+test('an unpriceable trial cannot win the round on placing more items', () => {
+  // The snug box holds both bricks but bills 2000 g against a ladder that stops at
+  // 1500 g; the per-unit box ships one brick at 100. A round key that ranked progress
+  // first committed the snug box and refused this request, while Rust, Python and PHP
+  // ship it in two per-unit boxes at 200 ( second review).
+  const req = request(
+    [cube('brick', 100, { weight: '1000 g', quantity: 2 })],
+    [
+      box('snug_unpriceable', 200, 100, 100, { rate_table: { weight_brackets_g: [1500], prices_minor: [900] } }),
+      box('unit_priced', 100, 100, 100, { rate_table: { weight_brackets_g: [1500], prices_minor: [100] } }),
+    ],
+    {
+      configuration: {
+        objective: 'lowest_landed_cost',
+        dimensional_weight_divisor: 5000,
+        dimensional_weight_length_unit: 'cm',
+        dimensional_weight_weight_unit: 'kg',
+      },
+    },
+  );
+  const result = packFallback(req);
+  assert.deepEqual(result.containers.map((c) => c.container_type), ['unit_priced', 'unit_priced']);
+  assert.equal(result.score[1], 200);
+  assert.equal(result.unpacked_items.length, 0);
+});
+
+test('the round key ranks money ahead of progress, matching the other engines', () => {
+  // Both containers are priceable: the snug box takes both bricks in one round for
+  // 5000, the per-unit box takes one brick for 100. Ranking progress first paid the
+  // 5000 -- 25x the answer Rust, Python and PHP return -- and the engines split
+  // silently, because the corpus fixtures tie the placed counts. Money first, two
+  // per-unit rounds at 200 win; the finished score agrees this is the better packing.
+  const req = request(
+    [cube('brick', 100, { weight: '1000 g', quantity: 2 })],
+    [
+      box('snug_dear', 200, 100, 100, { rate_table: { weight_brackets_g: [20000], prices_minor: [5000] } }),
+      box('unit_cheap', 100, 100, 100, { rate_table: { weight_brackets_g: [1500], prices_minor: [100] } }),
+    ],
+    {
+      configuration: {
+        objective: 'lowest_landed_cost',
+        dimensional_weight_divisor: 5000,
+        dimensional_weight_length_unit: 'cm',
+        dimensional_weight_weight_unit: 'kg',
+      },
+    },
+  );
+  const result = packFallback(req);
+  assert.deepEqual(result.containers.map((c) => c.container_type), ['unit_cheap', 'unit_cheap']);
+  assert.equal(result.score[1], 200);
+  assert.equal(result.unpacked_items.length, 0);
 });
 
 test('the compact lattice path no longer commits to an unpriceable container (quality profile)', () => {
@@ -1158,10 +1271,10 @@ test('the compact lattice path no longer commits to an unpriceable container (qu
   // `balanced` general search, prices every candidate container exactly rather than by
   // proxy, so it is the one shape that already gets this right; this pins that it stays
   // right now that the compact path is excluded rather than silently overriding it.
-  //  tracks the residual gap: the default `balanced` profile's own general search
-  // uses the same proxy as the excluded compact path and can still choose wrong on a
-  // larger request, which needs the quality search's exact per-candidate pricing wired
-  // into the default path rather than a fast-path exclusion to close.
+  // The residual gap  tracked -- the default `balanced` profile's general search
+  // sharing the excluded fast path's proxy -- is closed by the per-round key pricing
+  // each trial; `an unpriceable container loses to a priceable one in the general
+  // greedy path` above is the case that used to fail.
   const req = request(
     [cube('dense', 100, { weight: '500 g' })],
     [
@@ -1199,6 +1312,226 @@ test('lowest_landed_cost refuses a request it cannot price', () => {
     [box('c', 200, 200, 200, { rate_table: { weight_brackets_g: [1500], prices_minor: [100] } })],
     { configuration: { objective: 'lowest_landed_cost' } },
   )), /requires configuration\.dimensional_weight_divisor/);
+});
+
+// One pinned solver crams everything into the snug box, the other splits the load and
+// prices it. `extreme_points` (volume-descending) seats the lid first and stacks every
+// brick on it, so both boxes take all nine items in one round; both bill 3300 g, the
+// tie falls to the snug box, and its ladder stops at 2000 g -- unpriceable. `layer`
+// (height-descending) floors the bricks first, which walls the lid out of the spot the
+// other order used, so it ships bricks in the snug box (1350 g billed, 900) and the lid
+// in the roomy one (2500 g billed, 1500).
+const splitPortfolio = (betaBracketG, extra = {}) => request(
+  [
+    { id: 'lid', dimensions: mm(300, 300, 100), weight: '2500 g' },
+    { id: 'brick', dimensions: mm(100, 100, 150), weight: '100 g', quantity: 8 },
+  ],
+  [
+    box('alpha_snug', 300, 300, 300, { rate_table: { weight_brackets_g: [2000], prices_minor: [900] } }),
+    box('beta_room', 400, 400, 250, { rate_table: { weight_brackets_g: [betaBracketG], prices_minor: [1500] } }),
+  ],
+  {
+    configuration: {
+      objective: 'lowest_landed_cost',
+      dimensional_weight_divisor: 20000,
+      dimensional_weight_length_unit: 'cm',
+      dimensional_weight_weight_unit: 'kg',
+      minimum_support_ratio: 1,
+      solvers: ['extreme_points', 'layer'],
+      alternatives: 3,
+      ...extra,
+    },
+  },
+);
+
+test('a portfolio returns the priceable sibling instead of propagating a child run refusal', () => {
+  // The engine used to throw the no-published-price refusal inside the extreme_points
+  // child run, aborting the request its layer sibling could price at 2400. The refusal
+  // now fires once, at the outermost frame, on the packing actually selected for
+  // return -- the choke point Rust, Python and PHP already refuse at ( second
+  // review) -- so the priceable sibling wins on the ordinary score comparison.
+  const result = packFallback(splitPortfolio(2600));
+  assert.equal(result.status, 'feasible');
+  assert.equal(result.score[1], 2400);
+  assert.deepEqual(result.containers.map((container) => container.container_type), ['alpha_snug', 'beta_room']);
+  assert.equal(result.unpacked_items.length, 0);
+  assert.ok(!('unpriceableDetail' in result));
+});
+
+test('alternatives never surface the unpriceable sentinel', () => {
+  // The losing extreme_points run carries score[1] = MAX_SAFE_INTEGER. The sentinel is
+  // a search device, never an answer -- alternatives included ( review): the run
+  // is filtered out rather than offered as a packing costing 2^53-1 minor units.
+  const filtered = packFallback(splitPortfolio(2600));
+  assert.equal(filtered.alternatives.length, 0);
+  assert.ok(!JSON.stringify(filtered).includes('9007199254740991'));
+  // With the roomy box's ladder raised both runs price, the winner flips to the
+  // single-container packing, and the sibling is reported: the filter removes
+  // sentinels, not siblings.
+  const populated = packFallback(splitPortfolio(20000));
+  assert.equal(populated.score[1], 1500);
+  assert.equal(populated.alternatives.length, 1);
+  assert.equal(populated.alternatives[0].score[1], 2400);
+  assert.ok(populated.alternatives.every((alternative) => !('unpriceableDetail' in alternative)));
+  assert.ok(!JSON.stringify(populated).includes('9007199254740991'));
+});
+
+test('a child run hands its unpriceable packing to the portfolio instead of throwing', () => {
+  // Billed 1000 g against a ladder that stops at 500 g, with no sibling to win. The
+  // refusal is the outermost frame's job: a solver child and a seeded-start child must
+  // both return the sentinel-scored result, because throwing there is what aborted
+  // portfolios whose other runs had a priceable answer. The detail steering the
+  // outermost frame is non-enumerable and never serializes.
+  for (const [solverAlias, startIndex] of [['extreme_points', null], [null, 1]]) {
+    const run = packFallback(
+      landed({ weight_brackets_g: [500], prices_minor: [700] }, '200 g'),
+      Date.now, solverAlias, startIndex,
+    );
+    assert.equal(run.score[1], Number.MAX_SAFE_INTEGER);
+    assert.deepEqual(run.unpriceableDetail, { id: 'c', grams: 1000, bound: 500 });
+    assert.equal(Object.getOwnPropertyDescriptor(run, 'unpriceableDetail').enumerable, false);
+    assert.ok(!JSON.stringify(run).includes('unpriceableDetail'));
+  }
+});
+
+test('a portfolio with no priceable run anywhere still refuses at the outermost frame', () => {
+  // Every pinned solver, every seeded start and every quality re-entry reaches the same
+  // unpriceable packing; deferring the refusal to the outermost frame must not soften
+  // it into a sentinel-scored answer.
+  const refusal = /container "c" bills at 1000 g, above its rate table's last bracket \(500 g\); the shipment has no published price/;
+  for (const configuration of [
+    { solvers: ['extreme_points', 'layer'] },
+    { multi_start_orders: 2 },
+    { solver_profile: 'quality' },
+  ]) {
+    const req = landed({ weight_brackets_g: [500], prices_minor: [700] }, '200 g');
+    req.configuration = { ...req.configuration, ...configuration };
+    assert.throws(() => packFallback(req), refusal);
+  }
+});
+
+test('the quality portfolio prices the  scene instead of refusing it', () => {
+  // The second-review scene: eight 500 g cubes, a snug box whose ladder stops at 2000 g
+  // and a roomy one priced to 20000 g. Each quality-profile child settles on the roomy
+  // box, and the portfolio must ship it at 1500 rather than refuse because some frame
+  // ranked the snug box along the way.
+  const req = request(
+    [cube('box', 100, { weight: '500 g', quantity: 8 })],
+    [
+      box('alpha_unpriceable', 300, 300, 300, { rate_table: { weight_brackets_g: [2000], prices_minor: [900] } }),
+      box('beta_priceable', 400, 400, 400, { rate_table: { weight_brackets_g: [20000], prices_minor: [1500] } }),
+    ],
+    {
+      configuration: {
+        objective: 'lowest_landed_cost',
+        solver_profile: 'quality',
+        dimensional_weight_divisor: 5000,
+        dimensional_weight_length_unit: 'cm',
+        dimensional_weight_weight_unit: 'kg',
+      },
+    },
+  );
+  const result = packFallback(req);
+  assert.equal(result.status, 'feasible');
+  assert.equal(result.containers[0].container_type, 'beta_priceable');
+  assert.equal(result.score[1], 1500);
+});
+
+test('rebalancing refuses an input packing the tariff cannot price', () => {
+  // Same admission the solve path applies, in the same words: a packing that already
+  // bills past its rate table's last bracket has no published price to rebalance around.
+  const req = request(
+    [cube('a', 100, { weight: '1000 g' })],
+    [box('c', 200, 200, 200, { rate_table: { weight_brackets_g: [500], prices_minor: [700] } })],
+  );
+  const original = packSound(req);
+  const landedReq = {
+    ...req,
+    configuration: {
+      objective: 'lowest_landed_cost',
+      dimensional_weight_divisor: 8000,
+      dimensional_weight_length_unit: 'cm',
+      dimensional_weight_weight_unit: 'kg',
+    },
+  };
+  assert.throws(
+    () => rebalanceWeight(landedReq, original),
+    /container "c" bills at 1000 g, above its rate table's last bracket \(500 g\); the shipment has no published price/,
+  );
+});
+
+test('rebalancing applies the same landed-cost admission as packing', () => {
+  // The current packing uses only `rated`, but `untabled` remains a request option.
+  // Letting the direct rebalance API ignore it would make its contract weaker than
+  // packFallback and the native implementation ( second review).
+  const base = request(
+    [cube('parcel', 100, { weight: '500 g' })],
+    [box('rated', 200, 200, 200, { rate_table: { weight_brackets_g: [2000], prices_minor: [500] } })],
+  );
+  const original = packSound(base);
+  assert.throws(
+    () => rebalanceWeight({ ...base, configuration: { objective: 'lowest_landed_cost' } }, original),
+    /requires configuration\.dimensional_weight_divisor/,
+  );
+  const withUntabled = {
+    ...base,
+    containers: [...base.containers, box('untabled', 300, 300, 300)],
+    configuration: {
+      objective: 'lowest_landed_cost',
+      dimensional_weight_divisor: 8000,
+      dimensional_weight_length_unit: 'cm',
+      dimensional_weight_weight_unit: 'kg',
+    },
+  };
+  assert.throws(
+    () => rebalanceWeight(withUntabled, original),
+    /requires a rate_table on every container; "untabled" has none/,
+  );
+});
+
+test('a rebalance move that would leave the destination unpriceable is vetoed', () => {
+  // Three 500 g bricks in the big box against a 100 g pebble in the tight one. Moving a
+  // brick narrows the spread from 1400 g to 400 g, but bills the tight box at 600 g
+  // against a ladder that stops at 500 g: under `lowest_landed_cost` that trade sells
+  // balance for a shipment with no published price, so every such candidate fails
+  // exactly like an invalid one. The same scene under the default objective keeps
+  // moving, so anything not landed-priced is untouched by the guard.
+  const req = request(
+    [
+      cube('brick', 100, { weight: '500 g', quantity: 3 }),
+      cube('pebble', 100, { weight: '100 g' }),
+    ],
+    [
+      box('alpha_hold', 300, 300, 300, { max_items: 3, rate_table: { weight_brackets_g: [20000], prices_minor: [900] } }),
+      box('gamma_tight', 200, 200, 200, { max_items: 2, rate_table: { weight_brackets_g: [500], prices_minor: [300] } }),
+    ],
+  );
+  const original = packSound(req);
+  assert.deepEqual(
+    original.containers.map((container) => container.payload_weight.ticks),
+    [1500 * 8_000_000, 100 * 8_000_000],
+  );
+  const landedReq = {
+    ...req,
+    configuration: {
+      objective: 'lowest_landed_cost',
+      dimensional_weight_divisor: 20000,
+      dimensional_weight_length_unit: 'cm',
+      dimensional_weight_weight_unit: 'kg',
+    },
+  };
+  const vetoed = rebalanceWeight(landedReq, original, { maxMoves: 8 });
+  assert.deepEqual(vetoed.moves, []);
+  assert.equal(vetoed.improved, false);
+  assert.deepEqual(vetoed.containers, original.containers);
+  const balanced = rebalanceWeight(req, original, { maxMoves: 8 });
+  assert.deepEqual(balanced.moves, [
+    { item_id: 'brick#1', from_container_id: 'alpha_hold#1', to_container_id: 'gamma_tight#2' },
+  ]);
+  assert.deepEqual(
+    balanced.containers.map((container) => container.payload_weight.ticks),
+    [1000 * 8_000_000, 600 * 8_000_000],
+  );
 });
 
 // ---------------------------------------------------- staged rollout
@@ -1425,6 +1758,28 @@ test('exact_small searches equal-count branches for a better objective tie-break
     repeated.containers[0].placements.map(placement => [placement.item_id, at(placement), placement.orientation]),
     result.containers[0].placements.map(placement => [placement.item_id, at(placement), placement.orientation]),
   );
+});
+
+test('exact_small does not prune a heavier promotional rate band', () => {
+  const payload = request(
+    [
+      cube('a-light', 100, { weight: '100 g' }),
+      cube('b-light', 100, { weight: '100 g' }),
+      cube('z-heavy', 100, { weight: '800 g' }),
+    ],
+    [box('bin', 200, 100, 100, {
+      quantity: 1,
+      rate_table: { weight_brackets_g: [200, 900], prices_minor: [100, 10] },
+    })],
+    { configuration: {
+      solvers: ['exact_small'], objective: 'lowest_landed_cost', max_containers: 1,
+      dimensional_weight_divisor: 10000,
+      dimensional_weight_length_unit: 'cm', dimensional_weight_weight_unit: 'kg',
+    } },
+  );
+  const result = packFallback(payload);
+  assert.deepEqual(result.score.slice(0, 2), [1, 10]);
+  assert.ok(placements(result).some(placement => placement.item_id === 'z-heavy#1'));
 });
 
 test('exact_small stops at an admissible complete objective floor', () => {
