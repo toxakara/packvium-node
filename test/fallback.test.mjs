@@ -40,11 +40,17 @@ const rebalanceFixtureUrl = new URL('../../../../conformance/scene/rebalance-fix
 const sharedRebalanceCase = existsSync(rebalanceFixtureUrl)
   ? JSON.parse(readFileSync(rebalanceFixtureUrl)).cases[0]
   : null;
+// Also workspace-only, and guarded for the same reason as the fixture above: in a
+// published copy this path resolves above the package root, where nothing exists. Loading
+// it unguarded took every job in the mirror's matrix down at module load, on every OS and
+// every Node version, from 2026-08-14 until this guard was added.
 const nestedTopLoadFixtureUrl = new URL(
   '../../conformance/shared/fixtures/regression-grid-cumulative-top-load.json',
   import.meta.url,
 );
-const sharedNestedTopLoadRequest = JSON.parse(readFileSync(nestedTopLoadFixtureUrl));
+const sharedNestedTopLoadRequest = existsSync(nestedTopLoadFixtureUrl)
+  ? JSON.parse(readFileSync(nestedTopLoadFixtureUrl))
+  : null;
 
 test('explanations are deterministic and localization-ready', () => {
   const item = {
@@ -259,7 +265,11 @@ test('general grid propagates top load through adjacent nested items', () => {
   assert.deepEqual(placements(result).map(placement => placement.top_load.ticks), [8_000_000_000, 0]);
 });
 
-test('shared nested lattice honours support ratio, single contact, and cumulative load', () => {
+test('shared nested lattice honours support ratio, single contact, and cumulative load', (t) => {
+  if (sharedNestedTopLoadRequest === null) {
+    t.skip('the shared cross-language fixture corpus is not part of this package');
+    return;
+  }
   const result = packSound(sharedNestedTopLoadRequest);
 
   assert.equal(result.complete, true);
