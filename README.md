@@ -126,6 +126,9 @@ One request and result contract, implemented independently in four engines (Rust
 Python, PHP, JavaScript) and held to identical placements on a shared fixture set.
 Pick the package for your stack; mixing them in one system is safe.
 
+Documentation, the constraint reference and the benchmarks are at
+[packvium.com](https://packvium.com).
+
 | Package | Install | Source |
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
