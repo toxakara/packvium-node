@@ -3,7 +3,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
-  Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError, aggregateTermination,
+  Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
+  BoundOverflowError, __inspectHullShapeForTests, __objectiveBoundsForTests,
+  __occupiesLessThanItsBoxForTests, aggregateTermination,
   explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules,
 } from '../fallback.js';
@@ -50,6 +52,10 @@ const nestedTopLoadFixtureUrl = new URL(
 );
 const sharedNestedTopLoadRequest = existsSync(nestedTopLoadFixtureUrl)
   ? JSON.parse(readFileSync(nestedTopLoadFixtureUrl))
+  : null;
+const hullInternalsUrl = new URL('../../../../conformance/scene/hull-internals.json', import.meta.url);
+const sharedHullInternals = existsSync(hullInternalsUrl)
+  ? JSON.parse(readFileSync(hullInternalsUrl))
   : null;
 
 test('explanations are deterministic and localization-ready', () => {
@@ -1546,16 +1552,43 @@ test('a rebalance move that would leave the destination unpriceable is vetoed', 
 
 // ---------------------------------------------------- staged rollout
 
-test('the guard refuses exactly the fields the unsupported lists name', () => {
+test('the guard refuses exactly the fields the unsupported lists name', (t) => {
   // A field this engine has not implemented is rejected rather than ignored: an engine
   // that reads a request it does not fully understand and answers confidently is
-  // indistinguishable, from the outside, from one that honoured every field. The lists
-  // are empty while this engine is current with the shared schema, and this test is what
-  // holds a future staging to the same guard rather than to a hand-written throw.
+  // indistinguishable, from the outside, from one that honoured every field.
+  //
+  // This used to assert the lists are all empty, which was the same thing while they
+  // were -- and stopped being the same thing the moment  populated two. What the
+  // guard is actually for is that `public-field-matrix.json` records each refusal, so the
+  // shared corpus *asserts* it instead of merely tolerating it. So read the matrix and
+  // compare both directions.
   assert.deepEqual(Object.keys(UNSUPPORTED_FIELDS).sort(),
-    ['configuration', 'container', 'item', 'obstacle', 'request']);
-  const named = Object.values(UNSUPPORTED_FIELDS).flat();
-  assert.deepEqual(named, [], `staged fields still unimplemented: ${named.join(', ')}`);
+    ['configuration', 'container', 'item', 'obstacle', 'request', 'shapeType']);
+  const matrixUrl = new URL(
+    '../../conformance/shared/public-field-matrix.json', import.meta.url);
+  if (!existsSync(matrixUrl)) {
+    t.skip('the shared public-field matrix is not part of this package');
+    return;
+  }
+  const matrix = JSON.parse(readFileSync(matrixUrl, 'utf8'));
+  const rejectedByMatrix = Object.entries(matrix.fields)
+    .filter(([, row]) => matrix.support_sets[row.support].javascript === 'rejected:unsupported_feature')
+    .map(([field]) => field).sort();
+  const declared = new Set([
+    ...UNSUPPORTED_FIELDS.request,
+    ...UNSUPPORTED_FIELDS.configuration.map((name) => `configuration.${name}`),
+    ...UNSUPPORTED_FIELDS.item.map((name) => `items.*.${name}`),
+    ...UNSUPPORTED_FIELDS.container.map((name) => `containers.*.${name}`),
+  ]);
+  // A value-keyed refusal is one matrix row for the field itself. `hull_vertices` is an
+  // array of points, so the schema's leaves -- and therefore its rows -- are the three
+  // coordinates, not the array.
+  if (UNSUPPORTED_FIELDS.shapeType.length) declared.add('items.*.shape_type');
+  if (declared.delete('items.*.hull_vertices')) {
+    for (const axis of 'xyz') declared.add(`items.*.hull_vertices.*.${axis}`);
+  }
+  assert.deepEqual([...declared].sort(), rejectedByMatrix,
+    'the engine and the matrix disagree about what JavaScript refuses');
   const carrying = {
     request: (field) => ({ [field]: {} }),
     configuration: (field) => ({ configuration: { [field]: {} } }),
@@ -1572,6 +1605,244 @@ test('the guard refuses exactly the fields the unsupported lists name', () => {
       assert.ok(error.fields.includes(scope === 'request' ? field : `${scope}.${field}`));
     }
   }
+});
+
+test('the default shape type is served rather than refused', () => {
+  // `rigid_cuboid` is implemented, so spelling the default out must not be a rejection.
+  // This is why `shape_type` is not in the presence-keyed table: that table means "this
+  // engine does not implement the field at all", and a value-keyed refusal is a different
+  // claim. A caller who writes the default explicitly is asking for what they already get.
+  const result = packFallback(request(
+    [{ ...cube('a'), shape_type: 'rigid_cuboid' }], [box('c')]));
+  assert.equal(result.status, 'feasible');
+});
+
+test('a convex hull is packed by its hull rather than its box', () => {
+  //  closed the staged rollout that began with this engine refusing both shapes. Two
+  // complementary halves of one cube share a crate that fits one of their bounding boxes --
+  // the outcome an engine deciding collisions from boxes cannot produce, and the reason the
+  // refusal existed rather than packing a hull as its envelope.
+  const side = 100;
+  const lower = [[0, 0, 0], [side, 0, 0], [0, side, 0], [0, 0, side], [side, 0, side], [0, side, side]];
+  const upper = [[side, side, 0], [side, 0, 0], [0, side, 0], [side, side, side], [side, 0, side], [0, side, side]];
+  const hull = (id, vertices) => ({
+    id, quantity: 1, dimensions: { length: '100', width: '100', height: '100' },
+    shape_type: 'convex_hull',
+    hull_vertices: vertices.map(([x, y, z]) => ({ x: String(x), y: String(y), z: String(z) })),
+  });
+  const result = packFallback(request(
+    [hull('lower', lower), hull('upper', upper)],
+    [{ id: 'crate', inner_dimensions: { length: '100', width: '100', height: '100' } }]));
+  assert.equal(result.status, 'feasible');
+  assert.deepEqual(
+    result.containers.map((container) => container.placements.map((p) => p.item_id).sort()),
+    [['lower#1', 'upper#1']]);
+  // Two bounding boxes would fill the crate twice over; two hulls fill it exactly once.
+  assert.equal(result.containers[0].used_volume_ticks3, String((100 * 16000) ** 3));
+});
+
+test('a routed hull keeps its physical volume when collision falls back to its box', () => {
+  const side = 100;
+  const lower = [[0,0,0],[side,0,0],[0,side,0],[0,0,side],[side,0,side],[0,side,side]];
+  const result = packSound(request([{
+    id: 'routed', dimensions: mm(side, side, side), shape_type: 'convex_hull', stop_index: 0,
+    hull_vertices: lower.map(([x,y,z]) => ({ x: String(x), y: String(y), z: String(z) })),
+  }], [box('crate', side, side, side)]));
+  assert.equal(result.containers[0].used_volume_ticks3, String(BigInt(side * MM) ** 3n / 2n));
+});
+
+test('the shape memo answers a repeated pack exactly as the first one', () => {
+  //  put a process-lifetime memo in front of hull construction, which is where a
+  // determinism regression would hide: a wrong cached entry is invisible on the first call
+  // and only shows on the second. Packing the same request twice in one process is what
+  // distinguishes a memo from a mutation -- the second pack reads every shape from the cache
+  // and must not be able to tell.
+  const side = 100;
+  const lower = [[0, 0, 0], [side, 0, 0], [0, side, 0], [0, 0, side], [side, 0, side], [0, side, side]];
+  const upper = [[side, side, 0], [side, 0, 0], [0, side, 0], [side, side, side], [side, 0, side], [0, side, side]];
+  const hull = (id, vertices) => ({
+    id, quantity: 1, dimensions: { length: '100', width: '100', height: '100' },
+    shape_type: 'convex_hull',
+    hull_vertices: vertices.map(([x, y, z]) => ({ x: String(x), y: String(y), z: String(z) })),
+  });
+  const build = () => packFallback(request(
+    [hull('lower', lower), hull('upper', upper)],
+    [{ id: 'crate', inner_dimensions: { length: '100', width: '100', height: '100' } }]));
+  const first = build();
+  const second = build();
+  assert.deepEqual(second, first);
+  // Named separately from the deep compare: the volume is the number the hull geometry
+  // decides, so a memo handing back a stale or foreign shape shows here first.
+  assert.equal(second.containers[0].used_volume_ticks3, String((100 * 16000) ** 3));
+});
+
+test('the face walk and real-edge set match the numeric cross-language order', (t) => {
+  // These are the three hulls where the former decimal-string minimum selected a non-corner
+  // on one face. A packing-output test cannot catch that: the extra axes are safe and only
+  // make the predicate slower. Pin the actual internals, including order, from the independent
+  // Python port just as PHP and Rust do in their own suites.
+  if (sharedHullInternals === null) {
+    t.skip('the shared cross-language scene fixture is not part of this package');
+    return;
+  }
+  assert.equal(sharedHullInternals.format, 'packvium-hull-internals/v1');
+  const axesAsStrings = axes => axes.map(axis => axis.map(String));
+  for (const one of sharedHullInternals.cases) {
+    const expected = {
+      volume: one.volume,
+      faceAxes: axesAsStrings(one.face_axes),
+      edgeDirections: axesAsStrings(one.edge_directions),
+    };
+    const { vertices } = one;
+    assert.deepEqual(__inspectHullShapeForTests(vertices), expected);
+  }
+});
+
+test('a rotated hull is packed by the hull that rotation actually produces', () => {
+  // The memo is keyed on the item's vertices *and* the orientation. Keying on vertices alone
+  // would pass every test that packs one orientation, and quietly hand a wedge its neighbour's
+  // shape the moment a second rotation was tried -- so the six are asked for by name here.
+  const side = 100;
+  const wedge = [[0, 0, 0], [side, 0, 0], [0, side, 0], [0, 0, side], [side, 0, side], [0, side, side]];
+  const attempt = (rotations) => packFallback(request(
+    [{
+      id: 'w', quantity: 2, dimensions: { length: '100', width: '100', height: '100' },
+      shape_type: 'convex_hull', allowed_rotations: rotations,
+      hull_vertices: wedge.map(([x, y, z]) => ({ x: String(x), y: String(y), z: String(z) })),
+    }],
+    [{ id: 'crate', inner_dimensions: { length: '200', width: '100', height: '100' } }]));
+  const everyOrientation = attempt(['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL']);
+  assert.equal(everyOrientation.status, 'feasible');
+  // Two wedges are half a cube each, whichever way they are turned. The figure is a property
+  // of the shapes, not of the orientation search, so it may not move when the search widens.
+  assert.equal(
+    everyOrientation.containers[0].used_volume_ticks3,
+    String((100 * 16000) ** 3));
+  assert.equal(attempt(['LWH']).containers[0].used_volume_ticks3,
+    everyOrientation.containers[0].used_volume_ticks3);
+});
+
+test('the objective lower bound matches Python on every corpus case', (t) => {
+  //  asks only that this engine's bound never exceed the achieved objective, because
+  // this engine is not held to placement equality. That freedom does not extend to a bound:
+  // it is a function of the request, so a disagreement with Python would be a defect in one
+  // of the two rather than the permitted difference in how they place items. Equality is
+  // achievable here, so equality is what is asserted.
+  const sceneUrl = new URL('../../../../conformance/scene/objective-bounds.json', import.meta.url);
+  if (!existsSync(sceneUrl)) {
+    t.skip('the shared bounds scene is not part of this package');
+    return;
+  }
+  const scene = JSON.parse(readFileSync(sceneUrl));
+  assert.equal(scene.format, 'packvium-objective-bounds/v1');
+  assert.ok(scene.cases.length > 300,
+    'a scene that quietly emptied itself would make every case below vacuous');
+  for (const one of scene.cases) {
+    const instances = one.instances.map((raw) => ({
+      volume: BigInt(raw.volume), weight: BigInt(raw.weight), shrinks: raw.shrinks,
+    }));
+    const containers = one.containers.map((raw) => ({
+      usable: BigInt(raw.usable), inner: BigInt(raw.inner), baseArea: BigInt(raw.base_area),
+      height: BigInt(raw.height),
+      payload: raw.payload === null ? null : BigInt(raw.payload),
+      maxItems: raw.max_items === null ? null : BigInt(raw.max_items),
+      quantity: raw.quantity === null ? null : BigInt(raw.quantity),
+      costMinor: BigInt(raw.cost_minor),
+    }));
+    assert.deepEqual(__objectiveBoundsForTests(instances, containers), one.bounds,
+      `bounds diverge from Python on ${one.fixture}`);
+  }
+});
+
+test('a sum past the declared ceiling is refused rather than answered', () => {
+  // , at the same two inputs Python, PHP and Rust assert. The ceiling is declared
+  // rather than inherited: this engine's `Number` stops being exact past 2^53, PHP's integers
+  // silently become doubles, Python's are unbounded and Rust's i128 wraps. If each refused at
+  // its own limit, a caller would get a number from one engine and a refusal from another for
+  // the same request.
+  const ceiling = 10n ** 30n;
+  const containers = [{ usable: 1000n, inner: 1000n, baseArea: 100n, height: 10n,
+    payload: null, maxItems: null, quantity: 1n, costMinor: 0n }];
+  const three = (volume) => Array.from({ length: 3 },
+    () => ({ volume, weight: 1n, shrinks: false }));
+
+  assert.deepEqual(__objectiveBoundsForTests(three(ceiling / 4n), containers), [3, 0, 0, 0, 0]);
+  assert.throws(() => __objectiveBoundsForTests(three(ceiling / 2n), containers),
+    BoundOverflowError);
+});
+
+test('a bound that cannot cross every binding exactly is refused', () => {
+  // Unlimited inventory used to make the a-priori cost check count one container while L2
+  // opened two. JavaScript then rounded the resulting Number. The result ceiling is lower
+  // than the wide intermediate ceiling precisely because all four ports must return it.
+  const exactPortable = 2n ** 53n - 1n;
+  const instances = [
+    { volume: 1n, weight: 1n, shrinks: false },
+    { volume: 1n, weight: 1n, shrinks: false },
+  ];
+  const containers = [{ usable: 1n, inner: 1n, baseArea: 1n, height: 1n,
+    payload: null, maxItems: 1n, quantity: null, costMinor: exactPortable }];
+
+  assert.throws(() => __objectiveBoundsForTests(instances, containers), BoundOverflowError);
+});
+
+test('each shape that occupies less than its box is recognised', () => {
+  // The scene supplies this flag ready-made so its equality check is about arithmetic alone.
+  // That leaves exactly one thing it cannot catch, and it is the omission  found in
+  // Python: a port checking only `nestingHeight` is unsound for the two irregular shapes,
+  // both of which occupy less than their bounding box for the same reason.
+  assert.equal(__occupiesLessThanItsBoxForTests({ shapeType: 'rigid_cuboid' }), false);
+  assert.equal(__occupiesLessThanItsBoxForTests({ shapeType: 'convex_hull' }), true);
+  assert.equal(__occupiesLessThanItsBoxForTests({ shapeType: 'compressible' }), true);
+  assert.equal(
+    __occupiesLessThanItsBoxForTests({ shapeType: 'rigid_cuboid', nestingHeight: 1 }), true);
+});
+
+test('a shape refuses data belonging to another shape', () => {
+  // Refused rather than ignored: a `compression_ratio` silently dropped on a `convex_hull`
+  // reads back as an item packed to limits it never had.
+  assert.throws(
+    () => packFallback(request([{ ...cube('a'), shape_type: 'convex_hull' }], [box('c')])),
+    /a convex_hull item requires hull_vertices/);
+  assert.throws(
+    () => packFallback(request([{ ...cube('a'), compression_ratio: 0.25 }], [box('c')])),
+    /compression_ratio is not part of a rigid_cuboid item/);
+  assert.throws(
+    () => packFallback(request(
+      [{ ...cube('a'), shape_type: 'compressible', compression_ratio: 0.25 }], [box('c')])),
+    /a compressible item requires both/);
+});
+
+test('a compressible column compresses its own base', () => {
+  // Ordering cannot vary here -- two identical items in a one-footprint crate -- so this is
+  // the scene that makes `compression_ratio` observable in this engine as well as the other
+  // three. The base keeps 87.7% of its height under 50 kg over 0.01 square metres.
+  const cushion = {
+    id: 'cushion', quantity: 2, dimensions: { length: '100', width: '100', height: '100' },
+    weight: { value: '50', unit: 'kg' }, shape_type: 'compressible',
+    compression_ratio: 0.25, max_compression_pressure_kpa: 100,
+  };
+  const result = packFallback(request([cushion],
+    [{ id: 'crate', inner_dimensions: { length: '100', width: '100', height: '200' } }]));
+  assert.equal(result.containers.length, 1);
+  const uncompressed = BigInt((100 * 16000) ** 3) * 2n;
+  assert.ok(BigInt(result.containers[0].used_volume_ticks3) < uncompressed,
+    'the base must give up height under the load above it');
+});
+
+test('a load past the crush limit is refused rather than packed', () => {
+  // A hard boundary, not a worse score: 0.01 square metres under 100 kPa puts it between
+  // 101 kg and 102 kg, close enough to state and far enough from a round number that a
+  // floating-point shortcut would land on the wrong side of it.
+  const scene = (kilograms) => request([
+    { id: 'cushion', quantity: 1, dimensions: { length: '100', width: '100', height: '100' },
+      weight: { value: '2', unit: 'kg' }, must_be_on_floor: true, shape_type: 'compressible',
+      compression_ratio: 0.25, max_compression_pressure_kpa: 100 },
+    { id: 'brick', quantity: 1, dimensions: { length: '100', width: '100', height: '100' },
+      weight: { value: String(kilograms), unit: 'kg' } },
+  ], [{ id: 'crate', inner_dimensions: { length: '100', width: '100', height: '200' } }]);
+  const stacked = (result) => result.containers.some((c) => c.placements.length === 2);
+  assert.equal(stacked(packFallback(scene(102))), false, '102 kg crushes the cushion');
 });
 
 test('a policy rule set is honoured rather than refused', () => {

@@ -25,6 +25,13 @@ function requestLengthTicks(measure, defaultUnit) {
   return Math.round(Number(raw) * LENGTH_TICKS[unit]);
 }
 
+/** A request weight in ticks, defaulting to grams the way the schema does. */
+function requestWeightTicks(measure) {
+  const raw = measure && typeof measure === 'object' ? measure.value : measure;
+  const unit = measure && typeof measure === 'object' ? (measure.unit ?? 'g') : 'g';
+  return Math.round(Number(raw ?? 0) * WEIGHT_TICKS[unit]);
+}
+
 function overlaps(one, other) {
   return one.at.every((start, axis) =>
     start < other.at[axis] + other.size[axis] && start + one.size[axis] > other.at[axis]);
@@ -48,6 +55,7 @@ function boxesOf(container, latticeSequences = new Map()) {
     type: placement.item_type,
     at: corner(placement.position),
     size: size(placement.dimensions),
+    orientation: placement.orientation,
   }));
   const summary = container.lattice_summary;
   if (summary == null) return boxes;
@@ -63,6 +71,7 @@ function boxesOf(container, latticeSequences = new Map()) {
     boxes.push({
       id: `${summary.item_type}#${sequence}`,
       type: summary.item_type,
+      orientation: summary.orientation,
       at: [
         x * envelope[0] + clearance[0],
         y * envelope[1] + clearance[1],
@@ -78,6 +87,144 @@ function boxesOf(container, latticeSequences = new Map()) {
 /**
  * @returns {string[]} one code per violation, empty when the result is sound.
  */
+
+// ---------------------------------------------------------------- irregular geometry
+//
+// The engine's counterpart of this file must not be imported: an independent recompute is the
+// whole point, so the separating-axis rule and the pressure model are written here from
+// docs/IRREGULAR-ITEMS.md. Every product is a `BigInt` -- a projection reaches 2.4e25 while a
+// JavaScript number is exact only to 2^53.
+const vsub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vcross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const vdot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vkey = (v) => `${v[0]},${v[1]},${v[2]}`;
+const vcompare = (left, right) => {
+  for (let axis = 0; axis < 3; axis++) {
+    if (left[axis] < right[axis]) return -1;
+    if (left[axis] > right[axis]) return 1;
+  }
+  return 0;
+};
+function vgcd(a, b) { a = a < 0n ? -a : a; b = b < 0n ? -b : b; while (b) { const t = a % b; a = b; b = t; } return a; }
+function vprimitive(v) {
+  const g = vgcd(vgcd(v[0], v[1]), v[2]);
+  if (g === 0n) return null;
+  const r = [v[0] / g, v[1] / g, v[2] / g];
+  const lead = r.find((x) => x !== 0n);
+  return lead > 0n ? r : [-r[0], -r[1], -r[2]];
+}
+/** The rotation applied to a hull, as a proper rotation: three of the six orientations are odd
+ *  permutations, and a bare permutation would return the item's mirror image. */
+function rotateHull(vertices, orientation) {
+  const axes = { LWH: [0, 1, 2], LHW: [0, 2, 1], WLH: [1, 0, 2], WHL: [1, 2, 0], HLW: [2, 0, 1], HWL: [2, 1, 0] }[orientation];
+  let inversions = 0;
+  for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) if (axes[i] > axes[j]) inversions++;
+  const sign = inversions % 2 ? -1n : 1n;
+  const turned = vertices.map((v) => [sign * v[axes[0]], v[axes[1]], v[axes[2]]]);
+  const low = [0, 1, 2].map((a) => turned.reduce((m, v) => (v[a] < m ? v[a] : m), turned[0][a]));
+  return turned.map((v) => [v[0] - low[0], v[1] - low[1], v[2] - low[2]]);
+}
+/** The solid a placement occupies, in container coordinates: its hull, or its eight box
+ *  corners. Collision replay can deliberately request the route-safe box fallback; physical
+ *  volume never does, because a route changes reachability rather than the authored solid. */
+function solidOf(box, item, lengthUnit, collisionReplay = true) {
+  const corners = [];
+  for (const x of [0n, BigInt(box.size[0])]) for (const y of [0n, BigInt(box.size[1])]) for (const z of [0n, BigInt(box.size[2])]) {
+    corners.push([BigInt(box.at[0]) + x, BigInt(box.at[1]) + y, BigInt(box.at[2]) + z]);
+  }
+  if (item?.shape_type !== 'convex_hull'
+    || (collisionReplay && item.stop_index != null)
+    || item.hull_vertices == null) return corners;
+  const local = item.hull_vertices.map((v) => [
+    BigInt(requestLengthTicks(v.x, lengthUnit)),
+    BigInt(requestLengthTicks(v.y, lengthUnit)),
+    BigInt(requestLengthTicks(v.z, lengthUnit)),
+  ]);
+  return rotateHull(local, box.orientation).map((v) =>
+    [v[0] + BigInt(box.at[0]), v[1] + BigInt(box.at[1]), v[2] + BigInt(box.at[2])]);
+}
+/** Whether two convex solids share interior volume. Touching is contact, not collision. */
+function solidsOverlap(left, right) {
+  const axes = new Map();
+  for (const hull of [left, right]) {
+    for (let i = 0; i < hull.length; i++) for (let j = i + 1; j < hull.length; j++) for (let k = j + 1; k < hull.length; k++) {
+      const axis = vprimitive(vcross(vsub(hull[j], hull[i]), vsub(hull[k], hull[i])));
+      if (axis) axes.set(vkey(axis), axis);
+    }
+  }
+  const directions = (hull) => {
+    const out = [];
+    for (let i = 0; i < hull.length; i++) for (let j = i + 1; j < hull.length; j++) out.push(vsub(hull[j], hull[i]));
+    return out;
+  };
+  for (const a of directions(left)) for (const b of directions(right)) {
+    const axis = vprimitive(vcross(a, b));
+    if (axis) axes.set(vkey(axis), axis);
+  }
+  for (const axis of axes.values()) {
+    const span = (hull) => hull.reduce((acc, v) => {
+      const value = vdot(v, axis);
+      return [value < acc[0] ? value : acc[0], value > acc[1] ? value : acc[1]];
+    }, [vdot(hull[0], axis), vdot(hull[0], axis)]);
+    const [ll, lh] = span(left); const [rl, rh] = span(right);
+    if (lh <= rl || rh <= ll) return false;
+  }
+  return true;
+}
+/** Occupied volume: the hull's own, or the compressed box, or the box. */
+function occupiedVolumeOf(box, item, lengthUnit, loadTicks) {
+  if (item?.shape_type === 'convex_hull' && item.hull_vertices != null) {
+    const solid = solidOf(box, item, lengthUnit, false);
+    let six = 0n;
+    const axes = new Map();
+    for (let i = 0; i < solid.length; i++) for (let j = i + 1; j < solid.length; j++) for (let k = j + 1; k < solid.length; k++) {
+      const axis = vprimitive(vcross(vsub(solid[j], solid[i]), vsub(solid[k], solid[i])));
+      if (!axis) continue;
+      const offset = vdot(solid[i], axis);
+      const sides = solid.map((v) => vdot(v, axis) - offset);
+      if (sides.every((x) => x <= 0n) || sides.every((x) => x >= 0n)) axes.set(vkey(axis), axis);
+    }
+    for (const axis of axes.values()) for (const outward of [axis, [-axis[0], -axis[1], -axis[2]]]) {
+      const extreme = solid.reduce((m, v) => { const value = vdot(v, outward); return value > m ? value : m; }, vdot(solid[0], outward));
+      const face = solid.filter((v) => vdot(v, outward) === extreme);
+      if (face.length < 3) continue;
+      const sorted = [...face].sort(vcompare);
+      const ordered = [sorted[0]]; let current = sorted[0];
+      for (let step = 0; step < sorted.length; step++) {
+        let next = null;
+        for (const candidate of sorted) {
+          if (vkey(candidate) === vkey(current)) continue;
+          if (next === null) { next = candidate; continue; }
+          const turn = vdot(vcross(vsub(next, current), vsub(candidate, current)), outward);
+          const reach = vdot(vsub(candidate, current), vsub(candidate, current));
+          const held = vdot(vsub(next, current), vsub(next, current));
+          if (turn < 0n || (turn === 0n && reach > held)) next = candidate;
+        }
+        if (next === null || vkey(next) === vkey(sorted[0])) break;
+        ordered.push(next); current = next;
+      }
+      for (let i = 1; i + 1 < ordered.length; i++) six += vdot(ordered[0], vcross(ordered[i], ordered[i + 1]));
+    }
+    const magnitude = six < 0n ? -six : six;
+    return magnitude / 6n;
+  }
+  if (item?.max_compression_pressure_kpa == null) return volume(box.size);
+  const footprint = BigInt(box.size[0]) * BigInt(box.size[1]);
+  const metre = 16000n * 1000n;
+  const numerator = BigInt(loadTicks) * 980665n * metre * metre;
+  const denominator = 8000000000n * 100000n * 1000n * footprint;
+  const g = vgcd(numerator, denominator) || 1n;
+  const pressure = { n: numerator / g, d: denominator / g };
+  const limit = BigInt(item.max_compression_pressure_kpa);
+  if (pressure.n > limit * pressure.d) return volume(box.size);
+  if (limit === 0n) return volume(box.size);
+  const ratioPpm = BigInt(Math.floor(item.compression_ratio * 1000000 + 0.5));
+  const divisor = limit * 1000000n * pressure.d;
+  const retained = divisor - ratioPpm * pressure.n;
+  const height = (BigInt(box.size[2]) * retained + divisor - 1n) / divisor;
+  return footprint * (height > 1n ? height : 1n);
+}
+
 export function validate(request, result) {
   const issues = [];
   const itemsById = new Map(request.items.map((item) => [item.id, item]));
@@ -120,7 +267,12 @@ export function validate(request, result) {
       }
 
       for (const other of boxes.slice(index + 1)) {
-        if (overlaps(box, other) && !validNesting(box, other, itemsById, lengthUnit)) {
+        // The axis-aligned test is the broad phase; the exact test refines it only when a hull
+        // is one of the two solids, so an ordinary box pair reaches the same verdict it always
+        // did.
+        if (overlaps(box, other) && !validNesting(box, other, itemsById, lengthUnit)
+          && solidsOverlap(solidOf(box, item, lengthUnit),
+            solidOf(other, itemsById.get(other.type), lengthUnit))) {
           issues.push('collision');
         }
       }
@@ -236,7 +388,24 @@ export function objective(request, result) {
     const inner = size(container.inner_dimensions);
     const total = volume(inner);
     const boxes = boxesOf(container, latticeSequences);
-    let used = boxes.reduce((sum, box) => sum + volume(box.size), 0n);
+    // Occupied volume follows the shape: a hull's own volume, a compressible item's height
+    // after the load above it, otherwise the box. Counting boxes would put two interlocking
+    // wedges at 200% of a crate and would never show a compressible item giving up height.
+    const loadsFor = boxes.some((box) => itemsById.get(box.type)?.max_compression_pressure_kpa != null)
+      ? boxes.map((box) => {
+        let carried = 0n;
+        for (const other of boxes) {
+          if (other === box) continue;
+          const restsAbove = other.at[2] === box.at[2] + box.size[2]
+            && other.at[0] < box.at[0] + box.size[0] && box.at[0] < other.at[0] + other.size[0]
+            && other.at[1] < box.at[1] + box.size[1] && box.at[1] < other.at[1] + other.size[1];
+          if (restsAbove) carried += BigInt(requestWeightTicks(itemsById.get(other.type)?.weight ?? 0));
+        }
+        return carried;
+      })
+      : boxes.map(() => 0n);
+    let used = boxes.reduce((sum, box, index) =>
+      sum + occupiedVolumeOf(box, itemsById.get(box.type), lengthUnit, loadsFor[index]), 0n);
     boxes.forEach((box, index) => {
       for (const other of boxes.slice(index + 1)) {
         if (validNesting(box, other, itemsById, lengthUnit)) {
