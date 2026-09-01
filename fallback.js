@@ -1,4 +1,4 @@
-import { buildContactGraph } from './contact-graph.js';
+import { appendContactBox, buildContactGraph } from './contact-graph.js';
 import { parsePolicy, policyRejection, provesUnplaceable, tagOccurrences } from './policy.js';
 
 const LEN={mm:16000,cm:160000,m:16000000,in:406400,inch:406400,inches:406400,ft:4876800,tick:1,ticks:1};
@@ -20,9 +20,20 @@ const UNSUPPORTED={
   // container, which none of the per-entry loops below would ever see.
   request:[],
   configuration:[],
+  // `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list
+  // in , the last engine to gain both the solver behaviour and the independent
+  // validation the staged rollout requires.
   item:[],
   container:[],
   obstacle:[],
+  // `item.shape_type` values this engine does not implement. Presence is the
+  // wrong test for this one field: `rigid_cuboid` is the default and is implemented, so a
+  // caller that spells the default out must be served, not refused. What is unimplemented
+  // is a *value*, and the refusal names it -- packing a `convex_hull` item as its bounding
+  // box would return a plan that looks valid and does not physically fit.
+  // Empty since : this engine implements every value the schema defines. The guard
+  // stays because the next reserved value will need it.
+  shapeType:[],
 };
 // The admission boundary for staged public-field rollouts, exported so a test can assert
 // that what the lists name is exactly what the guard refuses -- the counterpart of
@@ -91,6 +102,8 @@ function rejectUnsupported(req){const fields=[];
     for(const key of UNSUPPORTED.container)if(hasOwn(raw,key))fields.push(`container.${key}`);
     for(const obstacle of raw.obstacles??[])for(const key of UNSUPPORTED.obstacle)if(hasOwn(obstacle,key))fields.push(`obstacle.${key}`);
   }
+  for(const raw of req.items??[]){const shape=raw?.shape_type;
+    if(typeof shape==='string'&&UNSUPPORTED.shapeType.includes(shape))fields.push(`item.shape_type=${shape}`)}
   if(fields.length)throw new UnsupportedFeatureError([...new Set(fields)].sort());
 }
 function rat(s){s=String(s).trim();if(s.includes(' ')){const [w,f]=s.split(/\s+/,2),[n,d]=f.split('/').map(BigInt),wb=BigInt(w),sg=s.startsWith('-')?-1n:1n,mag=(wb<0n?-wb:wb)*d+n;return [sg*mag,d]}if(s.includes('/')){const[n,d]=s.split('/').map(BigInt);return[n,d]}if(s.includes('.')){const neg=s.startsWith('-'),[a,b]=s.replace(/^[-+]/,'').split('.');const d=10n**BigInt(b.length),n=BigInt(a)*d+BigInt(b);return[neg?-n:n,d]}return[BigInt(s),1n]}
@@ -100,10 +113,558 @@ function dims(v,u){return [scalar(v.length,u,LEN),scalar(v.width,u,LEN),scalar(v
 function rotate(d,r){return ROT[r].map(i=>d[i])}
 function volume(d){return BigInt(d[0])*BigInt(d[1])*BigInt(d[2])}
 function intersects(a,b){return a.x<b.x+b.d[0]&&a.x+a.d[0]>b.x&&a.y<b.y+b.d[1]&&a.y+a.d[1]>b.y&&a.z<b.z+b.d[2]&&a.z+a.d[2]>b.z}
+
+// ---------------------------------------------------------------- irregular geometry
+//
+// The rule is fixed by docs/IRREGULAR-ITEMS.md. Every product here is a `BigInt`, and not for
+// tidiness: a separating axis is a cross product of two edge vectors, so its components grow
+// as the square of a coordinate and a projection grows as the cube. At the shared coordinate
+// cap a cross product reaches 8e16 and a projection 2.4e25, while a JavaScript number is exact
+// only to 2^53 ~ 9e15. Both would silently lose precision, and a collision predicate that
+// rounds returns a plan that validates and does not fit. Rust carries the same arithmetic in
+// `i128`; PHP needs a decimal-string fallback; here `BigInt` is already the house answer, used
+// for load distribution since the first port.
+
+/** Largest vertex coordinate a hull may carry, in ticks -- 6.25 m. Shared with every engine:
+ *  they must refuse the same hulls or they disagree about which requests are legal. */
+const MAX_HULL_COORDINATE=100000000;
+const UNIT_AXES=[[1n,0n,0n],[0n,1n,0n],[0n,0n,1n]];
+const sub3=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const cross3=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const dot3=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const big3=v=>[BigInt(v[0]),BigInt(v[1]),BigInt(v[2])];
+function bigGcd(a,b){a=a<0n?-a:a;b=b<0n?-b:b;while(b){const t=a%b;a=b;b=t}return a}
+/** Divide out the gcd and fix the sign, so parallel axes collapse to one entry. `null` for the
+ *  zero vector: a cross product of parallel directions names no axis, an ordinary outcome. */
+function primitiveAxis(v){
+  const g=bigGcd(bigGcd(v[0],v[1]),v[2]);
+  if(g===0n)return null;
+  const r=[v[0]/g,v[1]/g,v[2]/g];
+  const lead=r.find(x=>x!==0n);
+  return lead>0n?r:[-r[0],-r[1],-r[2]];
+}
+const axisKey=v=>`${v[0]},${v[1]},${v[2]}`;
+/** Lexicographic order on the vertex vector itself. `axisKey` is for identity, never order. */
+const compareVertices=(l,r)=>{
+  for(let i=0;i<3;i++)if(l[i]!==r[i])return l[i]<r[i]?-1:1;
+  return 0;
+};
+/** Canonicalise an authored vertex list or refuse a hull with no interior. A zero-volume hull
+ *  is separated from everything on its own normal, so it would pass through every other item
+ *  and still be reported as a valid placement. */
+function hullValidate(vertices){
+  const points=vertices.map(v=>[Number(v[0]),Number(v[1]),Number(v[2])]);
+  if(points.length<4)throw new RangeError(`a convex hull needs at least 4 vertices, got ${points.length}`);
+  if(new Set(points.map(axisKey)).size!==points.length)throw new RangeError('convex hull vertices must be unique');
+  if(points.some(v=>v.some(c=>Math.abs(c)>MAX_HULL_COORDINATE)))
+    throw new RangeError(`convex hull coordinates must stay within ${MAX_HULL_COORDINATE} ticks`);
+  const b=points.map(big3);
+  for(let i=0;i<b.length;i++)for(let j=i+1;j<b.length;j++)for(let k=j+1;k<b.length;k++)for(let l=k+1;l<b.length;l++)
+    if(dot3(sub3(b[l],b[i]),cross3(sub3(b[j],b[i]),sub3(b[k],b[i])))!==0n)return points;
+  throw new RangeError('convex hull vertices are coplanar and enclose no volume');
+}
+/** Does the plane through `origin` with normal `axis` leave every vertex on one side? */
+function isSupporting(points,origin,axis){
+  const offset=dot3(origin,axis);let above=false,below=false;
+  for(const v of points){const side=dot3(v,axis)-offset;
+    if(side>0n)above=true;else if(side<0n)below=true;
+    if(above&&below)return false}
+  return true;
+}
+/** Corners of one planar convex face, in cyclic order seen from outside.
+ *
+ *  The vertices sharing a supporting plane are not all corners of the polygon they lie on: one
+ *  can sit inside the face or part-way along an edge, and fanning over the raw set triangulates
+ *  the wrong region -- the surface then fails to close and the volume is wrong. Gift-wrapping
+ *  keeps only the corners, resolving collinear candidates to the farthest so an edge-interior
+ *  vertex is walked past rather than doubled back through. */
+function windFace(face,outward){
+  // By the vertex vector, never its decimal encoding: the walk is only correct because it
+  // starts from a corner, which it earns by starting from the smallest vertex under a genuine
+  // linear order. String order is not one -- "10,0,0" sorts before "9,0,0" -- so it can name a
+  // vertex lying inside the face and make the walk emit a segment that is not a hull edge.
+  const sorted=[...face].sort(compareVertices);
+  const ordered=[sorted[0]];let current=sorted[0];
+  for(let step=0;step<sorted.length;step++){
+    let next=null;
+    for(const candidate of sorted){
+      if(axisKey(candidate)===axisKey(current))continue;
+      if(next===null){next=candidate;continue}
+      const turn=dot3(cross3(sub3(next,current),sub3(candidate,current)),outward);
+      const reach=dot3(sub3(candidate,current),sub3(candidate,current));
+      const held=dot3(sub3(next,current),sub3(next,current));
+      if(turn<0n||(turn===0n&&reach>held))next=candidate;
+    }
+    if(next===null||axisKey(next)===axisKey(sorted[0]))break;
+    ordered.push(next);current=next;
+  }
+  return ordered;
+}
+/** Every face of the hull, each as its own corners in outward cyclic order.
+ *
+ *  One walk, because the faces answer two questions at once: the volume needs them wound
+ *  consistently, and the hull's edges are the consecutive corner pairs of the same walk. A
+ *  plane carrying fewer than three vertices is an edge or a corner of the hull, not a face,
+ *  and carries no edge its two adjoining faces do not already carry. */
+function woundFaces(points,faceAxes){
+  const faces=[];
+  for(const axis of faceAxes)for(const outward of [axis,[-axis[0],-axis[1],-axis[2]]]){
+    let extreme=null;
+    for(const v of points){const value=dot3(v,outward);if(extreme===null||value>extreme)extreme=value}
+    const face=points.filter(v=>dot3(v,outward)===extreme);
+    if(face.length<3)continue;
+    faces.push(windFace(face,outward));
+  }
+  return faces;
+}
+/** Exact volume in cubic ticks, by the divergence theorem over the hull's own faces. */
+function hullVolume(faces){
+  let six=0n;
+  for(const ordered of faces){
+    const apex=ordered[0];
+    for(let i=1;i+1<ordered.length;i++)six+=dot3(apex,cross3(ordered[i],ordered[i+1]));
+  }
+  const magnitude=six<0n?-six:six;
+  return magnitude/6n;
+}
+/** Directions of the hull's real edges, deduplicated and canonical.
+ *
+ *  Every edge of a convex polyhedron is shared by exactly two faces, so walking each wound
+ *  face and taking its consecutive corner pairs -- closing the cycle -- reaches all of them.
+ *  The separating-axis theorem asks for exactly these, not for every vertex pair.
+ *
+ *  The distinction is the whole cost of the predicate. A hull has at most `3v - 6` edges but
+ *  `v(v - 1) / 2` vertex pairs, and the axis set is the *product* of two hulls' sets, so the
+ *  gap squares: on a 20-vertex hull, 1351 candidate axes rather than 15616. Vertex pairs were
+ *  never wrong, only a superset -- a pair that is not an edge names a direction no face can
+ *  separate along, so it can add an axis but never remove one. */
+function hullEdges(faces){
+  const edges=new Map();
+  for(const ordered of faces)for(let i=0;i<ordered.length;i++){
+    const axis=primitiveAxis(sub3(ordered[(i+1)%ordered.length],ordered[i]));
+    if(axis)edges.set(axisKey(axis),axis);
+  }
+  return [...edges.values()].sort(compareVertices);
+}
+/** A hull's separating axes and volume in its own local frame, computed once per shape. */
+function hullShape(vertices){
+  const points=hullValidate(vertices).map(big3);
+  const faces=new Map();
+  for(let i=0;i<points.length;i++)for(let j=i+1;j<points.length;j++){
+    for(let k=j+1;k<points.length;k++){
+      // A triple whose plane cuts through the solid is not a face, and its normal separates
+      // nothing the real face normals do not.
+      const axis=primitiveAxis(cross3(sub3(points[j],points[i]),sub3(points[k],points[i])));
+      if(axis&&isSupporting(points,points[i],axis))faces.set(axisKey(axis),axis);
+    }
+  }
+  const faceAxes=[...faces.values()].sort(compareVertices);
+  const wound=woundFaces(points,faceAxes);
+  return {v:points,faces:faceAxes,edges:hullEdges(wound),volume:hullVolume(wound)};
+}
+/** A copied, string-exact view used only by this module's direct tests.
+ *
+ *  `fallback.js` is an internal package file: package.json exposes only `index.js`, which does
+ *  not re-export this function. Keeping the probe beside the algorithm lets the suite assert
+ *  edge identity and ordering without widening `@packvium/native`'s public API or handing a
+ *  mutable cached shape to a caller. */
+export function __inspectHullShapeForTests(vertices){
+  const shape=hullShape(vertices),copy=axes=>axes.map(axis=>axis.map(value=>value.toString()));
+  return {volume:shape.volume.toString(),faceAxes:copy(shape.faces),edgeDirections:copy(shape.edges)};
+}
+/** How many rotated hulls stay resident, before the memo is dropped and refilled. A request is
+ *  bounded by its distinct hull items times the six orientations, so this holds far more than
+ *  any request the solver is sized for -- and bounded, rather than growing for the life of the
+ *  process. */
+const SHAPE_CACHE_ENTRIES=1024;
+const shapeCache=new Map();
+/** The rotated hull of one item in one orientation, built at most once.
+ *
+ *  A hull depends on the item and the orientation and on nothing about where a candidate sits,
+ *  but the collision predicate was rebuilding it on every call -- `O(v^4)` work inside an
+ *  `O(n^2)` loop. Measured on the two-wedge fixture: 78 builds for two items, where twelve are
+ *  the floor.
+ *
+ *  Memoisation is safe here in the way it is not in general: the shape is never mutated after
+ *  it is built, the key is the whole of what determines the value, and callers only project
+ *  through it. Determinism is untouched -- this changes how often the answer is computed,
+ *  never what it is. */
+function shapeFor(vertices,rotation){
+  const key=rotation+'|'+vertices.map(v=>v.join(',')).join(';');
+  const found=shapeCache.get(key);
+  if(found!==undefined)return found;
+  const shape=hullShape(hullRotate(vertices,rotation));
+  if(shapeCache.size>=SHAPE_CACHE_ENTRIES)shapeCache.clear();
+  shapeCache.set(key,shape);
+  return shape;
+}
+/** A cuboid, built without searching for its own faces: both sets are the three unit axes. */
+/** Lower bounds on the objective vector.
+ *
+ *  The mathematics is fixed by docs/OPTIMALITY-CERTIFICATES.md. This is an independent
+ *  implementation written from that document, and `conformance/scene/objective-bounds.json`
+ *  holds it to the same vectors Python computes on 380 cases from the golden corpus.
+ *
+ *   asks only for soundness -- the bound must never exceed the achieved objective --
+ *  because this engine is not held to placement equality. That freedom does not extend to a
+ *  bound: it is a function of the *request*, so there is no room for a legitimately different
+ *  answer, and this port is held to equality because equality is achievable and stronger.
+ *
+ *  `BigInt` throughout for volumes. A one-metre cube is 4.1e21 cubic ticks, past what a
+ *  double represents exactly, and the widest intermediate multiplies a summed volume by 1e6.
+ *  Counts, weights, costs and the parts-per-million keys come back to `Number` only once the
+ *  arithmetic has reduced them to that scale.
+ *
+ *  `O(n log n + c log c)` for `n` instances and `c` container types: one sort of the volumes,
+ *  one of the weights, one of the per-unit costs. No geometry is touched. */
+const BOUND_PPM=1000000n;
+/** Every sum in the bound path must stay below this.
+ *
+ *  Declared rather than inherited. This engine's `Number` stops being exact past 2^53, PHP's
+ *  integers silently become doubles on overflow, Python's are unbounded and Rust's `i128`
+ *  wraps -- so if each refused at its own limit the four would disagree about which requests
+ *  are answerable. Keys 3 and 4 multiply a summed volume by `PPM`, so `10^30 * 10^6` sits
+ *  about 170-fold inside an `i128`. Everything guarded here is `BigInt`, because a ceiling a
+ *  representation cannot hold is a ceiling it cannot enforce. */
+const MAX_BOUND_SUM=10n**30n;
+// Results cross the JSON/Number boundary. Intermediates may use the wider ceiling above,
+// but every returned key must fit exactly in every binding before it becomes a Number.
+const MAX_BOUND_VALUE=2n**53n-1n;
+/** A sum in the bound path exceeded the declared ceiling. Structured rather than a number:
+ *  a bound that is quietly wrong is worse than none, because it will be believed. */
+export class BoundOverflowError extends Error{
+  constructor(quantity,ceiling=MAX_BOUND_SUM,subject='sum'){
+    super(`${quantity} ${subject} is past the ${ceiling} ceiling the bound path declares`);
+    this.name='BoundOverflowError';
+  }
+}
+function boundGuard(total,quantity){
+  if(total>MAX_BOUND_SUM)throw new BoundOverflowError(quantity);
+  return total;
+}
+function boundOutput(value,quantity){
+  if(value>MAX_BOUND_VALUE){
+    throw new BoundOverflowError(quantity,MAX_BOUND_VALUE,'bound');
+  }
+  return Number(value);
+}
+/** Can this item take up less room than its declared dimensions?
+ *
+ *  Three ways, and each breaks the same argument -- that nominal volumes sum to something a
+ *  solution must carry. A nested item sinks into the one below it; a `convex_hull` occupies
+ *  its hull and leaves the rest of its bounding box free; a `compressible` item gives up
+ *  height under load. The design document named only the first until a soundness test over
+ *  the corpus found the omission. */
+function occupiesLessThanItsBox(item){
+  if(item.nestingHeight!=null)return true;
+  return item.shapeType==='convex_hull'||item.shapeType==='compressible';
+}
+const boundCeilDiv=(a,b)=>(a+b-1n)/b;
+/** The largest n such that the n smallest values sum to at most the capacity. Smallest first
+ *  is the whole soundness argument: the cheapest units maximise how many fit, so this
+ *  over-estimates what any real packing achieves and the bound under-estimates. */
+function boundFit(ascending,capacity){
+  if(capacity===null)return ascending.length;
+  let used=0n;
+  for(let taken=0;taken<ascending.length;taken++){
+    used+=ascending[taken];
+    if(used>capacity)return taken;
+  }
+  return ascending.length;
+}
+/** Sum of limit*quantity, or null when any limit or inventory is undeclared. `zeroIsHarmless`
+ *  is the volume rule: a container with no usable volume adds nothing however many there
+ *  are, so an unlimited quantity only unbounds the total when the type holds something. */
+function boundCapacity(values,quantities,zeroIsHarmless){
+  let total=0n;
+  for(let i=0;i<values.length;i++){
+    if(values[i]===null)return null;
+    if(quantities[i]===null){
+      if(zeroIsHarmless&&values[i]<=0n)continue;
+      return null;
+    }
+    total=boundGuard(total+values[i]*quantities[i],'container capacity');
+  }
+  return total;
+}
+/** The largest declared limit, or null if any type declares none: one unlimited type makes
+ *  the maximum unbounded and every term conditioned on it vacuous. */
+function boundFiniteMax(values){
+  let best=null;
+  for(const value of values){
+    if(value===null)return null;
+    best=best===null||value>best?value:best;
+  }
+  return best;
+}
+/** Every bound, from the numbers the formulas consume -- the shape the shared scene records,
+ *  so this port is checked without reimplementing a request parser. `shrinks` is taken as
+ *  given; whether this engine decides it correctly is asserted separately. */
+function objectiveBounds(instances,containers){
+  const volumes=instances.map(i=>i.volume).sort((a,b)=>a<b?-1:a>b?1:0);
+  const weights=instances.map(i=>i.weight).sort((a,b)=>a<b?-1:a>b?1:0);
+  const shrinks=instances.some(i=>i.shrinks);
+  const count=instances.length;
+  const usable=containers.map(c=>c.usable),inner=containers.map(c=>c.inner);
+  const quantities=containers.map(c=>c.quantity);
+
+  // The a-priori check, once, on the way in. Every later product is bounded by these totals
+  // times PPM, so guarding them here is what makes the rest safe by derivation.
+  boundGuard(volumes.reduce((a,b)=>a+b,0n),'instance volume');
+  boundGuard(weights.reduce((a,b)=>a+b,0n),'instance weight');
+  for(const container of containers){
+    boundGuard(container.usable,'container capacity');
+    boundGuard(container.costMinor,'opening cost');
+  }
+
+  let placeable=count;
+  if(!shrinks)placeable=Math.min(placeable,boundFit(volumes,boundCapacity(usable,quantities,true)));
+  placeable=Math.min(placeable,boundFit(weights,boundCapacity(containers.map(c=>c.payload),quantities,false)));
+  const slotCapacity=boundCapacity(containers.map(c=>c.maxItems),quantities,false);
+  if(slotCapacity!==null)placeable=Math.min(placeable,Number(slotCapacity));
+  const unpacked=count-placeable,placed=placeable;
+
+  let opened=0;
+  if(placed>0&&containers.length){
+    opened=1;
+    if(!shrinks){
+      const largest=usable.reduce((a,b)=>b>a?b:a,0n);
+      if(largest>0n)opened=Math.max(opened,Number(boundCeilDiv(volumes.slice(0,placed).reduce((a,b)=>a+b,0n),largest)));
+    }
+    const payload=boundFiniteMax(containers.map(c=>c.payload));
+    if(payload!==null&&payload>0n)opened=Math.max(opened,Number(boundCeilDiv(weights.slice(0,placed).reduce((a,b)=>a+b,0n),payload)));
+    const slots=boundFiniteMax(containers.map(c=>c.maxItems));
+    if(slots!==null&&slots>0n)opened=Math.max(opened,Number(boundCeilDiv(BigInt(placed),slots)));
+  }
+
+  let cost=0n;
+  if(opened>0){
+    const available=[];
+    for(const c of containers){
+      const repeat=c.quantity===null?opened:Math.min(Number(c.quantity),opened);
+      for(let taken=0;taken<repeat;taken++)available.push(c.costMinor);
+    }
+    available.sort((a,b)=>a<b?-1:a>b?1:0);
+    cost=available.slice(0,opened).reduce((a,b)=>a+b,0n);
+  }
+
+  let unused=0n;
+  if(!shrinks&&opened>0&&containers.length){
+    const smallest=inner.reduce((a,b)=>b<a?b:a,inner[0]);
+    if(smallest>0n){
+      const largestPlaced=placed>0?volumes.slice(volumes.length-placed).reduce((a,b)=>a+b,0n):0n;
+      // In BigInt until it is clamped: `largestPlaced * PPM` can reach 10^36, which a
+      // `Number` would round rather than carry.
+      const filled=boundCeilDiv(largestPlaced*BOUND_PPM,smallest);
+      const raw=BigInt(opened)*BOUND_PPM-filled-BigInt(opened-1);
+      unused=raw>0n?raw:0n;
+    }
+  }
+
+  let height=0n;
+  if(!shrinks&&opened>0&&containers.length){
+    const widest=containers.map(c=>c.baseArea).reduce((a,b)=>b>a?b:a,0n);
+    const tallest=containers.map(c=>c.height).reduce((a,b)=>b>a?b:a,0n);
+    if(widest>0n&&tallest>0n){
+      const required=placed>0?boundCeilDiv(volumes.slice(0,placed).reduce((a,b)=>a+b,0n),widest):0n;
+      const raw=required*BOUND_PPM/tallest-BigInt(opened-1);
+      height=raw>0n?raw:0n;
+    }
+  }
+  return [
+    boundOutput(BigInt(unpacked),'unpacked count'),
+    boundOutput(BigInt(opened),'container count'),
+    boundOutput(boundGuard(cost,'opening cost'),'opening cost'),
+    boundOutput(unused,'unused volume'),
+    boundOutput(height,'stack height'),
+  ];
+}
+/** Exposed for the cross-language scene test only, like `__inspectHullShapeForTests`: the
+ *  bounds are internal until a contract freeze decides whether a caller ever sees a gap. */
+export function __objectiveBoundsForTests(instances,containers){return objectiveBounds(instances,containers);}
+export function __occupiesLessThanItsBoxForTests(item){return occupiesLessThanItsBox(item);}
+function boxShape(dx,dy,dz){
+  const v=[];
+  for(const x of [0n,BigInt(dx)])for(const y of [0n,BigInt(dy)])for(const z of [0n,BigInt(dz)])v.push([x,y,z]);
+  return {v,faces:UNIT_AXES,edges:UNIT_AXES,volume:BigInt(dx)*BigInt(dy)*BigInt(dz)};
+}
+/** Reorient a hull the way a rotation reorients its box, never mirroring it.
+ *
+ *  Three of the six rotations are odd permutations of the coordinate axes. On a cuboid that is
+ *  invisible; on a hull a bare permutation returns the item's mirror image, a shape the caller
+ *  does not own. One axis therefore changes sign when the permutation is odd. */
+function hullRotate(vertices,code){
+  const axes=ROT[code];
+  let inversions=0;
+  for(let i=0;i<3;i++)for(let j=i+1;j<3;j++)if(axes[i]>axes[j])inversions++;
+  const sign=inversions%2?-1:1;
+  const turned=vertices.map(v=>[sign*v[axes[0]],v[axes[1]],v[axes[2]]]);
+  const low=[0,1,2].map(a=>Math.min(...turned.map(v=>v[a])));
+  return turned.map(v=>[v[0]-low[0],v[1]-low[1],v[2]-low[2]]);
+}
+function separatingAxes(left,right){
+  const axes=new Map();
+  for(const axis of [...left.faces,...right.faces])axes.set(axisKey(axis),axis);
+  for(const l of left.edges)for(const r of right.edges){
+    const axis=primitiveAxis(cross3(l,r));
+    if(axis)axes.set(axisKey(axis),axis);
+  }
+  return [...axes.values()];
+}
+/** Do two placed hulls overlap with positive volume? Touching is contact, not collision: the
+ *  comparison is `<=`, matching the half-open convention cuboids already use. */
+function hullsCollide(left,leftOrigin,right,rightOrigin){
+  const lo=big3(leftOrigin),ro=big3(rightOrigin);
+  for(const axis of separatingAxes(left,right)){
+    const project=shape=>{let low=null,high=null;
+      for(const v of shape.v){const value=dot3(v,axis);
+        if(low===null||value<low)low=value;if(high===null||value>high)high=value}
+      return [low,high]};
+    const [ll,lh]=project(left),[rl,rh]=project(right);
+    const ls=dot3(lo,axis),rs=dot3(ro,axis);
+    if(lh+ls<=rl+rs||rh+rs<=ll+ls)return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------- compression
+
+const COMPRESSION_PPM=1000000n;
+const GRAVITY_NUMERATOR=980665n,GRAVITY_DENOMINATOR=100000n,PASCALS_PER_KPA=1000n;
+/** Exact pressure in kPa from the cumulative mass above an item, over its footprint. Reduced,
+ *  so the divisor in the height formula stays small and two engines agreeing on the value
+ *  cannot disagree on the representation. */
+function appliedPressure(loadTicks,footprintTicks){
+  const metre=BigInt(LEN.mm)*1000n;
+  const n=BigInt(loadTicks)*GRAVITY_NUMERATOR*metre*metre;
+  const d=BigInt(WT.kg)*GRAVITY_DENOMINATOR*PASCALS_PER_KPA*BigInt(footprintTicks);
+  const g=bigGcd(n,d)||1n;
+  return {n:n/g,d:d/g};
+}
+/** Cross multiplication, so the inclusive boundary is decided without ever dividing. */
+const pressureExceeds=(pressure,limitKpa)=>pressure.n>BigInt(limitKpa)*pressure.d;
+/** Occupied height under load, rounded up, never below one tick. Rounding up keeps a discrete
+ *  packer honest; the one-tick floor stops a fully compressible item reaching zero height,
+ *  where it would slip past collision and support invariants entirely. */
+function effectiveHeight(heightTicks,ratioPpm,limitKpa,pressure){
+  if(limitKpa===0)return heightTicks;
+  const divisor=BigInt(limitKpa)*COMPRESSION_PPM*pressure.d;
+  const retained=divisor-BigInt(ratioPpm)*pressure.n;
+  const rounded=(BigInt(heightTicks)*retained+divisor-1n)/divisor;
+  return Number(rounded>1n?rounded:1n);
+}
+/** The published ratio rule, `floor(ratio * 1000000 + 0.5)`, applied once at the boundary so
+ *  the float a caller supplied never reaches the geometry. */
+function ratioToPpm(ratio){
+  if(!(ratio>=0&&ratio<=1))throw new RangeError('compression_ratio must be between zero and one');
+  return Math.floor(ratio*1000000+0.5);
+}
 function validNesting(a,b){if(a.item.raw.id!==b.item.raw.id||a.item.nesting==null||b.item.nesting==null||a.item.nesting!==b.item.nesting)return false;
   if(a.x!==b.x||a.y!==b.y||a.x+a.ed[0]!==b.x+b.ed[0]||a.y+a.ed[1]!==b.y+b.ed[1])return false;
   const [low,high]=a.z<=b.z?[a,b]:[b,a];return low.z!==high.z&&low.z+low.ed[2]-high.z===a.item.nesting}
-function usedVolume(placements){let total=placements.reduce((s,p)=>s+volume(p.pd),0n),overlap=0n;
+/** This placement's rotated hull, or `null` when its box is the honest answer.
+ *
+ *  `null` for every `rigid_cuboid` and for three cases that fall back to the box, always
+ *  over-reserving space: a clearance has inflated the envelope past the physical box and a
+ *  margin around a hull is not a hull; the item is on a route, where the sequence replay
+ *  reasons with box sweeps only and packing tighter than it can verify would produce
+ *  arrangements the engine then calls unloadable. */
+function placedHull(placement){
+  const item=placement.item;
+  if(item.shapeType!=='convex_hull'||item.stopIndex!=null)return null;
+  if(placement.ed[0]!==placement.pd[0]||placement.ed[1]!==placement.pd[1]||placement.ed[2]!==placement.pd[2])return null;
+  return shapeFor(item.hullVertices,placement.r);
+}
+/** Do two placed items actually overlap? The axis-aligned envelope test is the broad phase and
+ *  stays mandatory; this refines its answer only when a hull is one of the two solids. */
+function solidsOverlap(leftShape,leftBox,rightShape,rightBox){
+  if(leftShape===null&&rightShape===null)return true;
+  return hullsCollide(
+    leftShape??boxShape(leftBox.d[0],leftBox.d[1],leftBox.d[2]),[leftBox.x,leftBox.y,leftBox.z],
+    rightShape??boxShape(rightBox.d[0],rightBox.d[1],rightBox.d[2]),[rightBox.x,rightBox.y,rightBox.z]);
+}
+/** Space one placement actually takes, which is its box only if it is one.
+ *
+ *  A `convex_hull` item occupies its hull: counting the bounding box is not a conservative
+ *  approximation of utilisation but a wrong number, putting two interlocking wedges at 200% of
+ *  a crate. A `compressible` item occupies the height left after the load it reports. */
+function occupiedVolume(placement,loadTicks=0){
+  const item=placement.item;
+  // Route and clearance can make collision conservatively use the envelope; neither changes
+  // the physical solid used for utilisation and void-fill reserve accounting.
+  if(item.shapeType==='convex_hull')return shapeFor(item.hullVertices,placement.r).volume;
+  if(item.maxCompressionKpa==null)return volume(placement.pd);
+  const footprint=placement.pd[0]*placement.pd[1];
+  // The load is passed in rather than read off the placement: this engine computes top loads
+  // at reporting time and never stores them, so a placement field would have been silently
+  // zero and nothing would ever have compressed.
+  const pressure=appliedPressure(loadTicks,footprint);
+  // A crushed item has no meaningful occupied volume, and the arrangement is already invalid
+  // -- the crush check refuses it and the validator reports it.
+  if(pressureExceeds(pressure,item.maxCompressionKpa))return volume(placement.pd);
+  return BigInt(footprint)*BigInt(effectiveHeight(placement.pd[2],item.compressionPpm,item.maxCompressionKpa,pressure));
+}
+/** First compressible box carrying more pressure than it declared it can take.
+ *
+ *  Deliberately shaped like `overloaded` and reading the same propagated loads: the two answer
+ *  one question in two currencies -- a mass the box below must bear, against a pressure the
+ *  item itself must survive. An item can pass one and fail the other, so both are asked. */
+function crushed(boxes,loads=null){
+  if(boxes.every(b=>b.maxCompressionKpa==null))return false;
+  if(loads==null)loads=topLoads(boxes);
+  return boxes.some((b,i)=>{
+    if(b.maxCompressionKpa==null)return false;
+    const footprint=b.d[0]*b.d[1];
+    return pressureExceeds(appliedPressure(Number(loads[i]),footprint),b.maxCompressionKpa);
+  });
+}
+/** Parse and admit an item's shape, or refuse it with the reason.
+ *
+ *  Coordinates go through the length scale, which refuses a negative value, so a hull crossing
+ *  the wire is authored as non-negative offsets from the corner of its own bounding box. The
+ *  admission rule spans four fields at once -- which are required, which are forbidden, and
+ *  what the survivors must agree with -- and mirrors the other three engines exactly. */
+function parseShape(raw,d,unit,nesting){
+  const shapeType=raw.shape_type??'rigid_cuboid';
+  if(!['rigid_cuboid','convex_hull','compressible'].includes(shapeType))
+    throw new RangeError(`item.shape_type ${shapeType} is not a known shape`);
+  const hullVertices=raw.hull_vertices==null?null:raw.hull_vertices.map(v=>
+    [scalar(v.x,unit,LEN),scalar(v.y,unit,LEN),scalar(v.z,unit,LEN)]);
+  const compressionPpm=raw.compression_ratio==null?null:ratioToPpm(raw.compression_ratio);
+  const maxCompressionKpa=raw.max_compression_pressure_kpa==null?null:Number(raw.max_compression_pressure_kpa);
+  const foreign=shapeType==='convex_hull'
+    ?[['compression_ratio',compressionPpm],['max_compression_pressure_kpa',maxCompressionKpa]]
+    :shapeType==='compressible'?[['hull_vertices',hullVertices]]
+    :[['hull_vertices',hullVertices],['compression_ratio',compressionPpm],['max_compression_pressure_kpa',maxCompressionKpa]];
+  for(const [name,value] of foreign)
+    if(value!=null)throw new RangeError(`${name} is not part of a ${shapeType} item`);
+  // Both rewrite occupied height. Choosing an order silently would give four engines four
+  // contracts, so the interaction is refused until a task defines it.
+  if(nesting!=null&&shapeType!=='rigid_cuboid')
+    throw new RangeError(`nesting_height with shape_type ${shapeType} is not supported yet`);
+  if(shapeType==='convex_hull'){
+    if(hullVertices===null)throw new RangeError('a convex_hull item requires hull_vertices');
+    const points=hullValidate(hullVertices);
+    for(let axis=0;axis<3;axis++){
+      const span=Math.max(...points.map(v=>v[axis]))-Math.min(...points.map(v=>v[axis]));
+      // `dimensions` stays the broad phase and the candidate-generation envelope, so a hull
+      // poking out of it would be collision-tested against space never reserved.
+      if(span>d[axis])throw new RangeError('hull_vertices span does not fit inside dimensions');
+    }
+  }
+  if(shapeType==='compressible'){
+    if(compressionPpm===null||maxCompressionKpa===null)
+      throw new RangeError('a compressible item requires both compression_ratio and max_compression_pressure_kpa');
+    if(maxCompressionKpa<0)throw new RangeError('max_compression_pressure_kpa cannot be negative');
+  }
+  return {shapeType,hullVertices,compressionPpm,maxCompressionKpa};
+}
+function usedVolume(placements){
+  // Compression needs the cumulative mass above each item, which is the same propagation the
+  // reported `top_load` uses -- one traversal, read twice.
+  const loads=placements.some(p=>p.item.maxCompressionKpa!=null)
+    ?topLoads(placements.map(constraintBox)):null;
+  let total=placements.reduce((s,p,i)=>s+occupiedVolume(p,loads===null?0:Number(loads[i])),0n),overlap=0n;
   for(let i=0;i<placements.length;i++)for(let j=i+1;j<placements.length;j++)if(validNesting(placements[i],placements[j]))
     overlap+=BigInt(placements[i].item.nesting)*BigInt(placements[i].ed[0])*BigInt(placements[i].ed[1]);
   return total-overlap}
@@ -113,7 +674,7 @@ function usedVolume(placements){let total=placements.reduce((s,p)=>s+volume(p.pd
 // what is already there -- O(n) where `usedVolume` is O(n^2). The search calls this once
 // per candidate orientation, which is what made the whole solve super-linear in item
 // count before.
-function usedVolumeDelta(placements,tentative){let delta=volume(tentative.pd);
+function usedVolumeDelta(placements,tentative){let delta=occupiedVolume(tentative);
   for(const placed of placements)if(validNesting(placed,tentative))
     delta-=BigInt(placed.item.nesting)*BigInt(placed.ed[0])*BigInt(placed.ed[1]);
   return delta}
@@ -162,6 +723,21 @@ function insertPoint(points,point){let low=0,high=points.length;
 // candidate list bounded instead of letting it grow with every placement, which is what
 // left the fallback evaluating two orders of magnitude more points per item than Python
 //. The half-open test matches `intersects`.
+/** Retire the points a placement covers -- unless it is a hull.
+ *
+ *  Retiring a point because it falls inside a solid's box assumes the box *is* the solid. For a
+ *  hull it is not: a placement origin is a corner of a bounding box, and a hull leaves most of
+ *  that box -- including, for a wedge, the origin itself -- available to the next item. Pruning
+ *  them first would mean the engine could describe an interlocking pack it could never propose,
+ *  and the exact collision test would be correct and never consulted.
+ *
+ *  One wrapper rather than a guard at each call site: the Rust port found a *second* place that
+ *  treated a box as the solid, and a single entry point is what makes a third impossible to
+ *  forget. */
+function retirePointsForPlacement(points,placement){
+  if(placedHull(placement)!==null)return;
+  retirePointsInside(points,{x:placement.x,y:placement.y,z:placement.z,d:placement.ed});
+}
 function retirePointsInside(points,box){const x2=box.x+box.d[0],y2=box.y+box.d[1],z2=box.z+box.d[2];
   let write=0;
   for(let read=0;read<points.length;read++){const p=points[read];
@@ -311,6 +887,10 @@ function contactGraph(boxes){const graph=buildContactGraph(boxes,overlapXY),grou
 
 function constraintBox(placement){return {x:placement.x,y:placement.y,z:placement.z,d:placement.ed,w:placement.item.w,
   maxTop:placement.item.maxTop,maxStacked:placement.item.maxStacked,itemType:placement.item.raw.id,nesting:placement.item.nesting,
+  // Load propagation already computes the cumulative mass above every box, which is exactly
+  // the numerator the pressure model needs, so the crush check rides the graph that is built
+  // anyway rather than a second one.
+  maxCompressionKpa:placement.item.maxCompressionKpa,compressionPpm:placement.item.compressionPpm,
   stopIndex:placement.item.stopIndex}}
 
 function topLoads(boxes,graph=contactGraph(boxes)){const loads=boxes.map(()=>0n);
@@ -369,7 +949,101 @@ function routeContactAllowed(candidate,placed,supports){
  * physical rule the schema accepts is enforced here instead: a result that claims to
  * honour a rule it ignored is worse than no result at all.
  */
-function allowed(candidate,placed,container,globalSupportPpm,metrics){
+// `loadBase` is a thunk, not a graph: the caller knows the placed boxes cannot move for
+// this item's whole candidate sweep, but most candidates never reach the load rules at
+// all, and building a base none of them asks for would be pure cost. It yields null
+// whenever the delta does not apply -- see `candidatesFor`.
+// Dimensions reach this rule in two shapes and both are legitimate: the solver carries them
+// as `[length, width, height]`, while a caller holding a request or a fixture carries the
+// named object. `sweptVolume` reads the named form, and an array silently answers `3` for
+// `.length` -- so normalising here is not tidiness. Before 's review this predicate
+// returned the opposite verdict for the same scene depending on which shape it was handed,
+// and nothing caught it because no request path supplies a direction list yet.
+const namedDimensions=value=>Array.isArray(value)
+  ?{length:value[0],width:value[1],height:value[2]}:value;
+const innerDimensions=container=>namedDimensions(container.d!==undefined?container.d:container);
+// Only position and envelope size matter to a corridor, so the box is built here rather than
+// through `constraintBox`, which also carries load, nesting and item type -- none of which
+// this rule reads, and all of which an embedder would have to supply to call it.
+const corridorBox=p=>({x:p.x,y:p.y,z:p.z,d:namedDimensions(p.ed)});
+
+/**
+ * The corridors open in one immutable placement state.
+ *
+ * Built once per candidate sweep and reused by every candidate: the placed boxes cannot move
+ * while one item is being placed, so the placed-versus-placed intersections give the same
+ * answer every time. Construction is `O(m^2 * |D|)` and each candidate then costs
+ * `O(m * |D|)`, matching what the Rust core does with the same state. Rebuilding per
+ * candidate would make switching the doors on cost `O(m^2 * |D|)` for every candidate -- the
+ * hoist exists so that wiring the field later does not also have to repair a hot loop.
+ *
+ * The base is keyed to one candidate stop, so it is valid for exactly one item's sweep.
+ */
+export function stopAccessibilityBase(candidateStop,placed,container,directions){
+  const stop=candidateStop??Infinity,stops=placed.map(p=>p.item.stopIndex??Infinity);
+  // No doors is the default on every request path, and one distinct stop means nothing is
+  // due before anything else. Either way no corridor can be wrongly blocked. Checked over
+  // the candidate too, or the first placement into an empty container would skip a check it
+  // should make.
+  if(!directions||directions.length===0||stops.every(each=>each===stop))
+    return {inert:true,stop,stops,directions:[],inner:null,boxes:[],clear:[]};
+  const inner=innerDimensions(container),boxes=placed.map(corridorBox);
+  const clear=boxes.map((box,index)=>stops[index]===Infinity
+    // Never unloaded, so it needs no door of its own -- it only ever blocks.
+    ?[]
+    :directions.map(direction=>sweptVolume(box,inner,direction))
+      .filter(sweep=>!boxes.some((other,position)=>position!==index
+        &&stops[position]>stops[index]&&sweptHits(sweep,other))));
+  return {inert:false,stop,stops,directions:[...directions],inner,boxes,clear};
+}
+
+function accessibleAgainst(base,candidateBox){
+  if(base.inert)return true;
+  // Every already-placed item due before the candidate must keep a door the candidate does
+  // not take.
+  for(let index=0;index<base.clear.length;index++){
+    if(base.stop<=base.stops[index])continue;
+    if(!base.clear[index].some(sweep=>!sweptHits(sweep,candidateBox)))return false;
+  }
+  // An item riding the whole route is never unloaded, so it needs no door of its own.
+  if(base.stop===Infinity)return true;
+  return base.directions.some(direction=>{
+    const sweep=sweptVolume(candidateBox,base.inner,direction);
+    return !base.boxes.some((other,index)=>base.stops[index]>base.stop&&sweptHits(sweep,other));
+  });
+}
+
+// The horizontal half of route order: nothing due later may stand between an earlier item
+// and a door. `routeContactAllowed` above enforces the vertical half -- nothing
+// due later may rest *above* something due earlier. Both are necessary and neither implies
+// the other; docs/STOP-ACCESSIBILITY.md derives the rule and the post-validator's
+// whole-scene replay stays the sufficient check.
+//
+// Inert unless the caller supplies exit directions. The request schema has no field for
+// them, and assuming all six walls open would enforce a rule true of no real vehicle and
+// nearly vacuous besides -- a box is almost always free through *some* face. This engine
+// has no programmatic config path, so the request path always passes the empty list and an
+// embedder reaches the rule by calling this function directly, which is as close as
+// JavaScript gets to the config field Python, PHP and Rust carry.
+//
+// The blocker set is `{q : s(q) > s(p)}` -- strictly later. Same-stop items are excluded
+// because the order within a stop is free: whichever is in the way comes off first.
+//
+// One implementation, not two: this builds the base and asks it, so the exported predicate
+// and the solver's hot path cannot drift apart.
+export function stopAccessible(candidate,placed,container,directions){
+  return accessibleAgainst(
+    stopAccessibilityBase(candidate.item.stopIndex,placed,container,directions),
+    corridorBox(candidate));
+}
+
+// Half-open on every axis, matching the box intersection test, so a box flush against
+// another's exit face is not standing in its way.
+function sweptHits([sx1,sy1,sz1,sx2,sy2,sz2],box){
+  return sx1<box.x+box.d.length&&box.x<sx2&&sy1<box.y+box.d.width&&box.y<sy2
+    &&sz1<box.z+box.d.height&&box.z<sz2}
+
+function allowed(candidate,placed,container,globalSupportPpm,metrics,loadBase=null,accessBase=null){
   const box={x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed};
   if(candidate.item.raw.must_be_on_floor&&box.z!==0)return false;
   const tags=candidate.item.tags,bad=candidate.item.incompatible;
@@ -398,13 +1072,22 @@ function allowed(candidate,placed,container,globalSupportPpm,metrics){
   // decidable from the items alone; when neither fires, the three skipped checks
   // return false for every box anyway, and building n+1 boxes per feasible
   // candidate was pure allocation.
-  const needsLoads=container.maxStackDensity!=null||candidate.item.maxTop!=null||placed.some(p=>p.item.maxTop!=null);
+  const needsLoads=container.maxStackDensity!=null||candidate.item.maxTop!=null||placed.some(p=>p.item.maxTop!=null)
+    ||candidate.item.maxCompressionKpa!=null||placed.some(p=>p.item.maxCompressionKpa!=null);
   const needsGraph=needsLoads||candidate.item.maxStacked!=null||placed.some(p=>p.item.maxStacked!=null);
-  if(!needsGraph)return groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports);
-  const boxes=[...placed.map(constraintBox),constraintBox(candidate)];
-  const graph=contactGraph(boxes),loads=needsLoads?topLoads(boxes,graph):null;
-  return !overloaded(boxes,loads)&&!stackLimitsExceeded(boxes,graph)&&!stackDensityExceeded(boxes,container.maxStackDensity,loads)
-    &&groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports);
+  if(!needsGraph)return groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports)
+    &&(accessBase===null||accessibleAgainst(accessBase,corridorBox(candidate)));
+  // With a base for this sweep, both the box list and the graph come from it by
+  // appending one box, rather than each candidate rebuilding both from every placement.
+  // The two paths are required to agree exactly, which is what `contact-graph`'s append
+  // property test holds them to.
+  const candidateBox=constraintBox(candidate),base=loadBase===null?null:loadBase();
+  const boxes=base===null?[...placed.map(constraintBox),candidateBox]:[...base.boxes,candidateBox];
+  const graph=base===null?contactGraph(boxes):appendContactBox(base,candidateBox,overlapXY);
+  const loads=needsLoads?topLoads(boxes,graph):null;
+  return !overloaded(boxes,loads)&&!crushed(boxes,loads)&&!stackLimitsExceeded(boxes,graph)&&!stackDensityExceeded(boxes,container.maxStackDensity,loads)
+    &&groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports)
+    &&(accessBase===null||accessibleAgainst(accessBase,corridorBox(candidate)));
 }
 
 function supportRatioOf(placement,placed){
@@ -469,6 +1152,10 @@ function admitItem(raw,u){
   if(raw.stop_index!=null&&(!Number.isSafeInteger(raw.stop_index)||raw.stop_index<0))throw new RangeError('stop_index must be a non-negative safe integer');
   if(raw.value!=null&&(!Number.isSafeInteger(raw.value)||raw.value<0))throw new RangeError('value must be a non-negative safe integer');
   if(raw.ground_contact_rule!=null&&!['free','covered','single','multiple'].includes(raw.ground_contact_rule))throw new RangeError('ground_contact_rule must be free, covered, single or multiple');
+  // The shape rules belong here for the reason this function exists: the compact lattice path
+  // never builds an `items` entry, so an admission living only in the general path's item loop
+  // would let the two disagree about which requests are legal.
+  parseShape(raw,d,u,nesting);
   if(raw.eligible_container_tags!=null&&(!Array.isArray(raw.eligible_container_tags)||raw.eligible_container_tags.some(tag=>typeof tag!=='string')))throw new TypeError('eligible_container_tags must be an array of strings');
 }
 
@@ -514,6 +1201,12 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
   const raw=req.items[0],quantity=raw.quantity??1;
   if(!Number.isSafeInteger(quantity)||quantity<1||raw.group!=null||(raw.tags??[]).length||(raw.incompatible_tags??[]).length
     ||(raw.eligible_container_tags??[]).length||raw.max_stacked_items!=null||raw.nesting_height!=null
+    // The lattice is closed-form over boxes: it counts cells from envelope extents and reports
+    // volume from its own summary. It can see neither a hull -- it would tile bounding boxes
+    // and call the result exact -- nor pressure, so a compressible column would be sized
+    // without ever asking whether its base survives, and reported uncompressed. The general
+    // search checks both per candidate.
+    ||(raw.shape_type!=null&&raw.shape_type!=='rigid_cuboid')
     ||!['free',null,undefined].includes(raw.ground_contact_rule))return null;
   const itemDimensions=dims(raw.dimensions,u),weight=scalar(raw.weight??0,'g',WT);
   const rotations=raw.allowed_rotations??(raw.keep_upright?['LWH','WLH']:Object.keys(ROT));
@@ -920,7 +1613,8 @@ const items=[];for(const raw of req.items){const d=dims(raw.dimensions,u),w=scal
     supportPpm:Math.round((raw.minimum_support_ratio??0)*SUPPORT_SCALE),priority:raw.priority??0,
     tags:raw.tags??[],incompatible:raw.incompatible_tags??[],group:raw.group??null,
     nesting,maxStacked:raw.max_stacked_items??null,groundRule:raw.ground_contact_rule??null,
-    stopIndex:raw.stop_index??null,eligibleTags:raw.eligible_container_tags??[],value:raw.value??0})}
+    stopIndex:raw.stop_index??null,eligibleTags:raw.eligible_container_tags??[],value:raw.value??0,
+    ...parseShape(raw,d,u,nesting)})}
 // Priority is a preference, not a guarantee: it leads the ordering so a caller can
 // bias the search, but ties (the default, priority 0 for all items) fall through to
 // the volume key unchanged.
@@ -994,6 +1688,34 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
   // the check belongs here beside the eligibility and tag-limit gates rather than inside
   // the point loop, and costs O(m + r) per (template, item) instead of per candidate.
   if(policyRules.length&&policyRejection(policyRules,item.tags,tmpl.tags??[],tagOccurrences(state.placements))!==null)return [];
+  // The placed boxes do not move for the whole of this item's candidate sweep, so
+  // their contact graph is built once here -- on first demand, since most candidates never
+  // reach a load rule -- and every candidate appends to it instead of rebuilding.
+  //
+  // Nesting is excluded: a nesting predecessor *replaces* the face edges of everything in
+  // its column, so one new placement can rewrite edges arbitrarily far from itself and the
+  // delta is no longer local. Nesting keeps the from-scratch path.
+  const nestingPresent=item.nesting!=null||state.placements.some(p=>p.item.nesting!=null);
+  let loadBaseGraph;
+  const loadBase=nestingPresent?null:()=>{
+    if(loadBaseGraph===undefined){
+      // The cell must cover every box hashed into the broad phase or queried against it,
+      // and the candidate is a new item that may be wider than anything placed -- so the
+      // hint comes from this item's own rotations, which are known here.
+      const widest=Math.max(1,...item.rots.flatMap(r=>{const pd=rotate(item.d,r);
+        return [pd[0]+2*clear,pd[1]+2*clear]}));
+      loadBaseGraph=buildContactGraph(state.placements.map(constraintBox),overlapXY,widest);
+    }
+    return loadBaseGraph;
+  };
+  // The same argument, for the other rule that reads the whole placed scene. The
+  // doors are empty on every request path today, so this base is inert and costs one pass
+  // over the stops -- it is built here rather than inside `allowed` so that wiring the
+  // field through later does not silently turn an O(m*|D|) check into O(m^2*|D|) per
+  // candidate.
+  const accessBase=stopAccessibilityBase(item.stopIndex,state.placements,tmpl,[]);
+  const compressionSensitive=item.shapeType==='compressible'
+    ||state.placements.some(placement=>placement.item.shapeType==='compressible');
   const found=[];
   const candidates=points.length>maxCandidatePoints?points.slice(0,maxCandidatePoints):points;
   candidatePoints:for(const pt of candidates){if(candidateEffortExceeded())break;metrics.candidate_points_considered++;for(const r of item.rots){if(candidateEffortExceeded())break candidatePoints;metrics.orientations_considered++;if(deadline.expired()){timeLimitReached=true;break candidatePoints}const pd=rotate(item.d,r),ed=pd.map(x=>x+2*clear),box={x:pt[0],y:pt[1],z:pt[2],d:ed};
@@ -1001,9 +1723,12 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
     if(tmpl.max!=null&&state.payload+item.w>tmpl.max)continue;
     if(tmpl.max_items!=null&&state.placements.length>=tmpl.max_items)continue;
     const tentative={x:pt[0],y:pt[1],z:pt[2],pd,ed,r,item};
-    if(used+usedVolumeDelta(state.placements,tentative)+tmpl.reserve>tmpl.innerVolume)continue;
+    if(!compressionSensitive&&used+usedVolumeDelta(state.placements,tentative)+tmpl.reserve>tmpl.innerVolume)continue;
     let collision=false;
-    for(const obstacle of tmpl.obs){metrics.collision_checks++;if(intersects(box,obstacle)){collision=true;break}}
+    const candidateShape=item.shapeType==='convex_hull'&&item.stopIndex==null&&clear===0
+      ?shapeFor(item.hullVertices,r):null;
+    for(const obstacle of tmpl.obs){metrics.collision_checks++;
+      if(intersects(box,obstacle)&&solidsOverlap(candidateShape,box,null,obstacle)){collision=true;break}}
     // Broad phase: visit only the placements sharing a cell with `box`, stamping each
     // so a placement spanning several cells is narrow-phase-checked once. A generation
     // counter does that without allocating a set per candidate orientation.
@@ -1012,11 +1737,23 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
         const bucket=index.cells.get(cellKey(ix,iy,iz));if(!bucket)continue;
         for(const position of bucket){if(index.seen[position]===stamp)continue;index.seen[position]=stamp;
           const placed=state.placements[position];metrics.collision_checks++;
-          if(intersects(box,{x:placed.x,y:placed.y,z:placed.z,d:placed.ed})&&!validNesting(tentativeBox,placed)){collision=true;break scan}}}}
+          const placedBox={x:placed.x,y:placed.y,z:placed.z,d:placed.ed};
+          if(intersects(box,placedBox)&&!validNesting(tentativeBox,placed)
+            // The axis-aligned test is the broad phase and stays mandatory. Only when a hull
+            // is one of the two solids does the exact test get to overrule it, so a request of
+            // ordinary boxes never reaches the hull path at all.
+            &&solidsOverlap(candidateShape,box,placedHull(placed),placedBox)){collision=true;break scan}}}}
     if(collision)continue;
     const candidate={x:pt[0],y:pt[1],z:pt[2],pd,ed,r,item};
     if(axleOverloaded(tmpl,state.placements,candidate))continue;
-    if(!allowed(candidate,state.placements,tmpl,globalSupportPpm,metrics))continue;
+    if(!allowed(candidate,state.placements,tmpl,globalSupportPpm,metrics,loadBase,accessBase))continue;
+    // With zero load the candidate is at its largest, and appending it can only shrink
+    // existing compressible supports. If that upper bound fits, the exact support-graph
+    // refresh cannot reject it; only a candidate near the reserve boundary pays the
+    // non-local calculation. Ordinary requests retain the incremental O(1) path above.
+    if(compressionSensitive){const upperBound=used+occupiedVolume(tentative);
+      if(upperBound+tmpl.reserve>tmpl.innerVolume
+        &&usedVolume([...state.placements,tentative])+tmpl.reserve>tmpl.innerVolume)continue}
     metrics.feasible_candidates++;
     const score=solverAlias==='grid'
       ?pt[2]*1e12+pt[1]*1e6+pt[0]
@@ -1047,9 +1784,13 @@ const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const state={tmpl,placements:[
       metrics.search_nodes_expanded++;
       const best=candidatesFor(tmpl,item,state,points,index,used,1)[0];
       if(!best){ok=false;break}
-      state.payload+=item.w;used+=usedVolumeDelta(state.placements,best);state.placements.push(best);
+      state.payload+=item.w;
+      const compressionSensitive=item.shapeType==='compressible'
+        ||state.placements.some(placement=>placement.item.shapeType==='compressible');
+      used=compressionSensitive?usedVolume([...state.placements,best]):used+usedVolumeDelta(state.placements,best);
+      state.placements.push(best);
       indexAdd(index,state.placements.length-1,{x:best.x,y:best.y,z:best.z,d:best.ed});
-      retirePointsInside(points,{x:best.x,y:best.y,z:best.z,d:best.ed});
+      retirePointsForPlacement(points,best);
       for(const point of pointsFrom(best))insertPoint(points,point)}
     if(!ok){state.placements=snapshotPlacements;state.payload=snapshotPayload;used=snapshotUsed;
       if(snapshotPoints)points.splice(0,points.length,...snapshotPoints);
@@ -1063,9 +1804,12 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     index:makeIndex(tmpl.d),unplaced:[]});
   const clone=node=>({state:{tmpl,placements:node.state.placements.slice(),payload:node.state.payload},used:node.used,
     points:node.points.slice(),index:copyIndex(node.index),unplaced:node.unplaced.slice()});
-  const place=(node,candidate)=>{node.state.payload+=candidate.item.w;node.used+=usedVolumeDelta(node.state.placements,candidate);
+  const place=(node,candidate)=>{node.state.payload+=candidate.item.w;
+    const compressionSensitive=candidate.item.shapeType==='compressible'
+      ||node.state.placements.some(placement=>placement.item.shapeType==='compressible');
+    node.used=compressionSensitive?usedVolume([...node.state.placements,candidate]):node.used+usedVolumeDelta(node.state.placements,candidate);
     node.state.placements.push(candidate);indexAdd(node.index,node.state.placements.length-1,{x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed});
-    retirePointsInside(node.points,{x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed});for(const point of pointsFrom(candidate))insertPoint(node.points,point)};
+    retirePointsForPlacement(node.points,candidate);for(const point of pointsFrom(candidate))insertPoint(node.points,point)};
   const sortCosts=costs=>costs.sort((a,b)=>a<b?-1:a>b?1:0);
   const maxCount=(sortedCosts,capacity)=>{let used=0n,count=0;for(const cost of sortedCosts){if(used+cost>capacity)break;used+=cost;count++}return count};
   // `future` is the same array for every comparison inside one `expansions.sort(...)`
@@ -1124,7 +1868,7 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
     w.state.payload+=candidate.item.w;w.used+=usedVolumeDelta(w.state.placements,candidate);
     w.state.placements.push(candidate);
     indexAdd(w.index,w.state.placements.length-1,{x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed});
-    retirePointsInside(w.points,{x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed});
+    retirePointsForPlacement(w.points,candidate);
     for(const point of pointsFrom(candidate))insertPoint(w.points,point)};
   // One child per feasible candidate for a lone item; a group is all-or-nothing, so it
   // contributes at most one child placed greedily member by member.
@@ -1454,6 +2198,8 @@ function rebalanceContext(req,result){
       nesting:raw.nesting_height==null?null:scalar(raw.nesting_height,unit,LEN),
       maxStacked:raw.max_stacked_items??null,groundRule:raw.ground_contact_rule??null,
       stopIndex:raw.stop_index??null,eligibleTags:raw.eligible_container_tags??[],
+      ...parseShape(raw,dims(raw.dimensions,unit),unit,
+        raw.nesting_height==null?null:scalar(raw.nesting_height,unit,LEN)),
     })
   }
   const templates=new Map((req.containers??[]).map(raw=>{

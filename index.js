@@ -29,7 +29,7 @@ export function rebalanceWeight(request,result,{maxMoves=64}={}){
   }
   return rebalanceFallback(request,result,{maxMoves});
 }
-export const version=()=>native?.version?.()??'0.1.3-js-fallback';
+export const version=()=>native?.version?.()??'1.0.0-js-fallback';
 
 /**
  * The exported commercial and control-plane API: a quote, a policy decision and catalog
