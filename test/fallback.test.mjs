@@ -1241,7 +1241,7 @@ test('an unpriceable trial cannot win the round on placing more items', () => {
   // The snug box holds both bricks but bills 2000 g against a ladder that stops at
   // 1500 g; the per-unit box ships one brick at 100. A round key that ranked progress
   // first committed the snug box and refused this request, while Rust, Python and PHP
-  // ship it in two per-unit boxes at 200 ( second review).
+  // ship it in two per-unit boxes at 200 (second review).
   const req = request(
     [cube('brick', 100, { weight: '1000 g', quantity: 2 })],
     [
@@ -1294,7 +1294,7 @@ test('the compact lattice path no longer commits to an unpriceable container (qu
   // Found by adversarial review: the compact lattice path scored `lowest_landed_cost`
   // with the same billed-weight proxy the general path uses, but never stood down for
   // it the way it already does for a registered policy rule -- so it could commit to
-  // one container with nothing to correct that choice once made. ` `'s
+  // one container with nothing to correct that choice once made. ``'s
   // homogeneous-block quality search, unlike the compact path or the default
   // `balanced` general search, prices every candidate container exactly rather than by
   // proxy, so it is the one shape that already gets this right; this pins that it stays
@@ -1376,7 +1376,7 @@ test('a portfolio returns the priceable sibling instead of propagating a child r
   // The engine used to throw the no-published-price refusal inside the extreme_points
   // child run, aborting the request its layer sibling could price at 2400. The refusal
   // now fires once, at the outermost frame, on the packing actually selected for
-  // return -- the choke point Rust, Python and PHP already refuse at ( second
+  // return -- the choke point Rust, Python and PHP already refuse at (second
   // review) -- so the priceable sibling wins on the ordinary score comparison.
   const result = packFallback(splitPortfolio(2600));
   assert.equal(result.status, 'feasible');
@@ -1388,7 +1388,7 @@ test('a portfolio returns the priceable sibling instead of propagating a child r
 
 test('alternatives never surface the unpriceable sentinel', () => {
   // The losing extreme_points run carries score[1] = MAX_SAFE_INTEGER. The sentinel is
-  // a search device, never an answer -- alternatives included ( review): the run
+  // a search device, never an answer -- alternatives included (review): the run
   // is filtered out rather than offered as a packing costing 2^53-1 minor units.
   const filtered = packFallback(splitPortfolio(2600));
   assert.equal(filtered.alternatives.length, 0);
@@ -1491,7 +1491,7 @@ test('rebalancing refuses an input packing the tariff cannot price', () => {
 test('rebalancing applies the same landed-cost admission as packing', () => {
   // The current packing uses only `rated`, but `untabled` remains a request option.
   // Letting the direct rebalance API ignore it would make its contract weaker than
-  // packFallback and the native implementation ( second review).
+  // packFallback and the native implementation (second review).
   const base = request(
     [cube('parcel', 100, { weight: '500 g' })],
     [box('rated', 200, 200, 200, { rate_table: { weight_brackets_g: [2000], prices_minor: [500] } })],
@@ -1777,7 +1777,7 @@ test('the objective lower bound matches Python on every corpus case', (t) => {
 });
 
 test('a sum past the declared ceiling is refused rather than answered', () => {
-  // , at the same two inputs Python, PHP and Rust assert. The ceiling is declared
+  //, at the same two inputs Python, PHP and Rust assert. The ceiling is declared
   // rather than inherited: this engine's `Number` stops being exact past 2^53, PHP's integers
   // silently become doubles, Python's are unbounded and Rust's i128 wraps. If each refused at
   // its own limit, a caller would get a number from one engine and a refusal from another for

@@ -73,7 +73,7 @@ test('every legal direction is accepted', () => {
   assert.ok(packFallback(request(['-z', '+z', '-y', '+y', '-x', '+x'])).status);
 });
 
-// A container that names no doors is the pre- default: the rule is inert, not the
+// A container that names no doors is the pre-default: the rule is inert, not the
 // container sealed. `[]` is a caller saying "no doors stated" rather than a malformed
 // request, so it has to behave exactly like the absent field — otherwise the two spellings
 // of one default diverge.

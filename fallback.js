@@ -22,13 +22,13 @@ const UNSUPPORTED={
   request:[],
   configuration:[],
   // `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list
-  // in , the last engine to gain both the solver behaviour and the independent
+  // in, the last engine to gain both the solver behaviour and the independent
   // validation the staged rollout requires.
   item:[],
   // `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract
   // freeze and is refused everywhere until an engine implements it from a request: a field
   // a caller can set and the solver ignores is worse than a refusal.
-  // `access_directions` left this list in , which wired the reserved field through
+  // `access_directions` left this list in, which wired the reserved field through
   // to the stop-accessibility rule in all four engines at once.
   container:['pallet_overhang_limit'],
   obstacle:[],
@@ -37,7 +37,7 @@ const UNSUPPORTED={
   // caller that spells the default out must be served, not refused. What is unimplemented
   // is a *value*, and the refusal names it -- packing a `convex_hull` item as its bounding
   // box would return a plan that looks valid and does not physically fit.
-  // Empty since : this engine implements every value the schema defines. The guard
+  // Empty since: this engine implements every value the schema defines. The guard
   // stays because the next reserved value will need it.
   shapeType:[],
 };
@@ -1603,7 +1603,7 @@ if(solverAlias===null&&requestedSolvers.length){
   winner.termination=aggregateTermination(starts);
   winner.algorithm=withPortfolioEffort(winner,runs);
   const alternativeLimit=Math.max(0,(req.configuration?.alternatives??3)-1);
-  // The sentinel is a search device, never an answer -- alternatives included ( review).
+  // The sentinel is a search device, never an answer -- alternatives included (review).
   winner.alternatives=runs.filter((run,index)=>index!==winnerIndex&&!run.unpriceableDetail).sort((a,b)=>compareScore(a.score,b.score)).slice(0,alternativeLimit);
   return finalizeOutermost(winner);
 }
@@ -2275,7 +2275,7 @@ for(const c of packed){scoreCost+=c.tmpl.cost_minor??0;
 // to invent -- so the refusal fires, but once, at the outermost frame, on the packing
 // actually selected for return: a portfolio sibling with a priceable answer must not be
 // aborted by this run's refusal. Rust, Python and PHP refuse at the same single choke
-// point ( second review). The detail rides the result as a non-enumerable property
+// point (second review). The detail rides the result as a non-enumerable property
 // below, a search device that never serializes.
 let unpriceableDetail=null;
 if(objective==='lowest_landed_cost')for(const c of packed){
