@@ -82,9 +82,17 @@ test('the measured coverage run really is the fallback', { skip: !process.env.PA
 
 test('the blocked candidates are the ones index.js actually tries', () => {
   const source = fs.readFileSync(path.join(PACKAGE, 'index.js'), 'utf8');
-  const candidates = source.match(/for\(const candidate of \[([^\]]*)\]/);
+  const candidates = source.match(/const NATIVE_CANDIDATES = \[([^\]]*)\]/);
   assert.ok(candidates, 'index.js no longer declares its native candidates as a literal list');
   const declared = [...candidates[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
   assert.deepEqual(declared, NATIVE_CANDIDATES,
     'index.js and force-fallback.mjs disagree about the native candidates');
+
+  // The list above is documentation; these are the specifiers that actually load code.
+  // They are required as literals so a supply-chain scanner can resolve every module
+  // this package can pull in -- which only holds while nobody reintroduces a dynamic
+  // `require(variable)`, and only says something while the two lists match.
+  const required = [...source.matchAll(/\brequire\('([^']+)'\)/g)].map((m) => m[1]);
+  assert.deepEqual(required, NATIVE_CANDIDATES,
+    'index.js loads its native backend through something other than the declared literals');
 });

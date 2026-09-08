@@ -1,7 +1,8 @@
 {
   "name":"@packvium/engine",
-  "version":"1.0.0",
+  "version":"1.1.0",
   "description":"Native-first 3D cartonization with deterministic JS fallback",
+  "author":{"name":"Packvium","url":"https://packvium.com"},
   "keywords":["3d-bin-packing","bin-packing","cartonization","packing","container-loading","logistics","shipping","deterministic"],
   "homepage":"https://packvium.com",
   "repository":{"type":"git","url":"git+https://github.com/toxakara/packvium-node.git"},
@@ -12,7 +13,6 @@
   "exports":{".":{"types":"./index.d.ts","import":"./index.js"}},
   "files":["index.js","fallback.js","contact-graph.js","policy.js","commerce.js","commerce-model.js","examples","index.d.ts","README.md","SECURITY.md"],
   "engines":{"node":">=16"},
-  "optionalDependencies":{"@packvium/native":"1.0.0"},
   "scripts":{
     "test":"node test/run-tests.mjs",
     "test:legacy":"node test/legacy-smoke.mjs"
