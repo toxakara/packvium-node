@@ -105,6 +105,8 @@ and execute without a project around it.
 | [`basic.mjs`](examples/basic.mjs) | Pack an order, read placements, and see why an item was refused. |
 | [`objectives.mjs`](examples/objectives.mjs) | All six objectives on scenes where they genuinely disagree — the same scores the Python, PHP and Rust engines print for the same request. |
 | [`shapes.mjs`](examples/shapes.mjs) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, and a cushion that compresses under load until the crush limit refuses it. |
+| [`constraints.mjs`](examples/constraints.mjs) | Stacking caps, incompatible tags and atomic groups — each shown with and without the rule, plus how to read the structured refusal. |
+| [`units.mjs`](examples/units.mjs) | Why lengths travel as strings: fractional inches kept exact, one tick deciding a fit, and the point where a JavaScript number stops being exact and a quote is refused rather than rounded. |
 | [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 
 ```bash

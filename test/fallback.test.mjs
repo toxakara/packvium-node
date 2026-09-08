@@ -693,6 +693,18 @@ test('a high-priority item leads the ordering', () => {
   assert.deepEqual(placements(result).map((p) => p.item_id), ['small#1']);
 });
 
+test('equal items use cross-language Unicode code-point order, not host collation', () => {
+  const result = packFallback(request(
+    [cube('\u{1F600}', 10), cube('Ａ', 10), cube('z', 10)],
+    [box('unicode-order', 40, 10, 10)],
+  ));
+
+  assert.deepEqual(
+    placements(result).map((placement) => placement.item_id),
+    ['z#1', 'Ａ#1', '\u{1F600}#1'],
+  );
+});
+
 test('the cheaper container is preferred when both would do', () => {
   const result = packSound(request([cube('a', 50)], [
     box('dear', 100, 100, 100, { cost_minor: 900 }),
@@ -1282,12 +1294,12 @@ test('the compact lattice path no longer commits to an unpriceable container (qu
   // Found by adversarial review: the compact lattice path scored `lowest_landed_cost`
   // with the same billed-weight proxy the general path uses, but never stood down for
   // it the way it already does for a registered policy rule -- so it could commit to
-  // one container with nothing to correct that choice once made. ``'s
+  // one container with nothing to correct that choice once made. ` `'s
   // homogeneous-block quality search, unlike the compact path or the default
   // `balanced` general search, prices every candidate container exactly rather than by
   // proxy, so it is the one shape that already gets this right; this pins that it stays
   // right now that the compact path is excluded rather than silently overriding it.
-  // The residual gap  tracked -- the default `balanced` profile's general search
+  // The residual gap tracked -- the default `balanced` profile's general search
   // sharing the excluded fast path's proxy -- is closed by the per-round key pricing
   // each trial; `an unpriceable container loses to a priceable one in the general
   // greedy path` above is the case that used to fail.
@@ -1426,7 +1438,7 @@ test('a portfolio with no priceable run anywhere still refuses at the outermost 
   }
 });
 
-test('the quality portfolio prices the  scene instead of refusing it', () => {
+test('the quality portfolio prices the scene instead of refusing it', () => {
   // The second-review scene: eight 500 g cubes, a snug box whose ladder stops at 2000 g
   // and a roomy one priced to 20000 g. Each quality-profile child settles on the roomy
   // box, and the portfolio must ship it at 1500 rather than refuse because some frame
@@ -1558,7 +1570,7 @@ test('the guard refuses exactly the fields the unsupported lists name', (t) => {
   // indistinguishable, from the outside, from one that honoured every field.
   //
   // This used to assert the lists are all empty, which was the same thing while they
-  // were -- and stopped being the same thing the moment  populated two. What the
+  // were -- and stopped being the same thing the moment populated two. What the
   // guard is actually for is that `public-field-matrix.json` records each refusal, so the
   // shared corpus *asserts* it instead of merely tolerating it. So read the matrix and
   // compare both directions.
@@ -1571,24 +1583,34 @@ test('the guard refuses exactly the fields the unsupported lists name', (t) => {
     return;
   }
   const matrix = JSON.parse(readFileSync(matrixUrl, 'utf8'));
-  const rejectedByMatrix = Object.entries(matrix.fields)
-    .filter(([, row]) => matrix.support_sets[row.support].javascript === 'rejected:unsupported_feature')
-    .map(([field]) => field).sort();
-  const declared = new Set([
-    ...UNSUPPORTED_FIELDS.request,
-    ...UNSUPPORTED_FIELDS.configuration.map((name) => `configuration.${name}`),
-    ...UNSUPPORTED_FIELDS.item.map((name) => `items.*.${name}`),
-    ...UNSUPPORTED_FIELDS.container.map((name) => `containers.*.${name}`),
-  ]);
-  // A value-keyed refusal is one matrix row for the field itself. `hull_vertices` is an
-  // array of points, so the schema's leaves -- and therefore its rows -- are the three
-  // coordinates, not the array.
-  if (UNSUPPORTED_FIELDS.shapeType.length) declared.add('items.*.shape_type');
-  if (declared.delete('items.*.hull_vertices')) {
-    for (const axis of 'xyz') declared.add(`items.*.hull_vertices.*.${axis}`);
-  }
+  // An engine refuses a field by name; the matrix is keyed on the schema's leaves, so one
+  // refused field is several rows. The matrix's own `rejection_name` -- the name the
+  // conformance harness demands in the diagnostic -- ties the rows to the field, so the
+  // comparison is made on that and never inferred from the spelling of a path. A
+  // value-keyed template such as `item.shape_type={value}` names the field before `=`.
+  const fieldOf = (rejectionName) => rejectionName.split('=', 1)[0];
+  const rows = Object.entries(matrix.fields).map(([path, row]) => ({
+    path,
+    name: row.rejection_name,
+    support: matrix.support_sets[row.support].javascript,
+  }));
+  const rejectedByMatrix = [...new Set(rows
+    .filter((row) => row.support === 'rejected:unsupported_feature')
+    .map((row) => fieldOf(row.name)))].sort();
+  const declared = new Set(Object.entries(UNSUPPORTED_FIELDS)
+    .filter(([scope]) => scope !== 'shapeType')
+    .flatMap(([scope, names]) =>
+      names.map((name) => (scope === 'request' ? name : `${scope}.${name}`))));
+  if (UNSUPPORTED_FIELDS.shapeType.length) declared.add('item.shape_type');
   assert.deepEqual([...declared].sort(), rejectedByMatrix,
     'the engine and the matrix disagree about what JavaScript refuses');
+  // A field refused by name is refused on every one of its leaves: a row that names a
+  // refused field while recording this engine as implementing it is a matrix error.
+  const halfRecorded = rows
+    .filter((row) => row.name !== undefined && declared.has(fieldOf(row.name))
+      && row.support !== 'rejected:unsupported_feature')
+    .map((row) => row.path);
+  assert.deepEqual(halfRecorded, [], 'rows recorded as implemented for a field JavaScript refuses');
   const carrying = {
     request: (field) => ({ [field]: {} }),
     configuration: (field) => ({ configuration: { [field]: {} } }),
@@ -1618,7 +1640,7 @@ test('the default shape type is served rather than refused', () => {
 });
 
 test('a convex hull is packed by its hull rather than its box', () => {
-  //  closed the staged rollout that began with this engine refusing both shapes. Two
+  // closed the staged rollout that began with this engine refusing both shapes. Two
   // complementary halves of one cube share a crate that fits one of their bounding boxes --
   // the outcome an engine deciding collisions from boxes cannot produce, and the reason the
   // refusal existed rather than packing a hull as its envelope.
@@ -1652,7 +1674,7 @@ test('a routed hull keeps its physical volume when collision falls back to its b
 });
 
 test('the shape memo answers a repeated pack exactly as the first one', () => {
-  //  put a process-lifetime memo in front of hull construction, which is where a
+  // put a process-lifetime memo in front of hull construction, which is where a
   // determinism regression would hide: a wrong cached entry is invisible on the first call
   // and only shows on the second. Packing the same request twice in one process is what
   // distinguishes a memo from a mutation -- the second pack reads every shape from the cache
@@ -1723,7 +1745,7 @@ test('a rotated hull is packed by the hull that rotation actually produces', () 
 });
 
 test('the objective lower bound matches Python on every corpus case', (t) => {
-  //  asks only that this engine's bound never exceed the achieved objective, because
+  // asks only that this engine's bound never exceed the achieved objective, because
   // this engine is not held to placement equality. That freedom does not extend to a bound:
   // it is a function of the request, so a disagreement with Python would be a defect in one
   // of the two rather than the permitted difference in how they place items. Equality is
@@ -1788,7 +1810,7 @@ test('a bound that cannot cross every binding exactly is refused', () => {
 
 test('each shape that occupies less than its box is recognised', () => {
   // The scene supplies this flag ready-made so its equality check is about arithmetic alone.
-  // That leaves exactly one thing it cannot catch, and it is the omission  found in
+  // That leaves exactly one thing it cannot catch, and it is the omission found in
   // Python: a port checking only `nestingHeight` is unsound for the two irregular shapes,
   // both of which occupy less than their bounding box for the same reason.
   assert.equal(__occupiesLessThanItsBoxForTests({ shapeType: 'rigid_cuboid' }), false);

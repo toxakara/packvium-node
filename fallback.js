@@ -1,4 +1,5 @@
 import { appendContactBox, buildContactGraph } from './contact-graph.js';
+import { compareCodePoints } from './commerce-model.js';
 import { parsePolicy, policyRejection, provesUnplaceable, tagOccurrences } from './policy.js';
 
 const LEN={mm:16000,cm:160000,m:16000000,in:406400,inch:406400,inches:406400,ft:4876800,tick:1,ticks:1};
@@ -24,7 +25,12 @@ const UNSUPPORTED={
   // in , the last engine to gain both the solver behaviour and the independent
   // validation the staged rollout requires.
   item:[],
-  container:[],
+  // `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract
+  // freeze and is refused everywhere until an engine implements it from a request: a field
+  // a caller can set and the solver ignores is worse than a refusal.
+  // `access_directions` left this list in , which wired the reserved field through
+  // to the stop-accessibility rule in all four engines at once.
+  container:['pallet_overhang_limit'],
   obstacle:[],
   // `item.shape_type` values this engine does not implement. Presence is the
   // wrong test for this one field: `rigid_cuboid` is the default and is implemented, so a
@@ -305,7 +311,7 @@ function shapeFor(vertices,rotation){
  *  implementation written from that document, and `conformance/scene/objective-bounds.json`
  *  holds it to the same vectors Python computes on 380 cases from the golden corpus.
  *
- *   asks only for soundness -- the bound must never exceed the achieved objective --
+ *  asks only for soundness -- the bound must never exceed the achieved objective --
  *  because this engine is not held to placement equality. That freedom does not extend to a
  *  bound: it is a function of the *request*, so there is no room for a legitimately different
  *  answer, and this port is held to equality because equality is achievable and stronger.
@@ -764,6 +770,10 @@ function axleOverloaded(container,placements,extra=null){const reaction=axleReac
   return (front.max!=null&&reaction.front>BigInt(front.max)*reaction.denominator)
     ||(rear.max!=null&&reaction.rear>BigInt(rear.max)*reaction.denominator)}
 function overlapXY(a,b){const dx=Math.max(0,Math.min(a.x+a.d[0],b.x+b.d[0])-Math.max(a.x,b.x));const dy=Math.max(0,Math.min(a.y+a.d[1],b.y+b.d[1])-Math.max(a.y,b.y));return dx*dy}
+// `overlapXY` on a placement's own fields: the same arithmetic without first copying the
+// placement into a `{x,y,z,d}` box, which the candidate sweep did once per comparison.
+function footprintOverlap(placement,x,y,length,width){const d=placementDimensions(placement);
+  const dx=Math.max(0,Math.min(placement.x+d[0],x+length)-Math.max(placement.x,x));const dy=Math.max(0,Math.min(placement.y+d[1],y+width)-Math.max(placement.y,y));return dx*dy}
 function placementDimensions(placement){return placement.ed??placement.d}
 function placementItemType(placement){return placement.itemType??placement.item?.raw?.id??null}
 function placementNesting(placement){return placement.nesting??placement.item?.nesting??null}
@@ -775,7 +785,16 @@ function sameNestingColumn(left,right){const leftNesting=placementNesting(left),
 // One candidate's exact direct supporters in O(n). A nested predecessor replaces only
 // shadowed face contacts from its own type/footprint column; unrelated face supporters
 // retain their original order and semantics.
-function directSupporters(candidate,placed){const dimensions=placementDimensions(candidate);let predecessor=null;
+function directSupporters(candidate,placed,topPlane=null){const dimensions=placementDimensions(candidate);let predecessor=null;
+  // With the scene bucketed by top face, a non-nesting candidate reads only the placements
+  // whose top is its own base: no predecessor can exist and no supporter is shadowed, so
+  // the full scan below reduces to its second loop over that one bucket, in the same order.
+  if(topPlane!==null&&placementNesting(candidate)==null){const supporters=[],level=topPlane.get(candidate.z);
+    if(level===undefined)return supporters;
+    for(const other of level){if(other===candidate)continue;
+      const area=footprintOverlap(other,candidate.x,candidate.y,dimensions[0],dimensions[1]);
+      if(area>0)supporters.push({placement:other,area})}
+    return supporters}
   for(const other of placed){if(other===candidate||other.z>=candidate.z||!sameNestingColumn(other,candidate))continue;
     if(predecessor==null||other.z>=predecessor.z)predecessor=other}
   if(predecessor!=null&&predecessor.z+placementDimensions(predecessor)[2]-candidate.z!==placementNesting(predecessor))predecessor=null;
@@ -893,8 +912,21 @@ function constraintBox(placement){return {x:placement.x,y:placement.y,z:placemen
   maxCompressionKpa:placement.item.maxCompressionKpa,compressionPpm:placement.item.compressionPpm,
   stopIndex:placement.item.stopIndex}}
 
-function topLoads(boxes,graph=contactGraph(boxes)){const loads=boxes.map(()=>0n);
-  const order=boxes.map((b,i)=>i).sort((a,b)=>(boxes[b].z+boxes[b].d[2])-(boxes[a].z+boxes[a].d[2])||boxes[b].z-boxes[a].z||a-b);
+// The order boxes settle in: highest top first, then highest base, then index. A strict
+// total order, so the permutation it yields is unique -- which is what lets a candidate
+// sweep insert one box into the scene's settled order rather than sort per candidate.
+function settleOrder(boxes){return boxes.map((b,i)=>i).sort((a,b)=>(boxes[b].z+boxes[b].d[2])-(boxes[a].z+boxes[a].d[2])||boxes[b].z-boxes[a].z||a-b)}
+// `settleOrder(boxes)` given the settled order of every box but the last. The last box has
+// the highest index, so it follows every box it ties with, and the order is monotone in
+// (top, base), so its slot is a binary search: O(n) for the copy against O(n log n) for the
+// sort the load path used to pay per candidate.
+function settleOrderWith(baseOrder,boxes){const last=boxes.length-1,top=boxes[last].z+boxes[last].d[2],base=boxes[last].z;
+  let low=0,high=baseOrder.length;
+  while(low<high){const mid=(low+high)>>1,box=boxes[baseOrder[mid]],boxTop=box.z+box.d[2];
+    if(top>boxTop||(top===boxTop&&base>box.z))high=mid;else low=mid+1}
+  const order=baseOrder.slice(0,low);order.push(last);for(let i=low;i<baseOrder.length;i++)order.push(baseOrder[i]);
+  return order}
+function topLoads(boxes,graph=contactGraph(boxes),order=settleOrder(boxes)){const loads=boxes.map(()=>0n);
   for(const upper of order){const supports=graph.supporters[upper];let total=0n;
     for(const [,area] of supports)total+=BigInt(area);
     if(total===0n)continue;
@@ -922,7 +954,7 @@ function groundContactAllowed(candidate,placed,supports=null){const rule=candida
   const box={x:candidate.x,y:candidate.y,z:candidate.z,d:placementDimensions(candidate)},supporters=supports??directSupporters(candidate,placed);
   if(rule==='single')return supporters.length===1;if(rule==='multiple')return supporters.length>=2;
   if(rule==='covered'){const corners=[[box.x,box.y],[box.x+box.d[0],box.y],[box.x,box.y+box.d[1]],[box.x+box.d[0],box.y+box.d[1]]];return corners.every(([x,y])=>supporters.some(({placement})=>{const d=placementDimensions(placement);return placement.x<=x&&x<=placement.x+d[0]&&placement.y<=y&&y<=placement.y+d[1]}))}return true}
-function routeContactAllowed(candidate,placed,supports){
+function routeContactAllowed(candidate,placed,supports,sweep=null){
   // An item without a declared stop rides the whole route. Infinity is the shared
   // PHP/Python/Rust contract. Check only the new relations, as the existing scene was
   // already valid; the one same-column face above may need an O(n) predecessor lookup
@@ -930,6 +962,18 @@ function routeContactAllowed(candidate,placed,supports){
   const candidateStop=candidate.item.stopIndex??Infinity;
   if(supports.some(({placement})=>candidateStop>(placement.item.stopIndex??Infinity)))return false;
   const dimensions=placementDimensions(candidate);let scene=null;
+  if(sweep!==null){
+    // Every comparison below is `stop > Infinity` when nothing on the route declares a
+    // stop, so the rule cannot refuse and the scan is skipped for the request that has no
+    // route at all -- which is every request that is not a multi-drop route.
+    if(candidateStop===Infinity&&!sweep.placedStops)return true;
+    // A non-nesting candidate is never a nested predecessor, so only the placements whose
+    // base is its top can rest on it: read that one bucket instead of the whole scene.
+    if(candidate.item.nesting==null){const level=sweep.bottomPlane().get(candidate.z+dimensions[2]);
+      if(level!==undefined)for(const upper of level)
+        if(footprintOverlap(upper,candidate.x,candidate.y,dimensions[0],dimensions[1])>0&&(upper.item.stopIndex??Infinity)>candidateStop)return false;
+      return true}
+  }
   for(const upper of placed){const upperDimensions=placementDimensions(upper),upperStop=upper.item.stopIndex??Infinity;
     if(validNesting(candidate,upper)&&candidate.z<upper.z){if(upperStop>candidateStop)return false;continue}
     if(candidate.z+dimensions[2]!==upper.z||overlapXY({x:candidate.x,y:candidate.y,z:candidate.z,d:dimensions},{x:upper.x,y:upper.y,z:upper.z,d:upperDimensions})<=0)continue;
@@ -1019,12 +1063,11 @@ function accessibleAgainst(base,candidateBox){
 // the other; docs/STOP-ACCESSIBILITY.md derives the rule and the post-validator's
 // whole-scene replay stays the sufficient check.
 //
-// Inert unless the caller supplies exit directions. The request schema has no field for
-// them, and assuming all six walls open would enforce a rule true of no real vehicle and
-// nearly vacuous besides -- a box is almost always free through *some* face. This engine
-// has no programmatic config path, so the request path always passes the empty list and an
-// embedder reaches the rule by calling this function directly, which is as close as
-// JavaScript gets to the config field Python, PHP and Rust carry.
+// Inert unless the container supplies exit directions. `container.access_directions` is
+// canonicalised into `tmpl.doors` by the request decoder; omitting it preserves the
+// pre-1.1.0 behaviour instead of pretending all six walls are doors. JavaScript has no
+// separate programmatic configuration object, so the per-container request field is its
+// only activation path.
 //
 // The blocker set is `{q : s(q) > s(p)}` -- strictly later. Same-stop items are excluded
 // because the order within a stop is free: whichever is in the way comes off first.
@@ -1043,12 +1086,40 @@ function sweptHits([sx1,sy1,sz1,sx2,sy2,sz2],box){
   return sx1<box.x+box.d.length&&box.x<sx2&&sy1<box.y+box.d.width&&box.y<sy2
     &&sz1<box.z+box.d.height&&box.z<sz2}
 
-function allowed(candidate,placed,container,globalSupportPpm,metrics,loadBase=null,accessBase=null){
+// What one candidate sweep knows about its item and the placed scene before any position is
+// tried. `allowed` used to rediscover each of these with its own pass over `placed` for every
+// feasible candidate -- the tag conflict, four "does anything here declare X" gates and the
+// supporter scan, on a scene that cannot change until the sweep commits -- which is where
+// the profile put a fifth of the whole solve. Built once per (template, item) sweep, in
+// O(n); the plane buckets are built on first demand because a floor candidate never asks.
+// A caller without a sweep (the rebalance replay) builds one per call and loses nothing.
+function sweepContext(item,placed){
+  const tags=item.tags,bad=item.incompatible;
+  let tagConflict=false,anyUnstackable=false,placedMaxTop=false,placedCompressible=false,placedMaxStacked=false,placedStops=false;
+  for(const p of placed){const other=p.item;
+    if(bad.some(t=>other.tags.includes(t))||other.incompatible.some(t=>tags.includes(t)))tagConflict=true;
+    if(!other.stackable)anyUnstackable=true;
+    if(other.maxTop!=null)placedMaxTop=true;
+    if(other.maxCompressionKpa!=null)placedCompressible=true;
+    if(other.maxStacked!=null)placedMaxStacked=true;
+    if(other.stopIndex!=null)placedStops=true}
+  let byTop=null,byBottom=null;
+  return {tagConflict,anyUnstackable,placedMaxTop,placedCompressible,placedMaxStacked,placedStops,
+    // Buckets keep `placed` order, which is the order every supporter list is contracted to.
+    topPlane(){if(byTop===null)byTop=bucketByPlane(placed,p=>p.z+placementDimensions(p)[2]);return byTop},
+    bottomPlane(){if(byBottom===null)byBottom=bucketByPlane(placed,p=>p.z);return byBottom}}}
+function bucketByPlane(placed,planeOf){const buckets=new Map();
+  for(const p of placed){const plane=planeOf(p),bucket=buckets.get(plane);if(bucket)bucket.push(p);else buckets.set(plane,[p])}
+  return buckets}
+function allowed(candidate,placed,container,globalSupportPpm,metrics,loadBase=null,accessBase=null,sweep=null){
   const box={x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed};
   if(candidate.item.raw.must_be_on_floor&&box.z!==0)return false;
-  const tags=candidate.item.tags,bad=candidate.item.incompatible;
-  for(const p of placed){
-    if(bad.some(t=>p.item.tags.includes(t))||p.item.incompatible.some(t=>tags.includes(t)))return false;
+  const scene=sweep??sweepContext(candidate.item,placed);
+  if(scene.tagConflict)return false;
+  // Face-to-face contact can only refuse when one of the pair declines to carry, and the
+  // nesting rule only when the candidate nests. A non-nesting candidate consults the two
+  // planes it can touch; anything else walks the scene exactly as before.
+  if(candidate.item.nesting!=null||sweep===null){if(scene.anyUnstackable||!candidate.item.stackable||candidate.item.nesting!=null)for(const p of placed){
     const other={x:p.x,y:p.y,z:p.z,d:p.ed};
     if(overlapXY(other,box)<=0)continue;
     if(other.z+other.d[2]===box.z&&!p.item.stackable)return false;
@@ -1059,10 +1130,15 @@ function allowed(candidate,placed,container,globalSupportPpm,metrics,loadBase=nu
       const [lower]=candidate.z<=p.z?[candidate,p]:[p,candidate];
       if(!lower.item.stackable)return false;
     }
+  }}else{
+    if(scene.anyUnstackable){const level=sweep.topPlane().get(box.z);
+      if(level!==undefined)for(const p of level)if(!p.item.stackable&&footprintOverlap(p,box.x,box.y,box.d[0],box.d[1])>0)return false}
+    if(!candidate.item.stackable){const level=sweep.bottomPlane().get(box.z+box.d[2]);
+      if(level!==undefined)for(const p of level)if(footprintOverlap(p,box.x,box.y,box.d[0],box.d[1])>0)return false}
   }
   metrics.support_checks++;
   const ratio=Math.max(globalSupportPpm,candidate.item.supportPpm);
-  const supports=box.z===0?[]:directSupporters(candidate,placed);
+  const supports=box.z===0?[]:directSupporters(candidate,placed,sweep===null?null:sweep.topPlane());
   if(supports.some(({placement})=>placement.item.stackable===false))return false;
   if(box.z!==0&&ratio>0){
     const area=supports.reduce((total,support)=>total+support.area,0);
@@ -1072,21 +1148,21 @@ function allowed(candidate,placed,container,globalSupportPpm,metrics,loadBase=nu
   // decidable from the items alone; when neither fires, the three skipped checks
   // return false for every box anyway, and building n+1 boxes per feasible
   // candidate was pure allocation.
-  const needsLoads=container.maxStackDensity!=null||candidate.item.maxTop!=null||placed.some(p=>p.item.maxTop!=null)
-    ||candidate.item.maxCompressionKpa!=null||placed.some(p=>p.item.maxCompressionKpa!=null);
-  const needsGraph=needsLoads||candidate.item.maxStacked!=null||placed.some(p=>p.item.maxStacked!=null);
-  if(!needsGraph)return groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports)
+  const needsLoads=container.maxStackDensity!=null||candidate.item.maxTop!=null||scene.placedMaxTop
+    ||candidate.item.maxCompressionKpa!=null||scene.placedCompressible;
+  const needsGraph=needsLoads||candidate.item.maxStacked!=null||scene.placedMaxStacked;
+  if(!needsGraph)return groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports,scene)
     &&(accessBase===null||accessibleAgainst(accessBase,corridorBox(candidate)));
   // With a base for this sweep, both the box list and the graph come from it by
   // appending one box, rather than each candidate rebuilding both from every placement.
   // The two paths are required to agree exactly, which is what `contact-graph`'s append
   // property test holds them to.
   const candidateBox=constraintBox(candidate),base=loadBase===null?null:loadBase();
-  const boxes=base===null?[...placed.map(constraintBox),candidateBox]:[...base.boxes,candidateBox];
-  const graph=base===null?contactGraph(boxes):appendContactBox(base,candidateBox,overlapXY);
-  const loads=needsLoads?topLoads(boxes,graph):null;
+  const boxes=base===null?[...placed.map(constraintBox),candidateBox]:[...base.graph.boxes,candidateBox];
+  const graph=base===null?contactGraph(boxes):appendContactBox(base.graph,candidateBox,overlapXY);
+  const loads=!needsLoads?null:base===null?topLoads(boxes,graph):topLoads(boxes,graph,settleOrderWith(base.order,boxes));
   return !overloaded(boxes,loads)&&!crushed(boxes,loads)&&!stackLimitsExceeded(boxes,graph)&&!stackDensityExceeded(boxes,container.maxStackDensity,loads)
-    &&groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports)
+    &&groundContactAllowed(candidate,placed,supports)&&routeContactAllowed(candidate,placed,supports,scene)
     &&(accessBase===null||accessibleAgainst(accessBase,corridorBox(candidate)));
 }
 
@@ -1462,6 +1538,15 @@ function unstartedRecord(solverAlias,index,globalDeadlineReached){return {
   global_deadline_reached:globalDeadlineReached,
 }}
 export function packFallback(req,clock=Date.now,solverAlias=null,startIndex=null,sharedDeadline=null){rejectUnsupported(req);
+// Admit the doors here, beside the other request-admission checks, and not
+// where they are canonicalised. The container template is built after the
+// uniform-lattice fast path has already returned, so validating there let a request
+// that took that path name a wall this engine has never heard of and be answered --
+// while Python, PHP and Rust refused the same request. The corpus could not see it:
+// the schema's own enum rejects a bad direction before any engine is asked, so the
+// divergence was reachable only from a library call, which is exactly how an
+// embedder reaches this engine.
+for(const container of req.containers??[])validateDirections(container.access_directions??[]);
 const requestedSolvers=req.configuration?.solvers??[],knownSolvers=['grid','extreme_points','homogeneous_blocks','layer','maximal_spaces','exact_small'];
 if(!Array.isArray(requestedSolvers)||requestedSolvers.some(name=>!knownSolvers.includes(name)))throw new RangeError(`unknown solver; expected one of ${knownSolvers.join(', ')}`);
 const exactItemLimit=req.configuration?.exact_item_limit??7;
@@ -1476,7 +1561,7 @@ const restartLimit=effort?.max_restarts??Number.MAX_SAFE_INTEGER;
 // a k-start request consume up to k*time_limit_ms while still reporting one portfolio
 // deadline, which is both a determinism and an observability defect.
 const deadline=sharedDeadline??new Deadline(req.configuration?.time_limit_ms??1000,clock);
-//  second review: the lowest_landed_cost refusal fires once, at the single
+// second review: the lowest_landed_cost refusal fires once, at the single
 // outermost frame, on the packing actually selected for return -- the same choke point
 // Rust, Python and PHP refuse at. A child solver/start run instead hands its result
 // back sentinel and all, so a portfolio sibling with a priceable answer is not aborted
@@ -1608,7 +1693,10 @@ const policyRules=parsePolicy(req.policy);
 const compact=(policyRules.length||objective==='lowest_landed_cost')?null:compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solverAlias,metrics,effortExceeded,effortRemaining,deadline});
 if(compact!==null)return compact;
 const items=[];for(const raw of req.items){const d=dims(raw.dimensions,u),w=scalar(raw.weight??0,'g',WT),rots=raw.allowed_rotations??(raw.keep_upright?['LWH','WLH']:Object.keys(ROT)),nesting=raw.nesting_height==null?null:scalar(raw.nesting_height,u,LEN);
-  for(let i=1;i<=(raw.quantity??1);i++)items.push({raw,d,w,rots,id:`${raw.id}#${i}`,
+  // The ordering keys below are functions of the item alone, computed once per type here
+  // rather than as fresh BigInts on both sides of every comparison the sort makes.
+  const vol=volume(d),longest=Math.max(...d);
+  for(let i=1;i<=(raw.quantity??1);i++)items.push({raw,d,w,rots,vol,longest,id:`${raw.id}#${i}`,
     stackable:raw.stackable!==false,maxTop:raw.max_top_load==null?null:scalar(raw.max_top_load,'g',WT),
     supportPpm:Math.round((raw.minimum_support_ratio??0)*SUPPORT_SCALE),priority:raw.priority??0,
     tags:raw.tags??[],incompatible:raw.incompatible_tags??[],group:raw.group??null,
@@ -1618,6 +1706,12 @@ const items=[];for(const raw of req.items){const d=dims(raw.dimensions,u),w=scal
 // Priority is a preference, not a guarantee: it leads the ordering so a caller can
 // bias the search, but ties (the default, priority 0 for all items) fall through to
 // the volume key unchanged.
+// Identifiers use the same Unicode-code-point order as Python, PHP, Rust and the commerce
+// API. Locale collation is host-dependent, while JavaScript's relational/default order is
+// UTF-16-code-unit order; both violate the cross-platform determinism contract outside
+// ASCII. Only the sign of a key matters to the sort, so the volume key compares BigInts
+// directly instead of materialising their difference.
+const compareId=compareCodePoints,ascendingVolume=(a,b)=>a.vol<b.vol?-1:a.vol>b.vol?1:0;
 items.sort((a,b)=>{
   const priority=b.priority-a.priority;if(priority)return priority;
   // Under `maximum_value` the second objective key is the value left behind, so the
@@ -1631,15 +1725,15 @@ items.sort((a,b)=>{
   // loads with the last one. Every stop is Infinity when nothing declares one, so an
   // unrouted request keeps the ordering below untouched.
   {const stop=(b.stopIndex??Infinity)-(a.stopIndex??Infinity);if(stop)return stop}
-  if(qualityProfile&&(startIndex===null||startIndex===0))return Math.max(...a.d)-Math.max(...b.d)||Number(volume(a.d)-volume(b.d))||a.id.localeCompare(b.id);
-  if(qualityProfile&&startIndex===1)return Number(volume(a.d)-volume(b.d))||Math.max(...a.d)-Math.max(...b.d)||a.id.localeCompare(b.id);
-  if(solverAlias==='layer')return (b.d[2]-a.d[2])||(b.d[0]*b.d[1]-a.d[0]*a.d[1])||a.id.localeCompare(b.id);
-  if(solverAlias==='maximal_spaces')return (Math.max(...b.d)-Math.max(...a.d))||Number(volume(b.d)-volume(a.d))||a.id.localeCompare(b.id);
+  if(qualityProfile&&(startIndex===null||startIndex===0))return a.longest-b.longest||ascendingVolume(a,b)||compareId(a.id,b.id);
+  if(qualityProfile&&startIndex===1)return ascendingVolume(a,b)||a.longest-b.longest||compareId(a.id,b.id);
+  if(solverAlias==='layer')return (b.d[2]-a.d[2])||(b.d[0]*b.d[1]-a.d[0]*a.d[1])||compareId(a.id,b.id);
+  if(solverAlias==='maximal_spaces')return (b.longest-a.longest)||ascendingVolume(b,a)||compareId(a.id,b.id);
   // `exact_small` deliberately has no ordering of its own. It used to sort by id, which
   // was harmless while it was greedy-in-disguise and actively harmful once the search
   // became real: smallest-first is the worst descent order, so the first branch failed to
   // pack everything and the bound never pruned.
-  return Number(volume(b.d)-volume(a.d))||a.id.localeCompare(b.id);
+  return ascendingVolume(b,a)||compareId(a.id,b.id);
 });
 // Start 0 is the ordering above, so a single-start request is byte-identical to what it
 // produced before restarts existed; every later start re-solves a shuffle of it.
@@ -1654,7 +1748,13 @@ const templates=req.containers.map(c=>{const d=dims(c.inner_dimensions,u),axleSp
   // innerVolume/reserve are pure functions of the immutable template, hoisted out of
   // candidatesFor's innermost (point x rotation) loop where they were recomputed as
   // fresh BigInts per orientation.
-  return {...c,d,outerD,max:c.max_payload==null?null:scalar(c.max_payload,'g',WT),tare:scalar(c.tare_weight??0,'g',WT),axleSpec,reservePpm,
+  // The walls this container may be unloaded through. Canonicalised into
+  // ALL_DIRECTIONS order and deduplicated rather than kept as given, so two callers naming
+  // the same doors in a different order search identically -- the same normalisation the
+  // Python, PHP and Rust decoders apply, and the reason all four agree on the answer.
+  validateDirections(c.access_directions??[]);
+  const doors=Object.freeze(ALL_DIRECTIONS.filter(d=>(c.access_directions??[]).includes(d)));
+  return {...c,d,outerD,doors,max:c.max_payload==null?null:scalar(c.max_payload,'g',WT),tare:scalar(c.tare_weight??0,'g',WT),axleSpec,reservePpm,
     innerVolume:volume(d),reserve:volume(d)*BigInt(reservePpm)/BigInt(SUPPORT_SCALE),
     rate:parseRateTable(c.rate_table),tagLimits:c.tag_limits??{},maxStackDensity,
     obs:(c.obstacles??[]).flatMap(o=>[o,...(o.additional_boxes??[])]).map(o=>({x:scalar(o.origin?.x??0,u,LEN),y:scalar(o.origin?.y??0,u,LEN),z:scalar(o.origin?.z??0,u,LEN),d:dims(o.dimensions,u)}))}}).sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'?(dimensionalWeight(a.outerD)-dimensionalWeight(b.outerD)||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))):((a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))));
@@ -1704,64 +1804,84 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
       // hint comes from this item's own rotations, which are known here.
       const widest=Math.max(1,...item.rots.flatMap(r=>{const pd=rotate(item.d,r);
         return [pd[0]+2*clear,pd[1]+2*clear]}));
-      loadBaseGraph=buildContactGraph(state.placements.map(constraintBox),overlapXY,widest);
+      const graph=buildContactGraph(state.placements.map(constraintBox),overlapXY,widest);
+      // The settled order of the base scene, sorted once here: each candidate then slots
+      // itself in rather than re-sorting the scene (`settleOrderWith`).
+      loadBaseGraph={graph,order:settleOrder(graph.boxes)};
     }
     return loadBaseGraph;
   };
   // The same argument, for the other rule that reads the whole placed scene. The
-  // doors are empty on every request path today, so this base is inert and costs one pass
-  // over the stops -- it is built here rather than inside `allowed` so that wiring the
-  // field through later does not silently turn an O(m*|D|) check into O(m^2*|D|) per
-  // candidate.
-  const accessBase=stopAccessibilityBase(item.stopIndex,state.placements,tmpl,[]);
+  // doors now come from the container, which is why the hoist mattered: switching the field
+  // on inside `allowed` would have turned an O(m*|D|) check into O(m^2*|D|) per candidate.
+  // A container that states no doors leaves the base inert at the cost of one pass over the
+  // stops, which is what every request that is not a multi-drop route pays.
+  const accessBase=stopAccessibilityBase(item.stopIndex,state.placements,tmpl,tmpl.doors);
   const compressionSensitive=item.shapeType==='compressible'
     ||state.placements.some(placement=>placement.item.shapeType==='compressible');
   const found=[];
   const candidates=points.length>maxCandidatePoints?points.slice(0,maxCandidatePoints):points;
-  candidatePoints:for(const pt of candidates){if(candidateEffortExceeded())break;metrics.candidate_points_considered++;for(const r of item.rots){if(candidateEffortExceeded())break candidatePoints;metrics.orientations_considered++;if(deadline.expired()){timeLimitReached=true;break candidatePoints}const pd=rotate(item.d,r),ed=pd.map(x=>x+2*clear),box={x:pt[0],y:pt[1],z:pt[2],d:ed};
-    if(ed.some((x,k)=>pt[k]+x>tmpl.d[k]))continue;
-    if(tmpl.max!=null&&state.payload+item.w>tmpl.max)continue;
-    if(tmpl.max_items!=null&&state.placements.length>=tmpl.max_items)continue;
-    const tentative={x:pt[0],y:pt[1],z:pt[2],pd,ed,r,item};
-    if(!compressionSensitive&&used+usedVolumeDelta(state.placements,tentative)+tmpl.reserve>tmpl.innerVolume)continue;
+  // Everything that is a function of (item, rotation) alone -- the rotated envelope, the
+  // volume it occupies, its hull -- is computed once per sweep here rather than once per
+  // point, the class of waste docs/PERFORMANCE-PRACTICE.md ranks first. The volume gate is
+  // also a function of `used`, fixed for the sweep, so it collapses to one boolean per
+  // orientation; only a nesting item keeps the per-position delta, because what it can
+  // nest into depends on where it lands. The payload and count gates depend on nothing
+  // the point loop changes. Every gate is pure, so the order they are asked in is free.
+  const placements=state.placements,nests=item.nesting!=null,sweep=sweepContext(item,placements);
+  const payloadBlocked=tmpl.max!=null&&state.payload+item.w>tmpl.max,countBlocked=tmpl.max_items!=null&&placements.length>=tmpl.max_items;
+  const exactHull=item.shapeType==='convex_hull'&&item.stopIndex==null&&clear===0;
+  const orientations=item.rots.map(r=>{const pd=rotate(item.d,r),ed=pd.map(x=>x+2*clear);
+    return {r,pd,ed,shape:exactHull?shapeFor(item.hullVertices,r):null,
+      volumeBlocked:!compressionSensitive&&!nests&&used+occupiedVolume({pd,r,item})+tmpl.reserve>tmpl.innerVolume}});
+  const [innerX,innerY,innerZ]=tmpl.d,obstacles=tmpl.obs;
+  candidatePoints:for(const pt of candidates){if(candidateEffortExceeded())break;metrics.candidate_points_considered++;const x=pt[0],y=pt[1],z=pt[2];
+    for(const orientation of orientations){if(candidateEffortExceeded())break candidatePoints;metrics.orientations_considered++;if(deadline.expired()){timeLimitReached=true;break candidatePoints}
+    const {r,pd,ed}=orientation,x2=x+ed[0],y2=y+ed[1],z2=z+ed[2];
+    if(x2>innerX||y2>innerY||z2>innerZ)continue;
+    if(payloadBlocked||countBlocked||orientation.volumeBlocked)continue;
+    const candidate={x,y,z,pd,ed,r,item};
+    if(nests&&!compressionSensitive&&used+usedVolumeDelta(placements,candidate)+tmpl.reserve>tmpl.innerVolume)continue;
     let collision=false;
-    const candidateShape=item.shapeType==='convex_hull'&&item.stopIndex==null&&clear===0
-      ?shapeFor(item.hullVertices,r):null;
-    for(const obstacle of tmpl.obs){metrics.collision_checks++;
+    const candidateShape=orientation.shape,box={x,y,z,d:ed};
+    for(const obstacle of obstacles){metrics.collision_checks++;
       if(intersects(box,obstacle)&&solidsOverlap(candidateShape,box,null,obstacle)){collision=true;break}}
     // Broad phase: visit only the placements sharing a cell with `box`, stamping each
     // so a placement spanning several cells is narrow-phase-checked once. A generation
     // counter does that without allocating a set per candidate orientation.
-    if(!collision){const [ix1,ix2,iy1,iy2,iz1,iz2]=cellRange(index,box),stamp=++index.gen,tentativeBox={x:pt[0],y:pt[1],z:pt[2],pd,ed,r,item};
+    if(!collision){const [ix1,ix2,iy1,iy2,iz1,iz2]=cellRange(index,box),stamp=++index.gen;
       scan:for(let ix=ix1;ix<ix2;ix++)for(let iy=iy1;iy<iy2;iy++)for(let iz=iz1;iz<iz2;iz++){
         const bucket=index.cells.get(cellKey(ix,iy,iz));if(!bucket)continue;
         for(const position of bucket){if(index.seen[position]===stamp)continue;index.seen[position]=stamp;
-          const placed=state.placements[position];metrics.collision_checks++;
-          const placedBox={x:placed.x,y:placed.y,z:placed.z,d:placed.ed};
-          if(intersects(box,placedBox)&&!validNesting(tentativeBox,placed)
+          const placed=placements[position],pe=placed.ed;metrics.collision_checks++;
+          // `intersects` on the placement's own fields: copying each visited placement into
+          // a box first was one allocation per narrow-phase check, a million per solve. The
+          // nesting exemption can only apply to a nesting candidate, and the box the exact
+          // test needs is built only once an envelope overlap has been found.
+          if(x<placed.x+pe[0]&&x2>placed.x&&y<placed.y+pe[1]&&y2>placed.y&&z<placed.z+pe[2]&&z2>placed.z
+            &&!(nests&&validNesting(candidate,placed))
             // The axis-aligned test is the broad phase and stays mandatory. Only when a hull
             // is one of the two solids does the exact test get to overrule it, so a request of
             // ordinary boxes never reaches the hull path at all.
-            &&solidsOverlap(candidateShape,box,placedHull(placed),placedBox)){collision=true;break scan}}}}
+            &&solidsOverlap(candidateShape,box,placedHull(placed),{x:placed.x,y:placed.y,z:placed.z,d:pe})){collision=true;break scan}}}}
     if(collision)continue;
-    const candidate={x:pt[0],y:pt[1],z:pt[2],pd,ed,r,item};
-    if(axleOverloaded(tmpl,state.placements,candidate))continue;
-    if(!allowed(candidate,state.placements,tmpl,globalSupportPpm,metrics,loadBase,accessBase))continue;
+    if(axleOverloaded(tmpl,placements,candidate))continue;
+    if(!allowed(candidate,placements,tmpl,globalSupportPpm,metrics,loadBase,accessBase,sweep))continue;
     // With zero load the candidate is at its largest, and appending it can only shrink
     // existing compressible supports. If that upper bound fits, the exact support-graph
     // refresh cannot reject it; only a candidate near the reserve boundary pays the
     // non-local calculation. Ordinary requests retain the incremental O(1) path above.
-    if(compressionSensitive){const upperBound=used+occupiedVolume(tentative);
+    if(compressionSensitive){const upperBound=used+occupiedVolume(candidate);
       if(upperBound+tmpl.reserve>tmpl.innerVolume
-        &&usedVolume([...state.placements,tentative])+tmpl.reserve>tmpl.innerVolume)continue}
+        &&usedVolume([...placements,candidate])+tmpl.reserve>tmpl.innerVolume)continue}
     metrics.feasible_candidates++;
     const score=solverAlias==='grid'
-      ?pt[2]*1e12+pt[1]*1e6+pt[0]
+      ?z*1e12+y*1e6+x
       :solverAlias==='layer'
-        ?(pt[2]+ed[2])*1e12+pt[2]*1e8+pt[1]*1e4+pt[0]
+        ?z2*1e12+z*1e8+y*1e4+x
         :solverAlias==='maximal_spaces'
-          ?(pt[0]+ed[0])+(pt[1]+ed[1])+(pt[2]+ed[2])*1e6
-          :(pt[2]+ed[2])*1e9+(pt[1]+ed[1])*1e4+pt[0]+ed[0];
+          ?x2+y2+z2*1e6
+          :z2*1e9+y2*1e4+x2;
     if(width===1){if(!found.length||score<found[0].score)found[0]={score,...candidate};continue}
     found.push({score,...candidate})}}
   if(width===1)return found;
@@ -1826,7 +1946,7 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     difference=b.state.placements.length-a.state.placements.length;if(difference)return difference;
     const az=a.state.placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0),bz=b.state.placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0);
     if(az!==bz)return az-bz;if(a.used!==b.used)return a.used>b.used?-1:1;
-    const signature=node=>node.state.placements.map(p=>`${p.item.id}@${p.x},${p.y},${p.z}`).join('|');return signature(a).localeCompare(signature(b))};
+    const signature=node=>node.state.placements.map(p=>`${p.item.id}@${p.x},${p.y},${p.z}`).join('|');return compareCodePoints(signature(a),signature(b))};
   const greedy=tryPackIntoTemplate(tmpl,itemsRemaining);let beam=[fresh()],incumbent=fresh();incumbent.state=greedy.state;incumbent.used=greedy.used;incumbent.unplaced=greedy.next;let nodes=0;
   for(let position=0;position<batches.length;position++){
     const batch=batches[position],future=batches.slice(position+1).flat(),expansions=[];let exhausted=false;
@@ -1987,7 +2107,7 @@ const homogeneousBlocksSupported=()=>policyRules.length===0&&templates.every(t=>
   &&items.every(i=>i.group==null&&!i.tags.length&&!i.incompatible.length&&!i.eligibleTags.length
     &&i.stackable&&!i.raw.must_be_on_floor&&i.maxTop==null&&i.maxStacked==null
     &&i.supportPpm===0&&(i.groundRule==null||i.groundRule==='free')&&i.nesting==null&&i.stopIndex==null);
-const compareBlockValue=(a,b)=>typeof a==='bigint'?(a<b?-1:a>b?1:0):typeof a==='string'?a.localeCompare(b):a-b;
+const compareBlockValue=(a,b)=>typeof a==='bigint'?(a<b?-1:a>b?1:0):typeof a==='string'?compareCodePoints(a,b):a-b;
 const compareBlockKey=(a,b)=>{for(let i=0;i<a.length;i++){const difference=compareBlockValue(a[i],b[i]);if(difference)return difference}return 0};
 const containsSpace=(outer,inner)=>outer.x<=inner.x&&outer.y<=inner.y&&outer.z<=inner.z
   &&outer.x+outer.d[0]>=inner.x+inner.d[0]&&outer.y+outer.d[1]>=inner.y+inner.d[1]&&outer.z+outer.d[2]>=inner.z+inner.d[2];
@@ -2067,7 +2187,7 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
     if(exhausted||!expansions.length)break;
     const dominant=new Map();for(const plan of expansions){const signature=`${plan.remaining.map(i=>i.id).join('|')}::${[...plan.inventory.entries()].sort().map(([k,v])=>`${k}:${v}`).join('|')}`;
       const previous=dominant.get(signature);if(!previous||compareScore(planScore(plan,[]),planScore(previous,[]))<0)dominant.set(signature,plan)}
-    beam=[...dominant.values()].sort((a,b)=>compareScore(planBound(a),planBound(b))||a.remaining.map(i=>i.id).join('|').localeCompare(b.remaining.map(i=>i.id).join('|'))).slice(0,containerPlanBeamWidth)}
+    beam=[...dominant.values()].sort((a,b)=>compareScore(planBound(a),planBound(b))||compareCodePoints(a.remaining.map(i=>i.id).join('|'),b.remaining.map(i=>i.id).join('|'))).slice(0,containerPlanBeamWidth)}
   packed.push(...incumbent.packed);remaining.splice(0,remaining.length,...incumbent.remaining);seq=incumbent.seq;
 }else while(remaining.length&&packed.length<maxContainers){
   if(deadline.expired()){timeLimitReached=true;break}
@@ -2272,7 +2392,7 @@ function rebalanceValid(context,result){
     if(usedVolume(state.placements)+volume(state.tmpl.d)*BigInt(state.tmpl.reservePpm)/BigInt(SUPPORT_SCALE)>volume(state.tmpl.d))return false;
     if(axleOverloaded(state.tmpl,state.placements))return false;
     const placed=[];
-    for(const candidate of [...state.placements].sort((a,b)=>a.z-b.z||a.y-b.y||a.x-b.x||a.item.id.localeCompare(b.item.id))){
+    for(const candidate of [...state.placements].sort((a,b)=>a.z-b.z||a.y-b.y||a.x-b.x||compareCodePoints(a.item.id,b.item.id))){
       if(!allowed(candidate,placed,state.tmpl,context.globalSupportPpm,{support_checks:0}))return false;
       // A move the rules forbid must fail the same check a placement did. Replaying the
       // container in this order is what makes a cap or a segregation answerable at all:
@@ -2334,7 +2454,7 @@ export function rebalanceWeight(req,result,{maxMoves=64}={}){
   }
   const context=rebalanceContext(req,result),moves=[];
   if(!rebalanceValid(context,result))throw new TypeError('result is not a valid packing of this request');
-  //  second review: under `lowest_landed_cost` a move is a re-pricing -- shifting
+  // second review: under `lowest_landed_cost` a move is a re-pricing -- shifting
   // payload can push a destination past its rate table's last bracket, leaving the
   // "balanced" packing with no published price. States are priced with the same helpers
   // the packer bills with: an unpriceable input is refused up front in the standard
@@ -2407,7 +2527,7 @@ export class SequenceReplayError extends Error{
 }
 export class SequenceWarning{
   constructor(code,index,messageKey,arguments_={}){this.code=code;this.index=index;this.message_key=messageKey;
-    this.arguments=Object.fromEntries(Object.entries(arguments_).sort(([a],[b])=>a.localeCompare(b)));Object.freeze(this.arguments);Object.freeze(this)}
+    this.arguments=Object.fromEntries(Object.entries(arguments_).sort(([a],[b])=>compareCodePoints(a,b)));Object.freeze(this.arguments);Object.freeze(this)}
   toJSON(){return {code:this.code,index:this.index,message_key:this.message_key,arguments:this.arguments}}
 }
 function sequenceInteger(value,name){if(!Number.isSafeInteger(value))throw new RangeError(`${name} must be a safe integer tick count`);return value}
