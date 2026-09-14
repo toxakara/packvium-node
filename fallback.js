@@ -912,6 +912,39 @@ function constraintBox(placement){return {x:placement.x,y:placement.y,z:placemen
   maxCompressionKpa:placement.item.maxCompressionKpa,compressionPpm:placement.item.compressionPpm,
   stopIndex:placement.item.stopIndex}}
 
+// Keep only the requested prefix: the root is the worst score, latest tie first.
+// Ordinals make heap eviction preserve the stable full-sort order exactly.
+function compareRetained(a,b){return a.score-b.score||a.ordinal-b.ordinal}
+function retainCandidate(heap,width,score,ordinal,candidate){
+  if(heap.length===width&&score>=heap[0].score)return;
+  const entry={score,ordinal,candidate};
+  if(heap.length<width){
+    let at=heap.length;heap.push(entry);
+    while(at>0){const parent=Math.floor((at-1)/2);if(compareRetained(heap[parent],entry)>=0)break;
+      heap[at]=heap[parent];at=parent}
+    heap[at]=entry;return;
+  }
+  let at=0;
+  while(at*2+1<heap.length){let child=at*2+1;
+    if(child+1<heap.length&&compareRetained(heap[child+1],heap[child])>0)child++;
+    if(compareRetained(entry,heap[child])>=0)break;
+    heap[at]=heap[child];at=child}
+  heap[at]=entry;
+}
+function groupBatches(items){const batches=[],groups=new Map();
+  for(const item of items){
+    if(item.group===null){batches.push([item]);continue}
+    let batch=groups.get(item.group);
+    if(batch===undefined){batch=[];groups.set(item.group,batch);batches.push(batch)}
+    batch.push(item)}
+  return batches;
+}
+// Internal test probes, deliberately absent from the package's index.js exports.
+export function __candidatePrefixForTests(scores,width){const heap=[];
+  scores.forEach((score,ordinal)=>retainCandidate(heap,width,score,ordinal,ordinal));
+  return heap.sort(compareRetained).map(entry=>entry.candidate)}
+export function __groupBatchesForTests(items){return groupBatches(items)}
+
 // The order boxes settle in: highest top first, then highest base, then index. A strict
 // total order, so the permutation it yields is unique -- which is what lets a candidate
 // sweep insert one box into the scene's settled order rather than sort per candidate.
@@ -1769,12 +1802,7 @@ const maxContainers=req.configuration?.max_containers??Infinity;
 // template wins.
 // Group members travel together: one container takes all of them or none. Batching them
 // here is what both the greedy pass and the exact search branch over.
-const batchesOf=itemsRemaining=>{const batches=[],taken=new Set();
-  for(const item of itemsRemaining){if(taken.has(item))continue;
-    if(item.group===null){batches.push([item]);taken.add(item);continue}
-    const batch=itemsRemaining.filter(other=>other.group===item.group&&!taken.has(other));
-    batch.forEach(o=>taken.add(o));batches.push(batch)}
-  return batches};
+const batchesOf=groupBatches;
 // Every feasible (point, rotation) for `item`, ordered by the solver's own candidate
 // score, best first. The greedy path asks for one and takes it; the exact search asks for
 // all of them and branches on each, which is the only difference between the two
@@ -1883,10 +1911,12 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
           ?x2+y2+z2*1e6
           :z2*1e9+y2*1e4+x2;
     if(width===1){if(!found.length||score<found[0].score)found[0]={score,...candidate};continue}
+    if(width!=null){retainCandidate(found,width,score,metrics.feasible_candidates,candidate);continue}
     found.push({score,...candidate})}}
   if(width===1)return found;
+  if(width!=null)return found.sort(compareRetained).map(({score,candidate})=>({score,...candidate}));
   found.sort((a,b)=>a.score-b.score);
-  return width==null?found:found.slice(0,width)
+  return found
 };
 const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const state={tmpl,placements:[],payload:0};const next=[];
   // Running `usedVolume` of `state.placements`, maintained incrementally rather than
@@ -1948,6 +1978,11 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     if(az!==bz)return az-bz;if(a.used!==b.used)return a.used>b.used?-1:1;
     const signature=node=>node.state.placements.map(p=>`${p.item.id}@${p.x},${p.y},${p.z}`).join('|');return compareCodePoints(signature(a),signature(b))};
   const greedy=tryPackIntoTemplate(tmpl,itemsRemaining);let beam=[fresh()],incumbent=fresh();incumbent.state=greedy.state;incumbent.used=greedy.used;incumbent.unplaced=greedy.next;let nodes=0;
+  // The batch the loop stopped before, when it stopped early (node limit, deadline or
+  // effort). Surviving beam nodes have consumed only the batches before it, so completing
+  // one means adding every batch from here on to its unplaced list -- mirrors Rust's
+  // `try_pack_into_beam` `pending_from`.
+  let pendingFrom=null;
   for(let position=0;position<batches.length;position++){
     const batch=batches[position],future=batches.slice(position+1).flat(),expansions=[];let exhausted=false;
     for(const node of beam){if(nodes>=containerPlanNodeLimit||deadline.expired()||effortExceeded()){exhausted=true;break}nodes++;metrics.search_nodes_expanded++;
@@ -1960,11 +1995,15 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     // re-enters the beam, so cloning the candidate points and spatial index for it
     // was pure allocation per expansion.
     for(const node of expansions){const complete={state:{tmpl,placements:node.state.placements.slice(),payload:node.state.payload},used:node.used,unplaced:[...node.unplaced,...future]};if(compareNode(complete,incumbent)<0)incumbent=complete}
-    if(!expansions.length||exhausted)break;
+    if(!expansions.length||exhausted){pendingFrom=position;break}
     const futureVolumes=future.some(item=>item.nesting!=null)?null:sortCosts(future.map(item=>volume(item.d)));
     const futureWeights=tmpl.max!=null?sortCosts(future.map(item=>BigInt(item.w))):null;
     expansions.sort((a,b)=>compareNode(a,b,future,futureVolumes,futureWeights));beam=expansions.slice(0,containerPlanBeamWidth)}
-  beam.sort((a,b)=>compareNode(a,b));if(beam.length&&compareNode(beam[0],incumbent)<0)incumbent=beam[0];
+  // Without the unreached tail a beam leader looks better than every complete incumbent,
+  // and choosing it dropped those items outright: neither placed nor reported unpacked.
+  const pending=pendingFrom===null?[]:batches.slice(pendingFrom).flat();
+  const completed=beam.map(node=>({state:node.state,used:node.used,unplaced:[...node.unplaced,...pending]})).sort((a,b)=>compareNode(a,b));
+  if(completed.length&&compareNode(completed[0],incumbent)<0)incumbent=completed[0];
   return {state:incumbent.state,next:incumbent.unplaced}
 };
 // Depth-first branch and bound over the same group batches, mirroring Python's

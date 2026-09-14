@@ -18,6 +18,10 @@
 import { pack } from '../index.js';
 
 const MM = { units: { length: 'mm' } };
+// An example must not change answer merely because the host was busy. These solves need
+// a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+// loaded machine cannot cut the multi-start portfolio short and let a different start win.
+const SAFETY_FUSE = { configuration: { time_limit_ms: 60000 } };
 
 /**
  * Pack one variant and print what it cost.
@@ -27,7 +31,7 @@ const MM = { units: { length: 'mm' } };
  * you actually wanted to see coming.
  */
 const solve = (label, items, containers) => {
-  const result = pack({ ...MM, items, containers });
+  const result = pack({ ...MM, ...SAFETY_FUSE, items, containers });
   const placed = result.containers.reduce((n, c) => n + c.placements.length, 0);
   console.log(
     `  ${label.padEnd(20)} ${result.containers.length} container(s), ` +
