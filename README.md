@@ -108,6 +108,7 @@ and execute without a project around it.
 | [`constraints.mjs`](examples/constraints.mjs) | Stacking caps, incompatible tags and atomic groups — each shown with and without the rule, plus how to read the structured refusal. |
 | [`units.mjs`](examples/units.mjs) | Why lengths travel as strings: fractional inches kept exact, one tick deciding a fit, and the point where a JavaScript number stops being exact and a quote is refused rather than rounded. |
 | [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+| [`execution.mjs`](examples/execution.mjs) | Turn a result into dock instructions — and the clearest place to see what "byte-identical" does and does not promise: the four adapters agree on any given result, while this engine is free to reach a different packing than Python does. |
 
 ```bash
 node examples/basic.mjs
@@ -121,6 +122,8 @@ node examples/basic.mjs
 - JSON input/output through `pack()` or `packJson()`.
 - Optional payload rebalancing with `rebalanceWeight()`.
 - Loading and removal sequence helpers for already placed boxes.
+- Execution plans through `buildExecutionPlan()` / `canonicalPlanJson()`: a work-order view of a
+  result, with solver facts separated from the text that cites them.
 - Deterministic carrier quotes, policy evaluation and effective-dated catalog lookup
   through `commerce`.
 

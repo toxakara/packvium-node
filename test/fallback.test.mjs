@@ -5,7 +5,7 @@ import test from 'node:test';
 import {
   Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
   BoundOverflowError, __inspectHullShapeForTests, __objectiveBoundsForTests,
-  __occupiesLessThanItsBoxForTests, aggregateTermination,
+  __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
   explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules,
 } from '../fallback.js';
@@ -36,6 +36,30 @@ const box = (id, length = 200, width = 200, height = 200, rest = {}) => ({
 
 const placements = (result) => result.containers.flatMap((container) => container.placements);
 const at = (placement) => [placement.position.x.ticks, placement.position.y.ticks, placement.position.z.ticks];
+
+test('bounded candidate retention equals the stable full-sort prefix', () => {
+  const streams = [[], [1], Array(300).fill(7),
+    Array.from({length: 300}, (_, i) => i),
+    Array.from({length: 300}, (_, i) => 300 - i),
+    Array.from({length: 300}, (_, i) => ((i * 73) % 31) - 15),
+    [1e25, -1e25, 0, -0, 1e25, -1e25]];
+  for (const scores of streams) {
+    const full = scores.map((score, ordinal) => ({score, ordinal}))
+      .sort((a, b) => a.score - b.score).map(entry => entry.ordinal);
+    for (const width of [1, 2, 3, 7, 128, 512]) {
+      assert.deepEqual(__candidatePrefixForTests(scores, width), full.slice(0, width));
+    }
+  }
+});
+
+test('group batching preserves first occurrence and member order', () => {
+  const items = ['00', null, '0', '00', '1', '0', null, '1']
+    .map((group, id) => ({group, id}));
+  assert.deepEqual(__groupBatchesForTests(items).map(batch => batch.map(item => item.id)),
+    [[0, 3], [1], [2, 5], [4, 7], [6]]);
+  assert.deepEqual(__groupBatchesForTests([]), []);
+  assert.deepEqual(__groupBatchesForTests(items), __groupBatchesForTests(items));
+});
 // A cross-language fixture kept in the native workspace tree; a published copy of this
 // package does not carry it.
 const rebalanceFixtureUrl = new URL('../../../../conformance/scene/rebalance-fixtures.json', import.meta.url);
@@ -801,6 +825,29 @@ test('an injected clock expires mid-search without sleeping', () => {
   assert.equal(result.algorithm.time_limit_reached, true);
   assert.ok(result.summary.packed_item_count > 0 && result.summary.packed_item_count < 8);
   assert.equal(result.summary.packed_item_count + result.summary.unpacked_item_count, 8);
+});
+
+// The beam search stops for three reasons -- its node limit, the deadline, or the effort
+// budget -- and all three leave the same loop. When it stopped early it used to hand back
+// the beam's leader without the batches it never reached, so those items were neither
+// placed nor reported unpacked: 12 requested, 1 placed, 0 unpacked, reported `feasible`.
+// Rust's `try_pack_into_beam` records the same defect and its fix; Python and PHP return
+// their complete incumbent instead. The node limit is the deterministic trigger, so this
+// needs no clock and covers the deadline and effort exits by construction.
+test('a beam search stopped early still accounts for every item it never reached', () => {
+  for (const limit of [1, 2, 3, 4]) {
+    const result = packFallback(request(
+      [cube('a', 100, { quantity: 4 }), cube('b', 80, { quantity: 4 }), cube('c', 60, { quantity: 4 })],
+      [box('crate')],
+      { configuration: { container_plan_beam_width: 16, container_plan_node_limit: limit, time_limit_ms: 600000 } },
+    ));
+    const placed = placements(result).length;
+    assert.equal(placed, result.summary.packed_item_count,
+      `node limit ${limit}: the summary counts placements the result does not contain`);
+    assert.equal(placed + result.unpacked_items.length, 12,
+      `node limit ${limit}: items were neither placed nor reported unpacked`);
+    assert.equal(result.summary.unpacked_item_count, result.unpacked_items.length);
+  }
 });
 
 test('Deadline accepts an injected monotonic clock', () => {

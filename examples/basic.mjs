@@ -19,6 +19,10 @@ import { backend, pack, version } from '../index.js';
 console.log(`engine ${version()} using the ${backend()} backend\n`);
 
 const request = {
+  // An example must not change answer merely because the host was busy. This solve needs
+  // a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+  // loaded machine cannot cut the multi-start portfolio short and let a different start win.
+  configuration: { time_limit_ms: 60000 },
   items: [
     // Lengths and weights are strings on purpose. They are parsed into exact integers,
     // so '0.1' means a tenth of a millimetre and never 0.09999999999999999. Plain

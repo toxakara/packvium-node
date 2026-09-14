@@ -24,13 +24,17 @@
 import { pack } from '../index.js';
 
 const MM = { units: { length: 'mm' } };
+// An example must not change answer merely because the host was busy. These solves need
+// a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+// loaded machine cannot cut the multi-start portfolio short and let a different start win.
+const SAFETY_FUSE = { configuration: { time_limit_ms: 60000 } };
 const crate = (length, width, height) => [
   { id: 'crate', inner_dimensions: { length, width, height } },
 ];
 
 /** Run one request and print only what the shape changed: containers and refusals. */
 const summarise = (label, request) => {
-  const result = pack({ ...MM, ...request });
+  const result = pack({ ...MM, ...SAFETY_FUSE, ...request });
   const placed = result.containers.reduce((n, c) => n + c.placements.length, 0);
   console.log(
     `  ${label.padEnd(22)} ${result.status.padEnd(10)} ` +
@@ -119,6 +123,7 @@ const brick = (kilograms) => ({
 const load = (label, kilograms) => {
   const result = pack({
     ...MM,
+    ...SAFETY_FUSE,
     items: [cushion(100), brick(kilograms)],
     containers: crate('100', '100', '200'),
   });

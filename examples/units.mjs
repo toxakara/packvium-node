@@ -18,6 +18,11 @@
 
 import { pack, commerce, CommerceInputError } from '../index.js';
 
+// An example must not change answer merely because the host was busy. These solves need
+// a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+// loaded machine cannot cut the multi-start portfolio short and let a different start win.
+const SAFETY_FUSE_MS = 60000;
+
 // ------------------------------------------------------------- fractions survive intact
 //
 // Imperial sizes arrive as fractions far more often than as decimals, and "12 3/8" is an
@@ -26,6 +31,7 @@ import { pack, commerce, CommerceInputError } from '../index.js';
 
 const inches = pack({
   units: { length: 'in' },
+  configuration: { time_limit_ms: SAFETY_FUSE_MS },
   items: [{ id: 'plank', quantity: 2, dimensions: { length: '12 3/8', width: '8 1/2', height: '3/4' } }],
   containers: [{ id: 'crate', inner_dimensions: { length: '24', width: '24', height: '24' } }],
 });
@@ -51,6 +57,7 @@ const TICKS_PER_MM = 16000;
 const fit = (containerMm) => {
   const result = pack({
     units: { length: 'mm' },
+    configuration: { time_limit_ms: SAFETY_FUSE_MS },
     items: [{ id: 'rod', quantity: 1, dimensions: { length: '100', width: '10', height: '10' } }],
     containers: [{ id: 'tube', inner_dimensions: { length: containerMm, width: '10', height: '10' } }],
   });
