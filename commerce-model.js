@@ -51,15 +51,17 @@ export function exact(value) {
  * would make this implementation disagree with the other three on exactly those inputs.
  */
 export function compareCodePoints(left, right) {
-  const a = Array.from(left);
-  const b = Array.from(right);
-  const shared = Math.min(a.length, b.length);
-  for (let index = 0; index < shared; index += 1) {
-    const difference = a[index].codePointAt(0) - b[index].codePointAt(0);
-    if (difference !== 0) return difference < 0 ? -1 : 1;
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const a = left.codePointAt(leftIndex);
+    const b = right.codePointAt(rightIndex);
+    if (a !== b) return a < b ? -1 : 1;
+    leftIndex += a > 0xffff ? 2 : 1;
+    rightIndex += b > 0xffff ? 2 : 1;
   }
-  if (a.length === b.length) return 0;
-  return a.length < b.length ? -1 : 1;
+  if (leftIndex === left.length) return rightIndex === right.length ? 0 : -1;
+  return 1;
 }
 
 // ------------------------------------------------------------------------------ rating

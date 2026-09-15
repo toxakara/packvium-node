@@ -301,3 +301,42 @@ test('an explicitly null optional field means the same as an omitted one', () =>
 test('canonical output leaves non-ASCII and slashes unescaped', () => {
   assert.equal(canonicalJson({ note: 'zóna/1 🙂' }), '{"note":"zóna/1 🙂"}');
 });
+
+
+test('code-point ordering matches an independent array oracle through surrogate boundaries', () => {
+  const alphabet = ['a', 'z', '\u0000', 'é', '\uff21', '😀', '\ud800', '\udc00'];
+  const strings = ['', ...alphabet];
+  for (const left of alphabet) for (const right of alphabet) strings.push(left + right);
+  strings.push('x'.repeat(1024), 'x'.repeat(1024) + '😀', 'x'.repeat(1024) + '\uff21');
+  const oracle = (left, right) => {
+    const a = Array.from(left, value => value.codePointAt(0));
+    const b = Array.from(right, value => value.codePointAt(0));
+    for (let i = 0; i < Math.min(a.length, b.length); i++) {
+      if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+    }
+    return Math.sign(a.length - b.length);
+  };
+  for (const left of strings) for (const right of strings) {
+    assert.equal(compareCodePoints(left, right), oracle(left, right), JSON.stringify([left, right]));
+  }
+  assert.deepEqual([...strings].sort(compareCodePoints), [...strings].sort(oracle));
+});
+
+
+test('catalog pinned lookups preserve boundaries and rollback across a long history', () => {
+  const versions = Array.from({length: 64}, (_, index) => ({
+    effective_at: (index + 1) % 7, published_at: index + 1, snapshot: {},
+  }));
+  const document = catalogDocument(...versions, {rollback_to: 1, published_at: 100, effective_at: 6});
+  for (const version of [1, 2, 32, 64, 65]) {
+    const result = catalogVersionInfo(document, {catalog_id: 'c', version, resolved_at: 100});
+    assert.equal(result.status, 'ok');
+    assert.equal(result.catalog.version, version);
+  }
+  for (const version of [-10, 0, 66, Number.MAX_SAFE_INTEGER]) {
+    const result = catalogVersionInfo(document, {catalog_id: 'c', version, resolved_at: 100});
+    assert.equal(result.status, 'rejected');
+  }
+  assert.equal(catalogVersionInfo(document, {catalog_id: 'c', as_of: 6, resolved_at: 100}).catalog.version, 65);
+  assert.equal(catalogVersionInfo(document, {catalog_id: 'c', as_of: 0, resolved_at: 100}).catalog.version, 63);
+});

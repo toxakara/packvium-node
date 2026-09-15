@@ -707,7 +707,7 @@ function cellKey(ix,iy,iz){return (ix*4096+iy)*4096+iz}
 function makeIndex(d){return {cx:Math.max(1,ceilDiv(Math.max(1,d[0]),CELLS_PER_AXIS)),
   cy:Math.max(1,ceilDiv(Math.max(1,d[1]),CELLS_PER_AXIS)),
   cz:Math.max(1,ceilDiv(Math.max(1,d[2]),CELLS_PER_AXIS)),
-  cells:new Map(),seen:[],gen:0}}
+  cells:new Map(),owned:new WeakSet(),seen:[],gen:0}}
 function cellRange(index,box){return [
   Math.floor(box.x/index.cx),ceilDiv(Math.max(box.x+box.d[0],box.x+1),index.cx),
   Math.floor(box.y/index.cy),ceilDiv(Math.max(box.y+box.d[1],box.y+1),index.cy),
@@ -715,11 +715,18 @@ function cellRange(index,box){return [
 function indexAdd(index,position,box){const [ix1,ix2,iy1,iy2,iz1,iz2]=cellRange(index,box);
   index.seen[position]=0;
   for(let ix=ix1;ix<ix2;ix++)for(let iy=iy1;iy<iy2;iy++)for(let iz=iz1;iz<iz2;iz++){
-    const key=cellKey(ix,iy,iz),bucket=index.cells.get(key);
-    if(bucket)bucket.push(position);else index.cells.set(key,[position])}}
-function copyIndex(index){return {cx:index.cx,cy:index.cy,cz:index.cz,
-  cells:new Map([...index.cells].map(([key,bucket])=>[key,bucket.slice()])),
-  seen:index.seen.slice(),gen:index.gen}}
+    const key=cellKey(ix,iy,iz);let bucket=index.cells.get(key);
+    if(!bucket||!index.owned.has(bucket)){
+      bucket=bucket?bucket.slice():[];index.cells.set(key,bucket);index.owned.add(bucket)}
+    bucket.push(position)}}
+function copyIndex(index){
+  // Both sides now share buckets; neither may append until it owns a private copy.
+  index.owned=new WeakSet();
+  return {cx:index.cx,cy:index.cy,cz:index.cz,cells:new Map(index.cells),owned:new WeakSet(),
+    seen:index.seen.slice(),gen:index.gen}}
+
+// Private-module test access to per-call index state; not re-exported by index.js.
+export const __spatialIndexForTests=Object.freeze({make:makeIndex,add:indexAdd,copy:copyIndex});
 function comparePoints(a,b){return a[2]-b[2]||a[1]-b[1]||a[0]-b[0]}
 function insertPoint(points,point){let low=0,high=points.length;
   while(low<high){const mid=(low+high)>>1;if(comparePoints(points[mid],point)<=0)low=mid+1;else high=mid}
@@ -1944,7 +1951,7 @@ const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const state={tmpl,placements:[
       for(const point of pointsFrom(best))insertPoint(points,point)}
     if(!ok){state.placements=snapshotPlacements;state.payload=snapshotPayload;used=snapshotUsed;
       if(snapshotPoints)points.splice(0,points.length,...snapshotPoints);
-      if(snapshotIndex){index.cells=snapshotIndex.cells;index.seen=snapshotIndex.seen}next.push(...batch)}}
+      if(snapshotIndex){index.cells=snapshotIndex.cells;index.owned=snapshotIndex.owned;index.seen=snapshotIndex.seen}next.push(...batch)}}
   return {state,next,used}
 };
 const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
@@ -1971,12 +1978,18 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     if(!future.some(item=>item.nesting!=null))possible=Math.min(possible,maxCount(sortedVolumes??sortCosts(future.map(item=>volume(item.d))),volume(tmpl.d)-node.used));
     if(tmpl.max!=null)possible=Math.min(possible,maxCount(sortedWeights??sortCosts(future.map(item=>BigInt(item.w))),BigInt(Math.max(0,tmpl.max-node.state.payload))));
     return node.unplaced.length+future.length-possible};
-  const compareNode=(a,b,future=[],sortedVolumes=null,sortedWeights=null)=>{let difference=lowerBound(a,future,sortedVolumes,sortedWeights)-lowerBound(b,future,sortedVolumes,sortedWeights);if(difference)return difference;
+  // Compared states are complete; placement always mutates a fresh clone first.
+  // Weak keys let discarded branches release their cached strings with their state.
+  const stateKeys=new WeakMap();
+  const stateKey=state=>{let key=stateKeys.get(state);if(key===undefined){
+    key={maxZ:state.placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0),signature:undefined};stateKeys.set(state,key)}return key};
+  const signature=state=>{const key=stateKey(state);if(key.signature===undefined)key.signature=state.placements.map(p=>`${p.item.id}@${p.x},${p.y},${p.z}`).join('|');return key.signature};
+  const compareNode=(a,b,bounds=null)=>{let difference=bounds===null?a.unplaced.length-b.unplaced.length:bounds.get(a)-bounds.get(b);if(difference)return difference;
     difference=a.unplaced.length-b.unplaced.length;if(difference)return difference;
     difference=b.state.placements.length-a.state.placements.length;if(difference)return difference;
-    const az=a.state.placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0),bz=b.state.placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0);
+    const az=stateKey(a.state).maxZ,bz=stateKey(b.state).maxZ;
     if(az!==bz)return az-bz;if(a.used!==b.used)return a.used>b.used?-1:1;
-    const signature=node=>node.state.placements.map(p=>`${p.item.id}@${p.x},${p.y},${p.z}`).join('|');return compareCodePoints(signature(a),signature(b))};
+    return compareCodePoints(signature(a.state),signature(b.state))};
   const greedy=tryPackIntoTemplate(tmpl,itemsRemaining);let beam=[fresh()],incumbent=fresh();incumbent.state=greedy.state;incumbent.used=greedy.used;incumbent.unplaced=greedy.next;let nodes=0;
   // The batch the loop stopped before, when it stopped early (node limit, deadline or
   // effort). Surviving beam nodes have consumed only the batches before it, so completing
@@ -1998,7 +2011,8 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     if(!expansions.length||exhausted){pendingFrom=position;break}
     const futureVolumes=future.some(item=>item.nesting!=null)?null:sortCosts(future.map(item=>volume(item.d)));
     const futureWeights=tmpl.max!=null?sortCosts(future.map(item=>BigInt(item.w))):null;
-    expansions.sort((a,b)=>compareNode(a,b,future,futureVolumes,futureWeights));beam=expansions.slice(0,containerPlanBeamWidth)}
+    const bounds=new Map(expansions.map(node=>[node,lowerBound(node,future,futureVolumes,futureWeights)]));
+    expansions.sort((a,b)=>compareNode(a,b,bounds));beam=expansions.slice(0,containerPlanBeamWidth)}
   // Without the unreached tail a beam leader looks better than every complete incumbent,
   // and choosing it dropped those items outright: neither placed nor reported unpacked.
   const pending=pendingFrom===null?[]:batches.slice(pendingFrom).flat();

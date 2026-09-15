@@ -4,7 +4,7 @@ import test from 'node:test';
 
 import {
   Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
-  BoundOverflowError, __inspectHullShapeForTests, __objectiveBoundsForTests,
+  BoundOverflowError, __spatialIndexForTests, __inspectHullShapeForTests, __objectiveBoundsForTests,
   __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
   explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules,
@@ -2320,3 +2320,26 @@ function compareScores(left, right) {
   }
   return 0;
 }
+
+
+test('spatial forks share reads but isolate writes from parents and siblings', () => {
+  const {make, add, copy} = __spatialIndexForTests;
+  const box = {x: 0, y: 0, z: 0, d: [2,2,2]};
+  const base = make([8,8,8]); add(base, 0, box);
+  const child = copy(base), grandchild = copy(child);
+  for (const [key, bucket] of base.cells) {
+    assert.strictEqual(child.cells.get(key), bucket);
+    assert.strictEqual(grandchild.cells.get(key), bucket);
+  }
+  add(base, 1, box);
+  const privateBuckets = new Map(base.cells);
+  add(base, 2, box);
+  add(child, 3, box);
+  add(grandchild, 4, box);
+  for (const [key, bucket] of base.cells) {
+    assert.strictEqual(bucket, privateBuckets.get(key));
+    assert.deepEqual(bucket, [0,1,2]);
+    assert.deepEqual(child.cells.get(key), [0,3]);
+    assert.deepEqual(grandchild.cells.get(key), [0,4]);
+  }
+});
