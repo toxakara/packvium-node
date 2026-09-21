@@ -8,12 +8,9 @@
  * forever.
  *
  * Held to byte-identical output with `packvium.execution`, `Packvium\Execution\Plan` and
- * `packvium_core::execution`. JavaScript is the one that needs care for that: `JSON.stringify`
- * emits keys in insertion order, so this module sorts them itself, and it is also this
- * project's known odd one out for string order -- `sort()` compares UTF-16 code units where
- * the other three compare code points. Every key sorted here is an ASCII identifier this
- * module writes, so the two orders coincide; a key derived from caller data would not be
- * safe to sort this way and none is.
+ * `packvium_core::execution`. The spelling they are compared on is RFC 8785
+ * (`canonical-json.js`), which sorts keys by UTF-16 code units in every engine, so a key
+ * outside the Basic Multilingual Plane no longer orders differently here.
  *
  * Two rules do the work, and both are about not quietly becoming a decision-maker.
  * Authoritative solver facts and human text are separated in the *output*, under `facts`
@@ -22,6 +19,8 @@
  * `position.*.ticks` -- never by `item_id`, which `conformance/canonical.py` drops as "an
  * instance count rather than a semantic property".
  */
+
+import { canonicalJson } from './canonical-json.js';
 
 /** The plan's own format tag; not the packing schema's version, and it does not move with it. */
 export const FORMAT = 'packvium-execution-plan/v1';
@@ -212,24 +211,13 @@ export function buildExecutionPlan(request, result, { loadingOrders = {} } = {})
 }
 
 /**
- * Sort object keys recursively, leaving arrays in place.
+ * The one byte-comparable spelling of a plan: RFC 8785, shared with the operational artifact
+ *. Objects are key-sorted and arrays keep their order, so steps are never reordered.
  *
- * A list stays a list: sorting one would reorder steps, which are ordered on purpose.
- */
-function sortKeys(value) {
-  if (Array.isArray(value)) return value.map(sortKeys);
-  if (value === null || typeof value !== 'object') return value;
-  const sorted = {};
-  for (const key of Object.keys(value).sort()) sorted[key] = sortKeys(value[key]);
-  return sorted;
-}
-
-/**
- * The one byte-comparable spelling of a plan.
- *
- * `JSON.stringify` emits insertion order, so the sort above is what makes this comparable
- * with Python's `sort_keys=True`, PHP's recursive `ksort` and `serde_json`'s `BTreeMap`.
+ * Until 1.3.0 this was `JSON.stringify` over recursively sorted keys. That is the same bytes
+ * for every plan an engine emits, but it wrote `null` for a non-finite number and escaped a
+ * lone surrogate, where the canonical form refuses both with a `CanonicalJsonError`.
  */
 export function canonicalPlanJson(plan) {
-  return JSON.stringify(sortKeys(plan));
+  return canonicalJson(plan);
 }

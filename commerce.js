@@ -307,7 +307,7 @@ function parseCatalogVersion(value, path, _identity, number, history) {
 function parseRollback(fields, path, number, history) {
   checkKeys(fields, path, ['rollback_to', 'published_at'], ['effective_at', 'note']);
   const toVersion = asInteger(fields.rollback_to, `${path}.rollback_to`);
-  const target = history.find((version) => version.number === toVersion);
+  const target = catalogVersionByNumber(history, toVersion);
   if (target === undefined) {
     fail(path, `rollback_to names version ${toVersion}, which is not published yet`);
   }
@@ -613,9 +613,13 @@ export function catalogVersionInfo(document, request) {
   return ok('catalog', catalogPayload(catalogId, resolved, resolvedAt));
 }
 
+function catalogVersionByNumber(history, number) {
+  return number >= 1 && number <= history.length ? history[number - 1] : undefined;
+}
+
 function resolveCatalogVersion(history, version, asOf) {
   if (version !== undefined) {
-    return history.find((candidate) => candidate.number === version) ?? 'catalog_version_not_found';
+    return catalogVersionByNumber(history, version) ?? 'catalog_version_not_found';
   }
   if (asOf === undefined) {
     return history.length > 1 ? 'ambiguous_catalog_reference' : history[0];

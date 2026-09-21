@@ -35,6 +35,29 @@ test('the execution plan resolves by package name, not only by relative path', a
   assert.equal(execution.FORMAT, 'packvium-execution-plan/v1');
 });
 
+test('the operational artifact and its exports resolve by package name', async () => {
+  const artifacts = await import(`${manifest.name}/artifacts.js`);
+  assert.equal(typeof artifacts.buildOperationalArtifact, 'function');
+  assert.equal(typeof artifacts.canonicalArtifactJson, 'function');
+  assert.equal(typeof artifacts.OperationalArtifactError, 'function');
+  assert.equal(artifacts.FORMAT, 'packvium-operational-artifact/v1');
+  const exports = await import(`${manifest.name}/artifact-exports.js`);
+  for (const name of ['exportJson', 'exportCsv', 'exportWorkOrderHtml']) {
+    assert.equal(typeof exports[name], 'function', name);
+  }
+  assert.equal(exports.CSV_COLUMNS[0], 'record');
+});
+
+test('a module an export imports is published even when it is not exported itself', () => {
+  // `canonical-json.js` is internal: absent from `exports` on purpose, but `artifacts.js` and
+  // `execution.js` import it, so a tarball without it would break both at load time.
+  const published = new Set(manifest.files);
+  for (const name of ['canonical-json.js', 'artifacts.js', 'artifact-exports.js', 'artifacts.d.ts', 'artifact-exports.d.ts']) {
+    assert.ok(published.has(name), `"files" does not publish ${name}`);
+  }
+  assert.ok(!('./canonical-json.js' in manifest.exports), 'canonical-json.js is not public API');
+});
+
 test('every declared export target exists, and so does the types file beside it', () => {
   for (const [subpath, entry] of Object.entries(manifest.exports)) {
     for (const [condition, target] of Object.entries(entry)) {

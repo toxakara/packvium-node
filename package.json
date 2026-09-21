@@ -1,6 +1,6 @@
 {
   "name":"@packvium/engine",
-  "version":"1.2.0",
+  "version":"1.3.0",
   "description":"Native-first 3D cartonization with deterministic JS fallback",
   "author":{"name":"Packvium","url":"https://packvium.com"},
   "keywords":["3d-bin-packing","bin-packing","cartonization","packing","container-loading","logistics","shipping","deterministic"],
@@ -10,8 +10,8 @@
   "type":"module",
   "main":"index.js",
   "types":"index.d.ts",
-  "exports":{".":{"types":"./index.d.ts","import":"./index.js"},"./execution.js":{"types":"./execution.d.ts","import":"./execution.js"}},
-  "files":["index.js","fallback.js","contact-graph.js","policy.js","commerce.js","commerce-model.js","execution.js","examples","index.d.ts","execution.d.ts","README.md","SECURITY.md"],
+  "exports":{".":{"types":"./index.d.ts","import":"./index.js"},"./execution.js":{"types":"./execution.d.ts","import":"./execution.js"},"./artifacts.js":{"types":"./artifacts.d.ts","import":"./artifacts.js"},"./artifact-exports.js":{"types":"./artifact-exports.d.ts","import":"./artifact-exports.js"}},
+  "files":["index.js","fallback.js","contact-graph.js","policy.js","commerce.js","commerce-model.js","execution.js","canonical-json.js","artifacts.js","artifact-exports.js","examples","index.d.ts","execution.d.ts","artifacts.d.ts","artifact-exports.d.ts","README.md","SECURITY.md"],
   "engines":{"node":">=16"},
   "scripts":{
     "test":"node test/run-tests.mjs",

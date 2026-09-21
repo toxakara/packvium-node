@@ -50,5 +50,12 @@ export function placementReference(containerIndex:number,placement:unknown):Plac
  */
 export function buildExecutionPlan(request:PackingRequest,result:PackingResult,options?:{loadingOrders?:Record<number,number[]>}):ExecutionPlan;
 
-/** The one byte-comparable spelling, with keys sorted recursively and arrays left in place. */
+/** What `canonicalPlanJson` throws. The class is internal, so match on `code`, not `instanceof`. */
+export interface CanonicalJsonError extends Error{code:'number_out_of_range'|'invalid_string'|'invalid_value'}
+
+/**
+ * The one byte-comparable spelling: RFC 8785, keys sorted by UTF-16 code units, arrays left in
+ * place. Throws a `CanonicalJsonError` for a number beyond 2^53 - 1 or not finite, a lone
+ * surrogate, or a value JSON cannot spell.
+ */
 export function canonicalPlanJson(plan:ExecutionPlan):string;
