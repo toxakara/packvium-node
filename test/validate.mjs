@@ -225,6 +225,33 @@ function occupiedVolumeOf(box, item, lengthUnit, loadTicks) {
   return footprint * (height > 1n ? height : 1n);
 }
 
+/**
+ * A fixed placement is an ordinary placement, so every physical rule above already covers it;
+ * what is new is whether it moved (docs/PLAN-REVISIONS.md). Keyed by container id `T#n`, item
+ * type, position ticks and orientation.
+ */
+function fixedPlacementIssues(request, result, lengthUnit) {
+  const key = (containerId, type, at, orientation) => JSON.stringify([containerId, type, ...at, orientation]);
+  const requested = new Set((request.fixed_placements ?? []).map((entry) => key(
+    `${entry.container_type}#${entry.container_instance ?? 1}`, entry.item_type,
+    ['x', 'y', 'z'].map((axis) => requestLengthTicks(entry.position?.[axis] ?? 0, lengthUnit)), entry.orientation)));
+  const reported = new Set();
+  for (const container of result.containers) {
+    for (const placement of container.placements) {
+      if (placement.fixed === true) {
+        reported.add(key(container.id, placement.item_type, corner(placement.position), placement.orientation));
+      }
+    }
+  }
+  const present = new Set(result.containers.map((container) => container.id));
+  const issues = [];
+  for (const entry of requested) {
+    if (!reported.has(entry)) issues.push(present.has(JSON.parse(entry)[0]) ? 'fixed_placement_moved' : 'fixed_container_missing');
+  }
+  for (const entry of reported) if (!requested.has(entry)) issues.push('unexpected_fixed_placement');
+  return issues;
+}
+
 export function validate(request, result) {
   const issues = [];
   const itemsById = new Map(request.items.map((item) => [item.id, item]));
@@ -314,6 +341,8 @@ export function validate(request, result) {
   for (const [, homes] of groupHomes) {
     if (homes.size > 1) issues.push('group_split');
   }
+
+  issues.push(...fixedPlacementIssues(request, result, lengthUnit));
 
   const expected = new Set();
   for (const item of request.items) {

@@ -1,6 +1,9 @@
 import { createRequire } from 'node:module';
 import {
+  FixedPlacementError,
+  InvalidRequestError,
   UnsupportedFeatureError,
+  checkRequestShape,
   packFallback,
   rebalanceWeight as rebalanceFallback,
 } from './fallback.js';
@@ -13,7 +16,7 @@ export {
   verifyLoadingPrefixBusinessRules, REASON_MESSAGES, explainReason,
   explanationForUnpackedItem, explainUnpackedItem,
 } from './fallback.js';
-export { UnsupportedFeatureError };
+export { FixedPlacementError, InvalidRequestError, UnsupportedFeatureError };
 import * as commerceFallback from './commerce.js';
 export { CommerceInputError } from './commerce.js';
 const require = createRequire(import.meta.url);
@@ -51,7 +54,17 @@ const native = loadNative();
 export const backend = () => (native ? 'rust' : 'javascript');
 
 export function packJson(input) {
-  if (native?.packJson) return native.packJson(input);
+  return packJsonWith(native, input);
+}
+
+// Separate from `packJson` so the native path can be exercised without a native build.
+export function packJsonWith(binding, input) {
+  if (binding?.packJson) {
+    // The native binding reports errors as text; checking the rule table here first gives a
+    // caller the same InvalidRequestError whichever backend answers.
+    checkRequestShape(JSON.parse(input));
+    return binding.packJson(input);
+  }
   return JSON.stringify(packFallback(JSON.parse(input)));
 }
 
@@ -69,7 +82,7 @@ export function rebalanceWeight(request, result, { maxMoves = 64 } = {}) {
   return rebalanceFallback(request, result, { maxMoves });
 }
 
-export const version = () => native?.version?.() ?? '1.3.0-js-fallback';
+export const version = () => native?.version?.() ?? '1.4.0-js-fallback';
 
 /**
  * The exported commercial and control-plane API: a quote, a policy decision and catalog
