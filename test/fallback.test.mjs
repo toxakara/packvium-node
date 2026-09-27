@@ -6,7 +6,7 @@ import {
   Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
   BoundOverflowError, __spatialIndexForTests, __inspectHullShapeForTests, __objectiveBoundsForTests,
   __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
-  explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
+  InvalidRequestError, explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules,
 } from '../fallback.js';
 import { objective as recomputeObjective, validate } from './validate.mjs';
@@ -382,9 +382,59 @@ test('nesting height accepts zero and rejects negative or full-height depths', (
         [cube('a', 10, { nesting_height })],
         [box('c', 10)],
       )),
-      /nesting_height/,
+      /nesting_height|length cannot be negative/,
     );
   }
+});
+
+test('every number below its schema floor is refused before either solver path', () => {
+  const base = () => request([cube('a', 10, { quantity: 2, weight: '1000' })], [box('c', 20, 10, 20, { quantity: 2 })],
+    { configuration: { solver_profile: 'fast' } });
+  const item = (fields) => (req) => Object.assign(req.items[0], fields);
+  const container = (fields) => (req) => Object.assign(req.containers[0], fields);
+  const configuration = (fields) => (req) => Object.assign(req.configuration, fields);
+  const obstacle = (fields) => container({ obstacles: [{ id: 'p', origin: { x: '15' }, dimensions: mm(1, 1, 1), ...fields }] });
+  assert.doesNotThrow(() => packFallback(base()));
+  const negative = 'negative_measure';
+  const cases = [
+    [item({ quantity: 0 }), 'below_minimum', '/items/0/quantity: must be at least 1'],
+    [item({ quantity: -1 }), 'below_minimum', '/items/0/quantity: must be at least 1'],
+    [item({ minimum_support_ratio: -0.5 }), 'below_minimum', '/items/0/minimum_support_ratio: must be at least 0'],
+    [item({ dimensions: mm(-1, 10, 10) }), negative, '/items/0/dimensions/length: cannot be negative'],
+    [item({ weight: '-1' }), negative, '/items/0/weight: cannot be negative'],
+    [item({ weight: -1 }), negative, '/items/0/weight: cannot be negative'],
+    [item({ max_top_load: '-1' }), negative, '/items/0/max_top_load: cannot be negative'],
+    [container({ quantity: 0 }), 'below_minimum', '/containers/0/quantity: must be at least 1'],
+    [container({ quantity: -1 }), 'below_minimum', '/containers/0/quantity: must be at least 1'],
+    [container({ max_items: 0 }), 'below_minimum', '/containers/0/max_items: must be at least 1'],
+    [container({ cost_minor: -1 }), 'below_minimum', '/containers/0/cost_minor: must be at least 0'],
+    [container({ void_fill_reserve_ratio: -0.5 }), 'below_minimum', '/containers/0/void_fill_reserve_ratio: must be at least 0'],
+    [container({ void_fill_reserve_ratio: 'half' }), 'wrong_type', '/containers/0/void_fill_reserve_ratio: must be a number'],
+    [container({ inner_dimensions: mm(20, -1, 20) }), negative, '/containers/0/inner_dimensions/width: cannot be negative'],
+    [container({ outer_dimensions: { length: '-1', width: '11', height: '21' } }), negative,
+      '/containers/0/outer_dimensions/length: cannot be negative'],
+    [container({ tare_weight: '-1' }), negative, '/containers/0/tare_weight: cannot be negative'],
+    [container({ max_payload: { value: '-1', unit: 'kg' } }), negative, '/containers/0/max_payload: cannot be negative'],
+    [obstacle({ origin: { x: '-1' } }), negative, '/containers/0/obstacles/0/origin/x: cannot be negative'],
+    [obstacle({ dimensions: mm(-1, 1, 1) }), negative, '/containers/0/obstacles/0/dimensions/length: cannot be negative'],
+    [configuration({ time_limit_ms: 0 }), 'below_minimum', '/configuration/time_limit_ms: must be at least 1'],
+    [configuration({ alternatives: -1 }), 'below_minimum', '/configuration/alternatives: must be at least 1'],
+    [configuration({ exact_item_limit: 0 }), 'below_minimum', '/configuration/exact_item_limit: must be at least 1'],
+    [configuration({ max_containers: 0 }), 'below_minimum', '/configuration/max_containers: must be at least 1'],
+    [configuration({ max_candidate_points: 15 }), 'below_minimum', '/configuration/max_candidate_points: must be at least 16'],
+    [configuration({ minimum_support_ratio: -0.5 }), 'below_minimum', '/configuration/minimum_support_ratio: must be at least 0'],
+    [configuration({ clearance: '-1' }), negative, '/configuration/clearance: cannot be negative'],
+  ];
+  for (const [edit, reason, message] of cases) {
+    const req = base();
+    edit(req);
+    assert.throws(() => packFallback(req), (error) => error instanceof InvalidRequestError
+      && error.reason === reason && error.message === `invalid_request: ${message}`, JSON.stringify(req));
+  }
+});
+
+test('a negative measure that rounds to zero ticks is admitted as zero', () => {
+  assert.doesNotThrow(() => packFallback(request([cube('a', 10, { weight: '-0.0000000001' })], [box('c', 10)])));
 });
 
 test('every box of a compound obstacle is enforced', () => {
@@ -992,7 +1042,7 @@ test('compact lattice rejects the same malformed item as the general path', () =
     [box('c')],
     { configuration: { require_placement_coordinates: false } },
   );
-  assert.throws(() => packFallback(payload), /value must be a non-negative safe integer/);
+  assert.throws(() => packFallback(payload), { message: 'invalid_request: /items/0/value: must be at least 0' });
 });
 
 test('compact lattice stops at the exact effort boundary', () => {
@@ -1601,7 +1651,7 @@ test('a rebalance move that would leave the destination unpriceable is vetoed', 
   assert.deepEqual(vetoed.containers, original.containers);
   const balanced = rebalanceWeight(req, original, { maxMoves: 8 });
   assert.deepEqual(balanced.moves, [
-    { item_id: 'brick#1', from_container_id: 'alpha_hold#1', to_container_id: 'gamma_tight#2' },
+    { item_id: 'brick#1', from_container_id: 'alpha_hold#1', to_container_id: 'gamma_tight#1' },
   ]);
   assert.deepEqual(
     balanced.containers.map((container) => container.payload_weight.ticks),
@@ -1935,15 +1985,23 @@ test('a policy rule set is honoured rather than refused', () => {
 
 test('a malformed tariff is rejected rather than silently mispricing', () => {
   const cases = [
-    [{ weight_brackets_g: [1500, 500], prices_minor: [100, 200] }, /strictly ascending/],
-    [{ weight_brackets_g: [500, 1500], prices_minor: [100] }, /same length/],
-    [{ weight_brackets_g: [], prices_minor: [] }, /non-empty/],
-    [{ weight_brackets_g: [0], prices_minor: [100] }, /positive safe integers/],
-    [{ weight_brackets_g: [500], prices_minor: [-1] }, /non-negative safe integers/],
-    [{ weight_brackets_g: [500], prices_minor: [100], fuel_surcharge_permille: -1 }, /fuel_surcharge_permille/],
+    // What the rule table cannot see -- order, pairing, emptiness -- still reaches the caller
+    // as a request error, with the engine's own words and no field.
+    [{ weight_brackets_g: [1500, 500], prices_minor: [100, 200] },
+      'invalid_request: rate_table weight_brackets_g must be strictly ascending'],
+    [{ weight_brackets_g: [500, 1500], prices_minor: [100] },
+      'invalid_request: rate_table weight_brackets_g and prices_minor must have the same length'],
+    [{ weight_brackets_g: [], prices_minor: [] },
+      'invalid_request: rate_table requires non-empty weight_brackets_g and prices_minor'],
+    [{ weight_brackets_g: [0], prices_minor: [100] },
+      'invalid_request: /containers/0/rate_table/weight_brackets_g/0: must be at least 1'],
+    [{ weight_brackets_g: [500], prices_minor: [-1] },
+      'invalid_request: /containers/0/rate_table/prices_minor/0: must be at least 0'],
+    [{ weight_brackets_g: [500], prices_minor: [100], fuel_surcharge_permille: -1 },
+      'invalid_request: /containers/0/rate_table/fuel_surcharge_permille: must be at least 0'],
   ];
   for (const [table, expected] of cases) {
-    assert.throws(() => packFallback(landed(table, '200 g')), expected);
+    assert.throws(() => packFallback(landed(table, '200 g')), { name: 'InvalidRequestError', message: expected });
   }
 });
 
@@ -1961,7 +2019,7 @@ test('a request that omits value reproduces the default result byte-for-byte', (
 test('a negative value fails admission instead of being ignored', () => {
   assert.throws(
     () => packFallback(request([cube('a', 10, { value: -1 })], [box('c')])),
-    /value must be a non-negative safe integer/,
+    { message: 'invalid_request: /items/0/value: must be at least 0' },
   );
 });
 

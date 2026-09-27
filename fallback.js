@@ -1,12 +1,18 @@
+import { jsonInteger, jsonSpelling } from './canonical-json.js';
 import { appendContactBox, buildContactGraph } from './contact-graph.js';
-import { compareCodePoints } from './commerce-model.js';
+import { CommerceInputError, compareCodePoints } from './commerce-model.js';
 import { parsePolicy, policyRejection, provesUnplaceable, tagOccurrences } from './policy.js';
+import { InvalidRequestError, checkRequest, pointer } from './request-errors.js';
 
-const LEN={mm:16000,cm:160000,m:16000000,in:406400,inch:406400,inches:406400,ft:4876800,tick:1,ticks:1};
+export { InvalidRequestError };
+
+const LEN={mm:16000,millimeter:16000,millimeters:16000,cm:160000,m:16000000,in:406400,inch:406400,inches:406400,ft:4876800,tick:1,ticks:1};
 const WT={g:8000000,kg:8000000000,mg:8000,lb:3628738960,lbs:3628738960,oz:226796185,tick:1,ticks:1};
 const ROT={LWH:[0,1,2],LHW:[0,2,1],WLH:[1,0,2],WHL:[1,2,0],HLW:[2,0,1],HWL:[2,1,0]};
 const SUPPORT_SCALE=1000000;
+const MIN_CANDIDATE_POINTS=16;
 const hasOwn=(value,key)=>Object.prototype.hasOwnProperty.call(value,key);
+const isObject=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 function cloneValue(value){
   if(Array.isArray(value))return value.map(cloneValue);
   if(value!==null&&typeof value==='object'){
@@ -19,6 +25,8 @@ function cloneValue(value){
 const UNSUPPORTED={
   // Top-level scope: a block describing the whole request rather than one item or
   // container, which none of the per-entry loops below would ever see.
+  // `fixed_placements` left this list in 1.4.0, when this engine gained seeding, admission
+  // and the fixed-placement validator rule (docs/PLAN-REVISIONS.md).
   request:[],
   configuration:[],
   // `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list
@@ -100,21 +108,226 @@ const addLanded=(total,template,billedTicks)=>{
 export class UnsupportedFeatureError extends Error{
   constructor(fields){super(`unsupported_feature: JavaScript fallback does not yet implement ${fields.join(', ')}; the request was rejected instead of silently ignoring public fields`);this.name='UnsupportedFeatureError';this.code='unsupported_feature';this.fields=fields}
 }
+// The entries of a list that can carry a field at all. This guard runs before the request's
+// shape is checked, so a list that is not one, or an entry that is not an object, is left for
+// `checkRequest` to name rather than crashing here.
+const objectsIn=value=>Array.isArray(value)?value.filter(isObject):[];
 function rejectUnsupported(req){const fields=[];
   for(const key of UNSUPPORTED.request)if(hasOwn(req,key))fields.push(key);
-  for(const key of UNSUPPORTED.configuration)if(hasOwn(req.configuration??{},key))fields.push(`configuration.${key}`);
-  for(const raw of req.items??[])for(const key of UNSUPPORTED.item)if(hasOwn(raw,key))fields.push(`item.${key}`);
-  for(const raw of req.containers??[]){
+  for(const key of UNSUPPORTED.configuration)if(isObject(req.configuration)&&hasOwn(req.configuration,key))fields.push(`configuration.${key}`);
+  for(const raw of objectsIn(req.items))for(const key of UNSUPPORTED.item)if(hasOwn(raw,key))fields.push(`item.${key}`);
+  for(const raw of objectsIn(req.containers)){
     for(const key of UNSUPPORTED.container)if(hasOwn(raw,key))fields.push(`container.${key}`);
-    for(const obstacle of raw.obstacles??[])for(const key of UNSUPPORTED.obstacle)if(hasOwn(obstacle,key))fields.push(`obstacle.${key}`);
+    for(const obstacle of objectsIn(raw.obstacles))for(const key of UNSUPPORTED.obstacle)if(hasOwn(obstacle,key))fields.push(`obstacle.${key}`);
   }
-  for(const raw of req.items??[]){const shape=raw?.shape_type;
+  for(const raw of objectsIn(req.items)){const shape=raw.shape_type;
     if(typeof shape==='string'&&UNSUPPORTED.shapeType.includes(shape))fields.push(`item.shape_type=${shape}`)}
   if(fields.length)throw new UnsupportedFeatureError([...new Set(fields)].sort());
 }
+/**
+ * The request's fixed placements are malformed (`reason` `malformed`, `field` the bad value) or
+ * cannot all hold (`cannot_hold`, `field` `/fixed_placements`), so no search is attempted
+ * (docs/PLAN-REVISIONS.md). The message is `packvium.fixed_placements`' word for word, and names
+ * no field: it predates the field and is pinned across engines.
+ */
+export class FixedPlacementError extends InvalidRequestError{
+  static code='invalid_fixed_placement';
+  static describe(field,detail){return `${this.code}: ${detail}`}
+  constructor(detail,reason='cannot_hold',field='/fixed_placements'){super(reason,field,detail);this.name='FixedPlacementError'}
+}
+const malformed=(detail,field)=>new FixedPlacementError(detail,'malformed',field);
+const FIXED_REQUIRED=['item_type','container_type','orientation'],FIXED_FIELDS=[...FIXED_REQUIRED,'container_instance','position'],AXES=['x','y','z'];
+const unknownKeys=(value,allowed)=>Object.keys(value).filter(key=>!allowed.includes(key)).sort(compareCodePoints);
+/**
+ * The request's `fixed_placements` as JSON gave them, or a refusal naming the first entry
+ * that is not the schema's shape. Nothing is coerced: `"1"` and `true` are not instances, and
+ * a list is not a position. An absent or null field is no fixed placements. O(f).
+ */
+function requireFixedPlacementShapes(raw,u){
+  if(raw==null)return [];
+  if(!Array.isArray(raw))throw malformed('fixed_placements is a list','/fixed_placements');
+  raw.forEach((entry,index)=>requireFixedEntryShape(entry,`fixed_placements[${index}]`,pointer('fixed_placements',index),u));
+  return raw
+}
+function requireFixedEntryShape(entry,where,field,u){
+  if(!isObject(entry))throw malformed(`${where} is an object`,field);
+  const unknown=unknownKeys(entry,FIXED_FIELDS);
+  if(unknown.length)throw malformed(`${where} does not carry ${jsonSpelling(unknown)}`,field);
+  const missing=FIXED_REQUIRED.filter(name=>!hasOwn(entry,name));
+  if(missing.length)throw malformed(`${where} needs ${jsonSpelling(missing)}`,field);
+  for(const name of ['item_type','container_type'])
+    if(typeof entry[name]!=='string'||!entry[name])throw malformed(`${where}.${name} is a non-empty string`,`${field}/${name}`);
+  if(!Object.keys(ROT).includes(entry.orientation))throw malformed(`${where}.orientation is one of the six codes`,`${field}/orientation`);
+  const instance=fixedInstance(entry);
+  if(instance===null||instance<1)throw malformed(`${where}.container_instance counts from 1`,`${field}/container_instance`);
+  const position=hasOwn(entry,'position')?entry.position:{};
+  requirePointShape(position,`${where}.position`,`${field}/position`,malformed);
+  for(const axis of AXES)if(hasOwn(position,axis))requireCoordinate(position[axis],`${where}.position.${axis}`,`${field}/position/${axis}`,u);
+}
+// Parsed here, before admission, so a coordinate the length parser cannot read is refused as
+// the entry's own fault, naming the value, rather than surfacing later as a bare parse error.
+function requireCoordinate(value,where,field,u){
+  try{scalar(value,u,LEN)}
+  catch(error){throw malformed(`${where} ${String(error?.message).includes('cannot be negative')?'cannot be negative':'is a measure'}`,field)}
+}
+const fixedInstance=entry=>jsonInteger(hasOwn(entry,'container_instance')?entry.container_instance:1);
+/**
+ * A point is an object of `x`, `y` and `z` measures; what a measure may be is the length
+ * parser's to say, so only the values it would silently misread are refused here. `error`
+ * builds the refusal from its message and the JSON Pointer of the bad value.
+ */
+export function requirePointShape(point,where,field,error){
+  if(!isObject(point))throw error(`${where} is a point object`,field);
+  const unknown=unknownKeys(point,AXES);
+  if(unknown.length)throw error(`${where} does not carry ${jsonSpelling(unknown)}`,field);
+  for(const axis of AXES)if(hasOwn(point,axis)&&(point[axis]===null||typeof point[axis]==='boolean'||Array.isArray(point[axis])))
+    throw error(`${where}.${axis} is a measure`,`${field}/${axis}`);
+}
+/**
+ * Resolve `req.fixed_placements` into the containers the solve opens first, or refuse the
+ * request. Fixed items take the first instances of their type in listed order, and each
+ * enters as a real placement, so every rule that reads a container's placement list holds
+ * for it with no rule of its own. The checks run in `admit_fixed_placements`' order because
+ * the refusal text is compared across engines.
+ *
+ * O(f log f) to resolve f entries, plus one pass of `fixedSetIssue`, O(f^2) in its pairwise
+ * collision sweep. It runs once per solve frame, before search.
+ */
+function admitFixedPlacements(req,{items,templates,u,clear}){
+  const entries=requireFixedPlacementShapes(req.fixed_placements,u);if(!entries.length)return [];
+  const rawItems=new Map((req.items??[]).map(raw=>[raw.id,raw])),byId=new Map(templates.map(t=>[t.id,t]));
+  const instances=new Map(items.map(item=>[item.id,item])),order=new Map((req.containers??[]).map((raw,index)=>[raw.id,index]));
+  const parsed=entries.map(entry=>{const point=hasOwn(entry,'position')?entry.position:{};
+    return {itemType:entry.item_type,containerType:entry.container_type,instance:fixedInstance(entry),orientation:entry.orientation,
+      position:AXES.map(axis=>scalar(hasOwn(point,axis)?point[axis]:0,u,LEN))}});
+  for(const entry of parsed){const raw=rawItems.get(entry.itemType);
+    if(raw===undefined)throw new FixedPlacementError(`unknown item type ${jsonSpelling(entry.itemType)}`);
+    if(!byId.has(entry.containerType))throw new FixedPlacementError(`unknown container type ${jsonSpelling(entry.containerType)}`);
+    if(!(raw.allowed_rotations??(raw.keep_upright?['LWH','WLH']:Object.keys(ROT))).includes(entry.orientation))
+      throw new FixedPlacementError(`${entry.itemType} may not be placed in orientation ${entry.orientation}`)}
+  const taken=new Map(),assigned=parsed.map(entry=>{const count=(taken.get(entry.itemType)??0)+1,quantity=rawItems.get(entry.itemType).quantity??1;taken.set(entry.itemType,count);
+    if(count>quantity)throw new FixedPlacementError(`${count} ${entry.itemType} fixed, ${quantity} requested`);
+    return instances.get(`${entry.itemType}#${count}`)});
+  const grouped=new Map();
+  parsed.forEach((entry,index)=>{const item=assigned[index],[px,py,pz]=entry.position;
+    // The clearance envelope must be inside the container, as for any placement; an item
+    // flush against a wall has an envelope that starts before it.
+    if(Math.min(px,py,pz)<clear)throw new FixedPlacementError(`outside_container: ${item.id}`);
+    const key=`${entry.containerType}\u0000${entry.instance}`,pd=rotate(item.d,entry.orientation);
+    if(!grouped.has(key))grouped.set(key,{tmpl:byId.get(entry.containerType),seq:entry.instance,placements:[]});
+    grouped.get(key).placements.push({x:px-clear,y:py-clear,z:pz-clear,pd,ed:pd.map(edge=>edge+2*clear),r:entry.orientation,item,fixed:true})});
+  const groups=[...grouped.values()].sort((a,b)=>order.get(a.tmpl.id)-order.get(b.tmpl.id)||a.seq-b.seq);
+  requireContiguousInstances(groups,req.configuration?.max_containers??null);
+  // Support is measured against every other fixed item in the container, not only the ones
+  // listed before it: the set is one arrangement, and listing order is not physics.
+  for(const group of groups)for(const placement of group.placements)placement.fixedSupport=placement.z===0?1
+    :directSupporters(placement,group.placements).reduce((total,support)=>total+support.area,0)/(placement.ed[0]*placement.ed[1]);
+  const issue=fixedSetIssue(groups,req,clear);
+  if(issue!==null)throw new FixedPlacementError(issue);
+  return groups
+}
+function requireContiguousInstances(groups,maxContainers){
+  const named=new Map();for(const group of groups){if(!named.has(group.tmpl.id))named.set(group.tmpl.id,[]);named.get(group.tmpl.id).push(group.seq)}
+  for(const [id,sequences] of named){
+    if(sequences.some((sequence,index)=>sequence!==index+1))throw new FixedPlacementError(`${id} instances ${jsonSpelling(sequences)} are not numbered 1..${sequences.length}`);
+    const quantity=byTemplate(groups,id).quantity;
+    if(quantity!=null&&sequences.length>quantity)throw new FixedPlacementError(`${sequences.length} ${id} named, ${quantity} available`)}
+  if(maxContainers!=null&&groups.length>maxContainers)throw new FixedPlacementError(`${groups.length} containers hold fixed items, max_containers is ${maxContainers}`)
+}
+const byTemplate=(groups,id)=>groups.find(group=>group.tmpl.id===id).tmpl;
+/**
+ * The first issue `IndependentSolutionValidator` reports for the fixed set alone, as
+ * `code: detail`, or null. Same rules, same order: collisions, then per placement bounds,
+ * obstacles, floor, eligibility, compatibility, tag counts, support and stacking, then per
+ * container load, axles, route, payload and item count, then groups. Item accounting is
+ * left out because the free items have not been placed yet. The support-polygon centroid
+ * test is absent because this engine does not enforce it in search either
+ * (docs/VALIDATION-CONTRACT.md).
+ */
+function fixedSetIssue(groups,req,clear){
+  const globalRatio=req.configuration?.minimum_support_ratio??0,globalPpm=Math.round(globalRatio*SUPPORT_SCALE),located=new Map();
+  for(const group of groups){const {tmpl,placements}=group,cid=`${tmpl.id}#${group.seq}`,boxOf=p=>({x:p.x,y:p.y,z:p.z,d:p.ed});
+    for(let i=0;i<placements.length;i++)for(let j=i+1;j<placements.length;j++){const a=placements[i],b=placements[j];
+      if(intersects(boxOf(a),boxOf(b))&&!validNesting(a,b)&&solidsOverlap(placedHull(a),boxOf(a),placedHull(b),boxOf(b)))return `collision: ${a.item.id} with ${b.item.id}`}
+    const compatibility=placements.some(p=>p.item.tags.length||p.item.incompatible.length);
+    const support=globalRatio>0||placements.some(p=>p.item.supportPpm>0||(p.item.groundRule!=null&&p.item.groundRule!=='free'));
+    const stack=placements.some(p=>!p.item.stackable||p.item.maxTop!=null||p.item.maxStacked!=null||p.item.maxCompressionKpa!=null);
+    const boxes=placements.map(constraintBox),graph=contactGraph(boxes);
+    for(let index=0;index<placements.length;index++){const p=placements[index],item=p.item,id=item.id,box=boxOf(p),others=placements.filter((_,k)=>k!==index);
+      if(p.x+p.ed[0]>tmpl.d[0]||p.y+p.ed[1]>tmpl.d[1]||p.z+p.ed[2]>tmpl.d[2])return `outside_container: ${id}`;
+      if(tmpl.obs.some(o=>intersects(box,o)&&solidsOverlap(placedHull(p),box,null,o)))return `obstacle_collision: ${id}`;
+      if(item.raw.must_be_on_floor&&p.z!==0)return `must_be_on_floor: ${id}: `;
+      if(item.eligibleTags.length&&!item.eligibleTags.some(tag=>(tmpl.tags??[]).includes(tag)))return `container_ineligible: ${id}`;
+      if(compatibility){const rule=compatibilityIssue(item,others,tmpl);if(rule!==null)return `${rule[0]}: ${id}: ${rule[1]}`}
+      if(support){const rule=supportIssue(p,others,globalRatio,globalPpm);if(rule!==null)return `${rule[0]}: ${id}: ${rule[1]}`}
+      if(stack){const lower=graph.supporters[index].find(([k])=>!placements[k].item.stackable);
+        if(lower!==undefined)return `non_stackable: ${id}: ${placements[lower[0]].item.raw.id}`;
+        if(!item.stackable&&graph.children[index].length)return `non_stackable: ${id}: ${item.raw.id}`}}
+    const bearing=loadIssue(boxes,graph,placements,tmpl);if(bearing!==null)return `${bearing[0]}: ${cid}: ${bearing[1]}`;
+    const reaction=axleReactions(tmpl,placements);
+    if(reaction!=null){const [front,rear]=tmpl.axleSpec;
+      if(front.max!=null&&reaction.front>BigInt(front.max)*reaction.denominator)return `axle_overloaded: ${cid}: front`;
+      if(rear.max!=null&&reaction.rear>BigInt(rear.max)*reaction.denominator)return `axle_overloaded: ${cid}: rear`}
+    if(placements.some(p=>p.item.stopIndex!=null)){const stuck=routeStuck(placements,tmpl,clear);
+      if(stuck!==null)return `unloading_order_violation: ${cid}: stop ${stuck.stop} cannot be fully unloaded (${stuck.indices.map(k=>placements[k].item.id).join(', ')} still blocked)`}
+    if(tmpl.max!=null&&placements.reduce((total,p)=>total+p.item.w,0)>tmpl.max)return `payload_exceeded: ${cid}`;
+    if(tmpl.max_items!=null&&placements.length>tmpl.max_items)return `max_items_exceeded: ${cid}`;
+    for(const p of placements)if(p.item.group!=null){if(!located.has(p.item.group))located.set(p.item.group,new Set());located.get(p.item.group).add(cid)}}
+  for(const group of [...located.keys()].sort(compareCodePoints)){const where=[...located.get(group)].sort(compareCodePoints);
+    if(where.length>1)return `group_split: ${group}: ${where.join(', ')}`}
+  return null
+}
+function compatibilityIssue(item,others,tmpl){
+  if(item.tags.length||item.incompatible.length)for(const other of others)
+    if(item.incompatible.some(tag=>other.item.tags.includes(tag))||other.item.incompatible.some(tag=>item.tags.includes(tag)))
+      return ['incompatible_items',`${item.raw.id} is incompatible with ${other.item.raw.id}`];
+  for(const tag of item.tags.filter(tag=>tmpl.tagLimits[tag]!=null).sort(compareCodePoints)){
+    const limit=tmpl.tagLimits[tag],count=others.filter(other=>other.item.tags.includes(tag)).length;
+    if(count+1>limit)return ['tag_count_exceeded',`${tag}: limit ${limit}, would be ${count+1}`]}
+  return null
+}
+function supportIssue(p,others,globalRatio,globalPpm){
+  const rule=p.item.groundRule,required=Math.max(globalRatio,p.item.raw.minimum_support_ratio??0);
+  if(p.z===0||((rule==null||rule==='free')&&required<=0))return null;
+  const supporters=directSupporters(p,others),count=supporters.length;
+  if(rule==='covered'){const surfaces=others.filter(o=>o.z+o.ed[2]===p.z),x2=p.x+p.ed[0],y2=p.y+p.ed[1];
+    if(![[p.x,p.y],[x2,p.y],[p.x,y2],[x2,y2]].every(([x,y])=>surfaces.some(s=>s.x<=x&&x<=s.x+s.ed[0]&&s.y<=y&&y<=s.y+s.ed[1])))
+      return ['ground_contact_violation',`covered: ${count} supporter(s), not all four corners touched`]}
+  if(rule==='single'&&count!==1)return ['ground_contact_violation',`single: rests on ${count} item(s)`];
+  if(rule==='multiple'&&count<2)return ['ground_contact_violation',`multiple: rests on ${count} item(s)`];
+  if(required<=0)return null;
+  const area=supporters.reduce((total,support)=>total+support.area,0),base=p.ed[0]*p.ed[1];
+  return area<requiredArea(base,Math.max(globalPpm,p.item.supportPpm))?['insufficient_support',`${area}/${base} < ${required.toFixed(6)}`]:null
+}
+// The whole-container bearing pass, each rule reporting its first offender by instance id.
+function loadIssue(boxes,graph,placements,tmpl){
+  const loads=topLoads(boxes,graph),label=index=>placements[index].item.id;
+  let index=boxes.findIndex((b,i)=>b.maxTop!=null&&loads[i]>BigInt(b.maxTop));if(index>=0)return ['top_load_exceeded',label(index)];
+  index=boxes.findIndex((b,i)=>b.maxCompressionKpa!=null&&pressureExceeds(appliedPressure(Number(loads[i]),b.d[0]*b.d[1]),b.maxCompressionKpa));
+  if(index>=0)return ['crush_violation',label(index)];
+  index=boxes.findIndex((b,root)=>{if(b.maxStacked==null)return false;const seen=new Set(),pending=[...graph.children[root]];
+    while(pending.length){const k=pending.pop();if(!seen.has(k)){seen.add(k);pending.push(...graph.children[k])}}return seen.size>b.maxStacked});
+  if(index>=0)return ['stacked_item_limit_exceeded',label(index)];
+  if(tmpl.maxStackDensity!=null){const squareMetre=16000000n*16000000n;
+    index=boxes.findIndex((b,i)=>(BigInt(b.w)+loads[i])*squareMetre>BigInt(tmpl.maxStackDensity)*BigInt(b.d[0])*BigInt(b.d[1]));
+    if(index>=0)return ['stack_density_exceeded',label(index)]}
+  return null
+}
+// `safe_route_removal_order` over the physical boxes: the first stop that cannot be emptied,
+// with every placement still due there, or null.
+function routeStuck(placements,tmpl,clear){
+  const boxes=placements.map(p=>({x:p.x+clear,y:p.y+clear,z:p.z+clear,d:{length:p.pd[0],width:p.pd[1],height:p.pd[2]}}));
+  const container={length:tmpl.d[0],width:tmpl.d[1],height:tmpl.d[2]},dependsOn=unloadingDependencies(boxes),present=new Set(boxes.map((_,k)=>k));
+  for(const stop of [...new Set(placements.map(p=>p.item.stopIndex).filter(s=>s!=null))].sort((a,b)=>a-b)){
+    let due=placements.map((p,k)=>k).filter(k=>placements[k].item.stopIndex===stop);
+    while(due.length){const removable=due.filter(k=>!dependsOn[k].some(d=>present.has(d))&&clearDirection(k,boxes,present,container,ALL_DIRECTIONS)!=null);
+      if(!removable.length)return {stop,indices:due};
+      const chosen=Math.min(...removable);present.delete(chosen);due=due.filter(k=>k!==chosen)}}
+  return null
+}
 function rat(s){s=String(s).trim();if(s.includes(' ')){const [w,f]=s.split(/\s+/,2),[n,d]=f.split('/').map(BigInt),wb=BigInt(w),sg=s.startsWith('-')?-1n:1n,mag=(wb<0n?-wb:wb)*d+n;return [sg*mag,d]}if(s.includes('/')){const[n,d]=s.split('/').map(BigInt);return[n,d]}if(s.includes('.')){const neg=s.startsWith('-'),[a,b]=s.replace(/^[-+]/,'').split('.');const d=10n**BigInt(b.length),n=BigInt(a)*d+BigInt(b);return[neg?-n:n,d]}return[BigInt(s),1n]}
 function round(n,d){const sg=n<0n?-1n:1n,a=n<0n?-n:n,q=a/d,r=a%d;const z=r*2n<d?q:r*2n>d?q+1n:q%2n===0n?q:q+1n;return sg*z}
-function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v.value;unit=v.unit??def}else if(typeof v==='string'){const m=v.trim().match(/^(.+?)\s*(millimeters|millimeter|inches|ticks|inch|lbs|tick|mm|cm|ft|in|mg|kg|oz|lb|g|m)$/i);if(m){raw=m[1];unit=m[2]}}const[n,d]=rat(raw);return Number(round(n*BigInt(table[unit.toLowerCase()]),d))}
+function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v.value;unit=v.unit??def}else if(typeof v==='string'){const m=v.trim().match(/^(.+?)\s*(millimeters|millimeter|inches|ticks|inch|lbs|tick|mm|cm|ft|in|mg|kg|oz|lb|g|m)$/i);if(m){raw=m[1];unit=m[2]}}const[n,d]=rat(raw),ticks=Number(round(n*BigInt(table[unit.toLowerCase()]),d));if(ticks<0)throw new RangeError(`${table===WT?'weight':'length'} cannot be negative`);return ticks}
 function dims(v,u){return [scalar(v.length,u,LEN),scalar(v.width,u,LEN),scalar(v.height,u,LEN)]}
 function rotate(d,r){return ROT[r].map(i=>d[i])}
 function volume(d){return BigInt(d[0])*BigInt(d[1])*BigInt(d[2])}
@@ -1262,6 +1475,8 @@ function lessThan(left,right){
  * general path's own item-building loop is what let the two disagree.
  */
 function admitItem(raw,u){
+  if(!Number.isSafeInteger(raw.quantity??1)||(raw.quantity??1)<1)throw new RangeError('item quantity must be positive');
+  if(!isUnitRatio(raw.minimum_support_ratio??0))throw new RangeError('minimum_support_ratio must be between 0 and 1');
   const d=dims(raw.dimensions,u),nesting=raw.nesting_height==null?null:scalar(raw.nesting_height,u,LEN);
   if(nesting!=null&&(nesting<0||nesting>=d[2]))throw new RangeError("nesting_height must be at least zero and strictly less than the item's own height");
   if(raw.max_stacked_items!=null&&(!Number.isSafeInteger(raw.max_stacked_items)||raw.max_stacked_items<1))throw new RangeError('max_stacked_items must be a positive safe integer');
@@ -1273,6 +1488,30 @@ function admitItem(raw,u){
   // would let the two disagree about which requests are legal.
   parseShape(raw,d,u,nesting);
   if(raw.eligible_container_tags!=null&&(!Array.isArray(raw.eligible_container_tags)||raw.eligible_container_tags.some(tag=>typeof tag!=='string')))throw new TypeError('eligible_container_tags must be an array of strings');
+}
+
+const isUnitRatio=value=>value>=0&&value<=1;
+const isAtLeast=(value,floor)=>Number.isSafeInteger(value)&&value>=floor;
+
+/**
+ * Reject a container the contract does not admit, before either solver path runs -- the
+ * compact lattice path returns before container templates are built (see `admitItem`).
+ */
+function admitContainer(raw){
+  if(raw.quantity!=null&&!isAtLeast(raw.quantity,1))throw new RangeError('container quantity must be positive');
+  if(raw.max_items!=null&&!isAtLeast(raw.max_items,1))throw new RangeError('container max_items must be at least 1');
+  if(raw.cost_minor!=null&&!isAtLeast(raw.cost_minor,0))throw new RangeError('container cost cannot be negative');
+  if(raw.void_fill_reserve_ratio!=null&&(typeof raw.void_fill_reserve_ratio!=='number'||!Number.isFinite(raw.void_fill_reserve_ratio)))throw new TypeError('void_fill_reserve_ratio must be a finite number');
+  if(!isUnitRatio(raw.void_fill_reserve_ratio??0))throw new RangeError('void_fill_reserve_ratio must be between 0 and 1');
+}
+
+/** Reject configuration limits below the floors the reference engine enforces. */
+function admitConfiguration(cfg){
+  for(const name of ['time_limit_ms','alternatives','exact_item_limit'])
+    if(cfg[name]!=null&&!isAtLeast(cfg[name],1))throw new RangeError('positive configuration values required');
+  if(cfg.max_containers!=null&&!isAtLeast(cfg.max_containers,1))throw new RangeError('max_containers must be at least 1');
+  if(cfg.max_candidate_points!=null&&!isAtLeast(cfg.max_candidate_points,MIN_CANDIDATE_POINTS))throw new RangeError(`max_candidate_points must be at least ${MIN_CANDIDATE_POINTS}`);
+  if(!isUnitRatio(cfg.minimum_support_ratio??0))throw new RangeError('minimum_support_ratio must be between 0 and 1');
 }
 
 /**
@@ -1305,6 +1544,9 @@ function latticePlacements({best,count,firstIndex,raw,weight,clear,ou,ow}){
   return placements
 }
 
+// Any `fixed_placements` but an empty list stands the closed-form path down; a malformed one
+// goes on to admission, which refuses it, rather than being answered as if it were absent.
+const hasFixedPlacements=req=>Array.isArray(req.fixed_placements)?req.fixed_placements.length>0:req.fixed_placements!=null;
 function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solverAlias,metrics,effortExceeded,effortRemaining,deadline}){
   // Keep this path opt-in until its capacity-first container choice is
   // proven objective-equivalent to the general path. Admission, effort accounting,
@@ -1313,7 +1555,9 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
   // retained lattice in `latticePlacements` is O(count), while compact output remains
   // O(c*r) and keeps regression-many-container-types below the scaling budget.
   const wantCoordinates=req.configuration?.require_placement_coordinates!==false;
-  if((solverAlias!=null&&solverAlias!=='grid')||req.items?.length!==1)return null;
+  // A container holding fixed items is not an empty box, and this path places every item of
+  // the request by formula; it stands down for the whole request, as it does for obstacles.
+  if((solverAlias!=null&&solverAlias!=='grid')||req.items?.length!==1||hasFixedPlacements(req))return null;
   const raw=req.items[0],quantity=raw.quantity??1;
   if(!Number.isSafeInteger(quantity)||quantity<1||raw.group!=null||(raw.tags??[]).length||(raw.incompatible_tags??[]).length
     ||(raw.eligible_container_tags??[]).length||raw.max_stacked_items!=null||raw.nesting_height!=null
@@ -1344,7 +1588,7 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
   templates.sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'
     ?dimensionalWeight(a.outerD)-dimensionalWeight(b.outerD)||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))
     :(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d)));
-  let remaining=quantity,sequence=0,scoreCost=0,scoreUnused=0,scoreHeight=0,scoreBillable=0,scoreLanded=0,scoreAchievedHeight=0;
+  let remaining=quantity,scoreCost=0,scoreUnused=0,scoreHeight=0,scoreBillable=0,scoreLanded=0,scoreAchievedHeight=0;
   const containers=[],maxContainers=req.configuration?.max_containers??Infinity;
   // Per-unit capacity depends only on (item, template), both fixed for the
   // whole solve, so it is computed once per template rather than recomputed on
@@ -1457,10 +1701,10 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
       const summary={...best,count,weight,clearance:clear};
       const used=volume(best.physical)*BigInt(count),payload=weight*count;
       const firstIndex=quantity-remaining+1;
-      sequence++;remaining-=count;metrics.search_nodes_expanded+=count;
+      remaining-=count;metrics.search_nodes_expanded+=count;
       metrics.candidate_points_considered+=count;metrics.orientations_considered+=count;metrics.feasible_candidates+=count;
       containers.push({
-        id:`${template.id}#${sequence}`,container_type:template.id,inner_dimensions:outDims(template.d,ou),
+        id:`${template.id}#${plan.opened}`,container_type:template.id,inner_dimensions:outDims(template.d,ou),
         outer_dimensions:outDims(template.outerD,ou),payload_weight:outWeight(payload,ow),
         gross_weight:outWeight(payload+template.tare,ow),used_volume_ticks3:used.toString(),
         volume_utilization:(Number(used)/Number(volume(template.d))).toFixed(6),
@@ -1577,7 +1821,48 @@ function unstartedRecord(solverAlias,index,globalDeadlineReached){return {
   id:startRecordId(solverAlias,index),started:false,completed:false,truncated:false,selected:false,
   global_deadline_reached:globalDeadlineReached,
 }}
-export function packFallback(req,clock=Date.now,solverAlias=null,startIndex=null,sharedDeadline=null){rejectUnsupported(req);
+// The engine's own unit tables and parser, handed to the preflight so a measure means there
+// exactly what it means when the model is built.
+const MEASURES=Object.freeze({length:{units:LEN,parse:(value,unit)=>scalar(value,unit,LEN)},weight:{units:WT,parse:(value,unit)=>scalar(value,unit,WT)}});
+/**
+ * Solve a JSON request. A request no engine may answer throws `InvalidRequestError` (or its
+ * subclass `FixedPlacementError`) naming the bad value, and nothing is solved.
+ *
+ * The rule table runs first, over the raw JSON (`checkRequest`). Whatever it does not name and
+ * still stops the request being read into the model reaches the caller as the same error with
+ * reason `invalid_value` -- but only until the search starts (`phase.solving`), so a solver
+ * defect is never dressed up as the caller's mistake. An error that already carries its own
+ * `code` (unsupported feature, policy, fixed placement, direction) passes through unchanged.
+ */
+export function packFallback(req,clock=Date.now,solverAlias=null,startIndex=null,sharedDeadline=null){
+  if(!isObject(req))throw new InvalidRequestError('wrong_type','','must be an object');
+  rejectUnsupported(req);
+  checkRequest(req,MEASURES);
+  return solveChecked(req,clock,solverAlias,startIndex,sharedDeadline);
+}
+/**
+ * The rule table alone, for a caller about to hand the request to the native engine: the
+ * native binding reports errors as text, and a caller should get the same `InvalidRequestError`
+ * whichever backend answers. Which fields a backend implements is its own business, so the
+ * unsupported-feature check is not part of it.
+ */
+export function checkRequestShape(req){
+  if(!isObject(req))throw new InvalidRequestError('wrong_type','','must be an object');
+  checkRequest(req,MEASURES);
+}
+function solveChecked(req,clock,solverAlias,startIndex,sharedDeadline){
+  const phase={solving:false};
+  try{return solveFrame(req,clock,solverAlias,startIndex,sharedDeadline,phase)}
+  catch(error){throw phase.solving?error:asRequestError(error)}
+}
+function asRequestError(error){
+  if(!(error instanceof Error)||'code' in error||error instanceof CommerceInputError)return error;
+  return new InvalidRequestError('invalid_value','',error.message)
+}
+// One frame of the solve: the outermost call, a portfolio member or one start of a multi-start
+// run. Every frame reads the request into its model before it searches; `phase` is shared by
+// all frames of one call and flips when the first search begins.
+function solveFrame(req,clock,solverAlias,startIndex,sharedDeadline,phase){
 // Admit the doors here, beside the other request-admission checks, and not
 // where they are canonicalised. The container template is built after the
 // uniform-lattice fast path has already returned, so validating there let a request
@@ -1587,10 +1872,12 @@ export function packFallback(req,clock=Date.now,solverAlias=null,startIndex=null
 // divergence was reachable only from a library call, which is exactly how an
 // embedder reaches this engine.
 for(const container of req.containers??[])validateDirections(container.access_directions??[]);
+admitConfiguration(req.configuration??{});
+for(const container of req.containers??[])admitContainer(container);
 const requestedSolvers=req.configuration?.solvers??[],knownSolvers=['grid','extreme_points','homogeneous_blocks','layer','maximal_spaces','exact_small'];
 if(!Array.isArray(requestedSolvers)||requestedSolvers.some(name=>!knownSolvers.includes(name)))throw new RangeError(`unknown solver; expected one of ${knownSolvers.join(', ')}`);
 const exactItemLimit=req.configuration?.exact_item_limit??7;
-const requestedItemCount=(req.items??[]).reduce((total,item)=>total+(item.quantity??1),0);
+const requestedItemCount=(req.items??[]).reduce((total,item)=>total+(item.quantity??1),0)-(Array.isArray(req.fixed_placements)?req.fixed_placements.length:0);
 if(requestedSolvers.includes('exact_small')&&requestedItemCount>exactItemLimit)throw new RangeError('exact-small item limit exceeded');
 const effort=req.configuration?.effort_budget??null;
 for(const [name,value] of Object.entries(effort??{}))if(!Number.isSafeInteger(value)||value<=0)throw new RangeError(`effort_budget.${name} must be a positive safe integer`);
@@ -1616,7 +1903,7 @@ const finalizeOutermost=result=>{
 };
 if(solverAlias===null&&requestedSolvers.length===0&&(req.configuration?.solver_profile??'balanced')==='quality'){
   const child={...req,configuration:{...(req.configuration??{}),solvers:['homogeneous_blocks','extreme_points','maximal_spaces','layer']}};
-  return packFallback(child,clock,null,null,deadline)
+  return solveFrame(child,clock,null,null,deadline,phase)
 }
 if(solverAlias===null&&requestedSolvers.length){
   let remainingStarts=restartLimit;
@@ -1630,7 +1917,7 @@ if(solverAlias===null&&requestedSolvers.length){
   for(const plan of plans){
     if(runs.length&&deadline.expired())break;
     const childRequest={...req,configuration:{...(req.configuration??{}),solvers:[],multi_start_orders:plan.count}};
-    runs.push(packFallback(childRequest,clock,plan.name,null,deadline));
+    runs.push(solveFrame(childRequest,clock,plan.name,null,deadline,phase));
   }
   let winnerIndex=0;for(let index=1;index<runs.length;index++)if(compareScore(runs[index].score,runs[winnerIndex].score)<0)winnerIndex=index;
   const winner=runs[winnerIndex],globalDeadlineReached=deadline.expired();
@@ -1657,9 +1944,9 @@ if(startIndex===null&&multiStartOrders>1){
   for(let index=0;index<plannedStarts;index++){
     if(runs.length&&deadline.expired())break;
     const child=stagedPlanSearch?{...req,configuration:{...(req.configuration??{}),max_candidates_per_item:1,container_plan_beam_width:1,container_plan_node_limit:1}}:req;
-    runs.push(packFallback(child,clock,solverAlias,index,deadline));
+    runs.push(solveFrame(child,clock,solverAlias,index,deadline,phase));
   }
-  if(stagedPlanSearch)for(let index=0;index<2;index++){if(deadline.expired())break;runs.push(packFallback(req,clock,solverAlias,index,deadline))}
+  if(stagedPlanSearch)for(let index=0;index<2;index++){if(deadline.expired())break;runs.push(solveFrame(req,clock,solverAlias,index,deadline,phase))}
   let winnerIndex=0;for(let index=1;index<runs.length;index++)if(compareScore(runs[index].score,runs[winnerIndex].score)<0)winnerIndex=index;
   const winner=runs[winnerIndex],globalDeadlineReached=deadline.expired();
   const plannedRecords=plannedStarts+(stagedPlanSearch?2:0);
@@ -1689,7 +1976,7 @@ if(!['mm','cm','m','in','ft'].includes(dimLengthUnit))throw new RangeError('dime
 if(!['mg','g','kg','oz','lb'].includes(dimWeightUnit))throw new RangeError('dimensional_weight_weight_unit must be mg, g, kg, oz or lb');
 const dimensionalWeight=d=>Number(volume(d)*BigInt(WT[dimWeightUnit])/(BigInt(LEN[dimLengthUnit])**3n*BigInt(dimDivisor??1)));
 const globalSupportPpm=Math.round((req.configuration?.minimum_support_ratio??0)*SUPPORT_SCALE);
-const maxCandidatePoints=Math.max(16,req.configuration?.max_candidate_points??4096);
+const maxCandidatePoints=req.configuration?.max_candidate_points??4096;
 const qualityProfile=(req.configuration?.solver_profile??'balanced')==='quality';
 const maxCandidatesPerItem=req.configuration?.max_candidates_per_item??(qualityProfile?16:1);
 const containerPlanBeamWidth=req.configuration?.container_plan_beam_width??(qualityProfile?16:1);
@@ -1780,8 +2067,7 @@ items.sort((a,b)=>{
 if(startIndex!==null&&startIndex>0&&(!qualityProfile||startIndex>2))items.splice(0,items.length,...seededOrder(items,req.configuration?.seed??42,startIndex));
 const templates=req.containers.map(c=>{const d=dims(c.inner_dimensions,u),axleSpec=c.axles==null?null:c.axles.map(a=>({position:scalar(a.position,u,LEN),max:a.max_load==null?null:scalar(a.max_load,'g',WT)}));
   if(axleSpec&&(axleSpec.length!==2||axleSpec[0].position>=axleSpec[1].position||axleSpec[0].position<0||axleSpec[1].position>d[0]))throw new RangeError('axles must be [front, rear] inside the container');
-  if(c.void_fill_reserve_ratio!=null&&(typeof c.void_fill_reserve_ratio!=='number'||!Number.isFinite(c.void_fill_reserve_ratio)))throw new TypeError('void_fill_reserve_ratio must be a finite number');
-  const reservePpm=Math.round((c.void_fill_reserve_ratio??0)*SUPPORT_SCALE);if(reservePpm<0||reservePpm>SUPPORT_SCALE)throw new RangeError('void_fill_reserve_ratio must be between 0 and 1');
+  const reservePpm=Math.round((c.void_fill_reserve_ratio??0)*SUPPORT_SCALE);
   if(c.tag_limits!=null&&(typeof c.tag_limits!=='object'||Array.isArray(c.tag_limits)||Object.values(c.tag_limits).some(limit=>!Number.isSafeInteger(limit)||limit<1)))throw new RangeError('tag_limits must map strings to positive safe integers');
   const maxStackDensity=c.max_stack_density==null?null:scalar(c.max_stack_density,'g',WT);if(maxStackDensity!=null&&maxStackDensity<0)throw new RangeError('max_stack_density must be non-negative');
   const outerD=c.outer_dimensions?dims(c.outer_dimensions,u):d;
@@ -1798,7 +2084,26 @@ const templates=req.containers.map(c=>{const d=dims(c.inner_dimensions,u),axleSp
     innerVolume:volume(d),reserve:volume(d)*BigInt(reservePpm)/BigInt(SUPPORT_SCALE),
     rate:parseRateTable(c.rate_table),tagLimits:c.tag_limits??{},maxStackDensity,
     obs:(c.obstacles??[]).flatMap(o=>[o,...(o.additional_boxes??[])]).map(o=>({x:scalar(o.origin?.x??0,u,LEN),y:scalar(o.origin?.y??0,u,LEN),z:scalar(o.origin?.z??0,u,LEN),d:dims(o.dimensions,u)}))}}).sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'?(dimensionalWeight(a.outerD)-dimensionalWeight(b.outerD)||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))):((a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))));
-const inventory=new Map(templates.map(c=>[c.id,c.quantity??Infinity])),remaining=[...items],packed=[];let seq=0;
+// Admission of fixed placements, before any search: the containers they name, each holding
+// only its fixed items, in opening order. Their instances leave the free list.
+const fixedGroups=admitFixedPlacements(req,{items,templates,u,clear});
+// The request is read: from here on a failure is the solver's, not the caller's. The compact
+// path above reads and answers in one closed-form step, so everything it throws is reading.
+phase.solving=true;
+const fixedIds=new Set(fixedGroups.flatMap(group=>group.placements.map(p=>p.item.id)));
+const inventory=new Map(templates.map(c=>[c.id,c.quantity??Infinity])),remaining=items.filter(item=>!fixedIds.has(item.id)),packed=[];let seq=0;
+// A fresh per-container search state: candidate points, spatial index and running volume,
+// with the template's fixed items (`tmpl.fixed`, set only on a seeded copy) already placed
+// exactly as search would place them, so every solver starts from them unaware they exist.
+const seedState=tmpl=>{const node={state:{tmpl,placements:[],payload:0},used:0n,
+    points:[[0,0,0],...tmpl.obs.flatMap(o=>[[o.x+o.d[0],o.y,o.z],[o.x,o.y+o.d[1],o.z],[o.x,o.y,o.z+o.d[2]]])].sort(comparePoints),
+    index:makeIndex(tmpl.d)};
+  for(const placement of tmpl.fixed??[]){const placements=node.state.placements;node.state.payload+=placement.item.w;
+    const compressionSensitive=placement.item.shapeType==='compressible'||placements.some(p=>p.item.shapeType==='compressible');
+    node.used=compressionSensitive?usedVolume([...placements,placement]):node.used+usedVolumeDelta(placements,placement);
+    placements.push(placement);indexAdd(node.index,placements.length-1,{x:placement.x,y:placement.y,z:placement.z,d:placement.ed});
+    retirePointsForPlacement(node.points,placement);for(const point of pointsFrom(placement))insertPoint(node.points,point)}
+  return node};
 const maxContainers=req.configuration?.max_containers??Infinity;
 // Trial-packs `itemsRemaining` into one instance of `tmpl`, batching group members
 // together so they land in one container or none of them do. Returns the resulting
@@ -1884,21 +2189,32 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
     // Broad phase: visit only the placements sharing a cell with `box`, stamping each
     // so a placement spanning several cells is narrow-phase-checked once. A generation
     // counter does that without allocating a set per candidate orientation.
-    if(!collision){const [ix1,ix2,iy1,iy2,iz1,iz2]=cellRange(index,box),stamp=++index.gen;
-      scan:for(let ix=ix1;ix<ix2;ix++)for(let iy=iy1;iy<iy2;iy++)for(let iz=iz1;iz<iz2;iz++){
-        const bucket=index.cells.get(cellKey(ix,iy,iz));if(!bucket)continue;
-        for(const position of bucket){if(index.seen[position]===stamp)continue;index.seen[position]=stamp;
-          const placed=placements[position],pe=placed.ed;metrics.collision_checks++;
-          // `intersects` on the placement's own fields: copying each visited placement into
-          // a box first was one allocation per narrow-phase check, a million per solve. The
-          // nesting exemption can only apply to a nesting candidate, and the box the exact
-          // test needs is built only once an envelope overlap has been found.
-          if(x<placed.x+pe[0]&&x2>placed.x&&y<placed.y+pe[1]&&y2>placed.y&&z<placed.z+pe[2]&&z2>placed.z
-            &&!(nests&&validNesting(candidate,placed))
-            // The axis-aligned test is the broad phase and stays mandatory. Only when a hull
-            // is one of the two solids does the exact test get to overrule it, so a request of
-            // ordinary boxes never reaches the hull path at all.
-            &&solidsOverlap(candidateShape,box,placedHull(placed),{x:placed.x,y:placed.y,z:placed.z,d:pe})){collision=true;break scan}}}}
+    if(!collision){
+      const ix1=Math.floor(x/index.cx),ix2=ceilDiv(Math.max(x2,x+1),index.cx);
+      const iy1=Math.floor(y/index.cy),iy2=ceilDiv(Math.max(y2,y+1),index.cy);
+      const iz1=Math.floor(z/index.cz),iz2=ceilDiv(Math.max(z2,z+1),index.cz);
+      if(ix2===ix1+1&&iy2===iy1+1&&iz2===iz1+1){
+        const bucket=index.cells.get(cellKey(ix1,iy1,iz1));
+        if(bucket){
+          for(const position of bucket){
+            const placed=placements[position],pe=placed.ed;metrics.collision_checks++;
+            if(x<placed.x+pe[0]&&x2>placed.x&&y<placed.y+pe[1]&&y2>placed.y&&z<placed.z+pe[2]&&z2>placed.z
+              &&!(nests&&validNesting(candidate,placed))
+              &&solidsOverlap(candidateShape,box,placedHull(placed),{x:placed.x,y:placed.y,z:placed.z,d:pe})){collision=true;break}
+          }
+        }
+      }else{
+        const stamp=++index.gen;
+        scan:for(let ix=ix1;ix<ix2;ix++)for(let iy=iy1;iy<iy2;iy++)for(let iz=iz1;iz<iz2;iz++){
+          const bucket=index.cells.get(cellKey(ix,iy,iz));if(!bucket)continue;
+          for(const position of bucket){if(index.seen[position]===stamp)continue;index.seen[position]=stamp;
+            const placed=placements[position],pe=placed.ed;metrics.collision_checks++;
+            if(x<placed.x+pe[0]&&x2>placed.x&&y<placed.y+pe[1]&&y2>placed.y&&z<placed.z+pe[2]&&z2>placed.z
+              &&!(nests&&validNesting(candidate,placed))
+              &&solidsOverlap(candidateShape,box,placedHull(placed),{x:placed.x,y:placed.y,z:placed.z,d:pe})){collision=true;break scan}}
+        }
+      }
+    }
     if(collision)continue;
     if(axleOverloaded(tmpl,placements,candidate))continue;
     if(!allowed(candidate,placements,tmpl,globalSupportPpm,metrics,loadBase,accessBase,sweep))continue;
@@ -1925,13 +2241,12 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
   found.sort((a,b)=>a.score-b.score);
   return found
 };
-const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const state={tmpl,placements:[],payload:0};const next=[];
+const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const seeded=seedState(tmpl),state=seeded.state;const next=[];
   // Running `usedVolume` of `state.placements`, maintained incrementally rather than
   // recomputed per candidate. Kept local to this call, not on `state`, so it
   // cannot leak into the packed container the caller spreads.
-  let used=0n;
-  const points=[[0,0,0],...tmpl.obs.flatMap(o=>[[o.x+o.d[0],o.y,o.z],[o.x,o.y+o.d[1],o.z],[o.x,o.y,o.z+o.d[2]]])].sort(comparePoints);
-  const index=makeIndex(tmpl.d);
+  let used=seeded.used;
+  const points=seeded.points,index=seeded.index;
   for(const batch of batchesOf(itemsRemaining)){
     const snapshotPlacements=state.placements.slice(),snapshotPayload=state.payload,snapshotUsed=used;
     const snapshotPoints=batch.length>1?points.slice():null,snapshotIndex=batch.length>1?copyIndex(index):null;let ok=true;
@@ -1956,9 +2271,7 @@ const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const state={tmpl,placements:[
 };
 const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
   const batches=batchesOf(itemsRemaining);
-  const fresh=()=>({state:{tmpl,placements:[],payload:0},used:0n,
-    points:[[0,0,0],...tmpl.obs.flatMap(o=>[[o.x+o.d[0],o.y,o.z],[o.x,o.y+o.d[1],o.z],[o.x,o.y,o.z+o.d[2]]])].sort(comparePoints),
-    index:makeIndex(tmpl.d),unplaced:[]});
+  const fresh=()=>({...seedState(tmpl),unplaced:[]});
   const clone=node=>({state:{tmpl,placements:node.state.placements.slice(),payload:node.state.payload},used:node.used,
     points:node.points.slice(),index:copyIndex(node.index),unplaced:node.unplaced.slice()});
   const place=(node,candidate)=>{node.state.payload+=candidate.item.w;
@@ -2032,9 +2345,9 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
 // the reference engines do. Bounded by `exact_item_limit`, already enforced at admission.
 const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
   const batches=batchesOf(itemsRemaining);
-  const freshWork=()=>({state:{tmpl,placements:[],payload:0},used:0n,
-    points:[[0,0,0],...tmpl.obs.flatMap(o=>[[o.x+o.d[0],o.y,o.z],[o.x,o.y+o.d[1],o.z],[o.x,o.y,o.z+o.d[2]]])].sort(comparePoints),
-    index:makeIndex(tmpl.d)});
+  const freshWork=()=>seedState(tmpl);
+  // Fixed items are in every state and in no item list, so item counts leave them out.
+  const fixedCount=(tmpl.fixed??[]).length;
   const cloneWork=w=>({state:{tmpl,placements:w.state.placements.slice(),payload:w.state.payload},
     used:w.used,points:w.points.slice(),index:copyIndex(w.index)});
   const placeInto=(w,candidate)=>{
@@ -2099,7 +2412,7 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
     // below must then use the smallest volumes for that final count; retaining the
     // earlier, longer prefix would overstate the necessary height and be inadmissible.
     smallestVolumeSum=volumes.slice(0,placeable).reduce((sum,value)=>sum+value,0n);
-    const permanentlySkipped=itemsRemaining.length-work.state.placements.length-future.length;
+    const permanentlySkipped=itemsRemaining.length-(work.state.placements.length-fixedCount)-future.length;
     const unpackedFloor=permanentlySkipped+future.length-placeable;
     if(placeable===0&&work.state.placements.length===0)return [unpackedFloor,0,0,0,0];
     const largestVolumeSum=volumes.slice(Math.max(0,volumes.length-placeable)).reduce((sum,value)=>sum+value,0n);
@@ -2135,7 +2448,7 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
     if(deadline.expired()){timeLimitReached=true;return}
     if(effortExceeded())return;
     metrics.search_nodes_expanded++;
-    const unpackedHere=itemsRemaining.length-work.state.placements.length;
+    const unpackedHere=itemsRemaining.length-(work.state.placements.length-fixedCount);
     if(unpackedHere<=bestRank[0]){const workRank=rankedWork(work);if(compareScore(workRank,bestRank)<0){best=work;bestRank=workRank}}
     if(compareScore(bestRank,completeLowerBound)===0)return;
     if(depth>=batches.length)return;
@@ -2206,7 +2519,7 @@ const blockMode=(tmpl,itemsRemaining,volumeFirst)=>{let spaces=[{x:0,y:0,z:0,d:t
       state.placements.push(placement);state.payload+=placement.item.w;metrics.feasible_candidates++;metrics.orientations_considered++}
     spaces=subtractBlock(spaces,{x:best.space.x,y:best.space.y,z:best.space.z,d:[best.nx*best.ed[0],best.ny*best.ed[1],best.nz*best.ed[2]]})}
   const next=[...byType.keys()].sort().flatMap(key=>byType.get(key));return {state,next,reached}}
-const packBlocksIntoTemplate=(tmpl,itemsRemaining)=>{if(!homogeneousBlocksSupported())return tryPackIntoTemplate(tmpl,itemsRemaining);
+const packBlocksIntoTemplate=(tmpl,itemsRemaining)=>{if(!homogeneousBlocksSupported()||tmpl.fixed)return tryPackIntoTemplate(tmpl,itemsRemaining);
   let best=null;for(const volumeFirst of [false,true]){if(deadline.expired()){timeLimitReached=true;break}const candidate=blockMode(tmpl,itemsRemaining,volumeFirst);if(candidate.reached&&deadline.expired())timeLimitReached=true;
     const used=usedVolume(candidate.state.placements),top=candidate.state.placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0),signature=candidate.state.placements.map(p=>`${p.item.id}@${p.x},${p.y},${p.z}`).join('|'),key=[candidate.next.length,-used,top,signature];
     if(best==null||compareBlockKey(key,best.key)<0)best={...candidate,key}}
@@ -2229,8 +2542,19 @@ const additionalContainerBound=plan=>{const available=templates.filter(t=>plan.i
   if(!plan.remaining.some(item=>item.nesting!=null)){const capacity=available.reduce((best,t)=>volume(t.d)>best?volume(t.d):best,0n),required=plan.remaining.reduce((sum,item)=>sum+volume(item.d),0n);if(capacity>0n)lower=Math.max(lower,Number((required+capacity-1n)/capacity))}
   if(available.every(t=>t.max!=null)){const capacity=Math.max(...available.map(t=>t.max)),required=plan.remaining.reduce((sum,item)=>sum+item.w,0);if(capacity>0)lower=Math.max(lower,Math.ceil(required/capacity))}return lower};
 const planBound=(plan)=>{const key=planScore(plan,[]),index=objective==='default'?1:2;key[index]+=additionalContainerBound(plan);return key};
+// Containers holding fixed items open first, in request order then instance order, each
+// filled by one ordinary single-container search from its seeded state. They are kept
+// whatever that search gets -- nothing, or nothing at all once the deadline or effort is
+// spent -- because dropping one would drop items the request says are already loaded.
+let fixedReached=false;
+for(const group of fixedGroups){const seeded={...group.tmpl,fixed:group.placements};let trial=null;
+  if(deadline.expired())timeLimitReached=true;else if(!fixedReached)trial=packIntoTemplate(seeded,remaining);
+  if(trial===null||timeLimitReached||effortExceeded())fixedReached=true;
+  inventory.set(seeded.id,inventory.get(seeded.id)-1);seq++;
+  packed.push({...(trial===null?seedState(seeded).state:trial.state),seq});
+  if(trial!==null)remaining.splice(0,remaining.length,...trial.next)}
 if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
-  const initial={packed:[],remaining:remaining.slice(),inventory:new Map(inventory),seq:0};let beam=[initial],incumbent=initial,planNodes=0;
+  const initial={packed:packed.slice(),remaining:remaining.slice(),inventory:new Map(inventory),seq};let beam=fixedReached?[]:[initial],incumbent=initial,planNodes=0;
   while(beam.length&&planNodes<containerPlanNodeLimit){const expansions=[];let exhausted=false;
     for(const plan of beam){if(!plan.remaining.length||plan.packed.length>=maxContainers){if(compareScore(planScore(plan),planScore(incumbent))<0)incumbent=plan;continue}
       for(const tmpl of templates){if(planNodes>=containerPlanNodeLimit)break;if(deadline.expired()||effortExceeded()){exhausted=true;break}if(plan.inventory.get(tmpl.id)<=0)continue;planNodes++;
@@ -2241,8 +2565,8 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
     const dominant=new Map();for(const plan of expansions){const signature=`${plan.remaining.map(i=>i.id).join('|')}::${[...plan.inventory.entries()].sort().map(([k,v])=>`${k}:${v}`).join('|')}`;
       const previous=dominant.get(signature);if(!previous||compareScore(planScore(plan,[]),planScore(previous,[]))<0)dominant.set(signature,plan)}
     beam=[...dominant.values()].sort((a,b)=>compareScore(planBound(a),planBound(b))||compareCodePoints(a.remaining.map(i=>i.id).join('|'),b.remaining.map(i=>i.id).join('|'))).slice(0,containerPlanBeamWidth)}
-  packed.push(...incumbent.packed);remaining.splice(0,remaining.length,...incumbent.remaining);seq=incumbent.seq;
-}else while(remaining.length&&packed.length<maxContainers){
+  packed.splice(0,packed.length,...incumbent.packed);remaining.splice(0,remaining.length,...incumbent.remaining);seq=incumbent.seq;
+}else while(remaining.length&&packed.length<maxContainers&&!fixedReached){
   if(deadline.expired()){timeLimitReached=true;break}
   if(effortExceeded())break;
   const eligible=templates.filter(c=>inventory.get(c.id)>0&&remaining.some(i=>(!i.eligibleTags.length||i.eligibleTags.some(tag=>(c.tags??[]).includes(tag)))&&i.rots.some(r=>{const d=rotate(i.d,r).map(x=>x+2*clear);return d.every((x,k)=>x<=c.d[k])})));
@@ -2291,9 +2615,13 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
   seq++;packed.push({...winner.state,seq});
   remaining.splice(0,remaining.length,...winner.next);
 }
+// Containers are numbered per type in opening order, `T#n`, as in every engine; fixed
+// containers open first, so a fixed placement's instance n is the container emitted as `T#n`.
+{const counts=new Map();
+  for(const c of packed){const n=(counts.get(c.tmpl.id)??0)+1;counts.set(c.tmpl.id,n);c.seq=n}}
 const containers=packed.map(c=>{const loads=topLoads(c.placements.map(constraintBox)),used=usedVolume(c.placements);
   const reaction=axleReactions(c.tmpl,c.placements);
-  return {id:`${c.tmpl.id}#${c.seq}`,container_type:c.tmpl.id,inner_dimensions:outDims(c.tmpl.d,ou),outer_dimensions:outDims(c.tmpl.outer_dimensions?dims(c.tmpl.outer_dimensions,u):c.tmpl.d,ou),payload_weight:outWeight(c.payload,ow),gross_weight:outWeight(c.payload+c.tmpl.tare,ow),used_volume_ticks3:used.toString(),volume_utilization:(Number(used)/Number(volume(c.tmpl.d))).toFixed(6),centre_of_mass_offset_ppm:centreOfMassOffsetPpm(c.tmpl,c.placements,clear),...(reaction==null?{}:{axle_reactions:{basis:'gross',denominator:reaction.denominator.toString(),front_numerator:reaction.front.toString(),rear_numerator:reaction.rear.toString()}}),void_fill_reserve_ticks3:(volume(c.tmpl.d)*BigInt(c.tmpl.reservePpm)/BigInt(SUPPORT_SCALE)).toString(),placements:c.placements.map((p,i)=>({item_id:p.item.id,item_type:p.item.raw.id,position:outPoint({x:p.x+clear,y:p.y+clear,z:p.z+clear},ou),dimensions:outDims(p.pd,ou),orientation:p.r,support_ratio:supportRatioOf(p,c.placements).toFixed(6),top_load:outWeight(loads[i],ow)}))}});
+  return {id:`${c.tmpl.id}#${c.seq}`,container_type:c.tmpl.id,inner_dimensions:outDims(c.tmpl.d,ou),outer_dimensions:outDims(c.tmpl.outer_dimensions?dims(c.tmpl.outer_dimensions,u):c.tmpl.d,ou),payload_weight:outWeight(c.payload,ow),gross_weight:outWeight(c.payload+c.tmpl.tare,ow),used_volume_ticks3:used.toString(),volume_utilization:(Number(used)/Number(volume(c.tmpl.d))).toFixed(6),centre_of_mass_offset_ppm:centreOfMassOffsetPpm(c.tmpl,c.placements,clear),...(reaction==null?{}:{axle_reactions:{basis:'gross',denominator:reaction.denominator.toString(),front_numerator:reaction.front.toString(),rear_numerator:reaction.rear.toString()}}),void_fill_reserve_ticks3:(volume(c.tmpl.d)*BigInt(c.tmpl.reservePpm)/BigInt(SUPPORT_SCALE)).toString(),placements:c.placements.map((p,i)=>({item_id:p.item.id,item_type:p.item.raw.id,position:outPoint({x:p.x+clear,y:p.y+clear,z:p.z+clear},ou),dimensions:outDims(p.pd,ou),orientation:p.r,support_ratio:(p.fixed?p.fixedSupport:supportRatioOf(p,c.placements)).toFixed(6),top_load:outWeight(loads[i],ow),...(p.fixed?{fixed:true}:{})}))}});
 const fitsWithRotations=(i,rots)=>templates.some(c=>rots.some(r=>{const d=rotate(i.d,r).map(x=>x+2*clear);return d.every((edge,k)=>edge<=c.d[k])}));
 const unpacked=remaining.map(i=>{
   // Same geometric check with every physical orientation allowed, not only the
@@ -2542,7 +2870,9 @@ export function rebalanceWeight(req,result,{maxMoves=64}={}){
     const destinations=context.states.map((_,index)=>index).filter(index=>index!==sourceIndex).sort((a,b)=>weights[a]-weights[b]);
     let committed=null;
     search:for(const placementIndex of placements){
-      const moving=context.states[sourceIndex].placements[placementIndex],weight=moving.item.w;if(weight<=0)continue;
+      const moving=context.states[sourceIndex].placements[placementIndex],weight=moving.item.w;
+      // A fixed item is already loaded where the request put it; nothing may move it.
+      if(moving.publicPlacement.fixed===true||weight<=0)continue;
       for(const destinationIndex of destinations){
         const projected=[...weights];projected[sourceIndex]-=weight;projected[destinationIndex]+=weight;
         if(Math.max(...projected)-Math.min(...projected)>=spread)continue;

@@ -5,7 +5,9 @@ export interface Axle{position:ExactScalar;max_load?:ExactScalar}
 export interface Container{id:string;inner_dimensions:Dimensions;outer_dimensions?:Dimensions;max_payload?:ExactScalar;tare_weight?:ExactScalar;quantity?:number;cost_minor?:number;max_items?:number;max_stack_density?:ExactScalar;axles?:[Axle,Axle];tags?:string[];tag_limits?:Record<string,number>;void_fill_reserve_ratio?:number;metadata?:Record<string,unknown>;obstacles?:Array<{id:string;origin:{x:ExactScalar;y:ExactScalar;z:ExactScalar};dimensions:Dimensions;additional_boxes?:Array<{origin?:{x:ExactScalar;y:ExactScalar;z:ExactScalar};dimensions:Dimensions}>}>}
 export interface PackingConfiguration{solver_profile?:'fast'|'balanced'|'quality'|'exact_small';time_limit_ms?:number;alternatives?:number;seed?:number;max_containers?:number;clearance?:ExactScalar;minimum_support_ratio?:number;exact_item_limit?:number;multi_start_orders?:number;max_candidates_per_item?:number;max_candidate_points?:number;require_placement_coordinates?:boolean;solvers?:Array<'grid'|'extreme_points'|'homogeneous_blocks'|'layer'|'maximal_spaces'|'exact_small'>;objective?:'default'|'lowest_cost'|'shipping_cost'|'open_dimension_height'|'maximum_value';dimensional_weight_divisor?:number;dimensional_weight_length_unit?:'mm'|'cm'|'m'|'in'|'ft';dimensional_weight_weight_unit?:'mg'|'g'|'kg'|'oz'|'lb';effort_budget?:{max_candidates_evaluated?:number;max_placement_attempts?:number;max_search_nodes?:number;max_restarts?:number}}
 export interface CatalogReference{catalog_id:string;version:number;effective_at:number;resolved_at:number}
-export interface PackingRequest{units?:{length?:string};configuration?:PackingConfiguration;items:Item[];containers:Container[];catalog_versions_used?:CatalogReference[];output?:{length_unit?:string;weight_unit?:string}}
+/** An item already in a known place before the solve (docs/PLAN-REVISIONS.md). A result placement can be copied in unchanged. */
+export interface FixedPlacement{item_type:string;container_type:string;container_instance?:number;position?:{x?:ExactScalar;y?:ExactScalar;z?:ExactScalar};orientation:'LWH'|'LHW'|'WLH'|'WHL'|'HLW'|'HWL'}
+export interface PackingRequest{units?:{length?:string};configuration?:PackingConfiguration;items:Item[];containers:Container[];fixed_placements?:FixedPlacement[];catalog_versions_used?:CatalogReference[];output?:{length_unit?:string;weight_unit?:string}}
 export interface ResultFact{code:string;[key:string]:unknown}
 export interface StartRecord{id:string;started:boolean;completed:boolean;truncated:boolean;selected:boolean;global_deadline_reached:boolean}
 export interface TerminationFact extends ResultFact{any_start_truncated:boolean;all_required_starts_completed:boolean;winning_start_truncated:boolean;global_deadline_reached:boolean;starts:StartRecord[]}
@@ -18,6 +20,12 @@ export interface PackingResult{status:string;feasibility:ResultFact;termination:
 export interface WeightMove{item_id:string;from_container_id:string;to_container_id:string}
 export interface RebalanceResult{containers:unknown[];moves:WeightMove[];improved:boolean}
 export class UnsupportedFeatureError extends Error{readonly code:'unsupported_feature';readonly fields:string[]}
+/** Why a request was refused: a closed set shared by all four engines (docs/ERRORS.md). */
+export type InvalidRequestReason='missing_field'|'wrong_type'|'below_minimum'|'above_maximum'|'negative_measure'|'invalid_unit'|'duplicate_id'|'not_allowed'|'invalid_value';
+/** The request is not one any engine may answer; nothing was solved. `field` is the RFC 6901 JSON Pointer of the offending value, `''` for the request as a whole. */
+export class InvalidRequestError extends RangeError{readonly code:string;readonly reason:string;readonly field:string;readonly detail:string;constructor(reason:InvalidRequestReason,field:string,detail:string)}
+/** The request's fixed placements are malformed (`reason` `malformed`, `field` the bad value) or cannot all hold (`cannot_hold`, `field` `/fixed_placements`); refused before any search. */
+export class FixedPlacementError extends InvalidRequestError{readonly code:'invalid_fixed_placement';readonly reason:'malformed'|'cannot_hold';constructor(detail:string,reason?:'malformed'|'cannot_hold',field?:string)}
 export type MovementDirection='+x'|'-x'|'+y'|'-y'|'+z'|'-z';
 export interface SequencePoint{x:number;y:number;z:number}
 export interface SequenceDimensions{length:number;width:number;height:number}

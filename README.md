@@ -50,6 +50,31 @@ const quote = commerce.quote(commerceDocument, {
 console.log(quote.quote.total_minor);
 ```
 
+## Errors
+
+A request that no engine may answer throws `InvalidRequestError`, a `RangeError`, before anything
+is solved, whichever backend is running. It names the problem instead of describing it:
+
+```js
+import { InvalidRequestError, pack } from '@packvium/engine';
+
+try {
+  const result = pack(request);
+} catch (error) {
+  if (!(error instanceof InvalidRequestError)) throw error;
+  error.code;    // 'invalid_request'
+  error.reason;  // 'below_minimum'
+  error.field;   // '/items/0/quantity' -- a JSON Pointer into your request
+  error.message; // 'invalid_request: /items/0/quantity: must be at least 1'
+}
+```
+
+`reason` is one of `missing_field`, `wrong_type`, `below_minimum`, `above_maximum`, `negative_measure`, `invalid_unit`, `duplicate_id`, `not_allowed` or `invalid_value`. `FixedPlacementError` extends it, with code
+`invalid_fixed_placement` and reason `malformed` or `cannot_hold`.
+The message is the same in every Packvium engine. Branch on `reason` and `field`; show the
+message to a person. A request that is valid but does not fit completely is not an error: the
+result lists what was left out, and why, in `unpacked_items`.
+
 ## Quotes, policy and catalog versions
 
 `commerce` has three functions, all deterministic and all over one document you supply —
@@ -110,6 +135,7 @@ and execute without a project around it.
 | [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`execution.mjs`](examples/execution.mjs) | Turn a result into dock instructions — and the clearest place to see what "byte-identical" does and does not promise: the four adapters agree on any given result, while this engine is free to reach a different packing than Python does. |
 | [`artifacts.mjs`](examples/artifacts.mjs) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable HTML work order, and a refusal for a format it does not know. |
+| [`revisions.mjs`](examples/revisions.mjs) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, and a hash-chained record that notices an edit. |
 
 ```bash
 node examples/basic.mjs
@@ -128,6 +154,9 @@ node examples/basic.mjs
 - Portable operational artifacts through `buildOperationalArtifact()` from `artifacts.js`, exported
   by `artifact-exports.js` as canonical JSON, CSV or a self-contained HTML work order — the same
   bytes the Python, PHP and Rust packages write.
+- Fixed placements (`fixed_placements`): items already loaded stay where they are and the solve
+  packs around them; plan revisions from `revisions.js` record exceptions against an approved
+  plan and derive the next request, hash-chained with the same bytes in all four engines.
 - Deterministic carrier quotes, policy evaluation and effective-dated catalog lookup
   through `commerce`.
 

@@ -48,11 +48,22 @@ test('the operational artifact and its exports resolve by package name', async (
   assert.equal(exports.CSV_COLUMNS[0], 'record');
 });
 
+test('plan revisions resolve by package name', async () => {
+  const revisions = await import(`${manifest.name}/revisions.js`);
+  for (const name of ['rootRevision', 'deriveRevision', 'applyEvents', 'verifyRevisionChain',
+    'documentDigest', 'canonicalRevisionJson', 'PlanRevisionError']) {
+    assert.equal(typeof revisions[name], 'function', name);
+  }
+  assert.equal(revisions.FORMAT, 'packvium-plan-revision/v1');
+});
+
 test('a module an export imports is published even when it is not exported itself', () => {
   // `canonical-json.js` is internal: absent from `exports` on purpose, but `artifacts.js` and
   // `execution.js` import it, so a tarball without it would break both at load time.
   const published = new Set(manifest.files);
-  for (const name of ['canonical-json.js', 'artifacts.js', 'artifact-exports.js', 'artifacts.d.ts', 'artifact-exports.d.ts']) {
+  // `revisions.js` imports `commerce-model.js` and `artifacts.js` the same way.
+  for (const name of ['canonical-json.js', 'commerce-model.js', 'artifacts.js', 'artifact-exports.js', 'revisions.js',
+    'artifacts.d.ts', 'artifact-exports.d.ts', 'revisions.d.ts']) {
     assert.ok(published.has(name), `"files" does not publish ${name}`);
   }
   assert.ok(!('./canonical-json.js' in manifest.exports), 'canonical-json.js is not public API');

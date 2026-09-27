@@ -37,6 +37,25 @@ export function canonicalJson(value) {
   return parts.join('');
 }
 
+/**
+ * The integer a JSON value is, judged by value as every engine can judge it: `1.0` is `1`
+ * (JavaScript cannot tell them apart once the text is parsed); `true`, `"1"` and `1.5` are
+ * not integers, and neither is anything past 2^53 - 1. Null when it is not one.
+ */
+export function jsonInteger(value) {
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/** How a refusal quotes a value: its canonical JSON, the one spelling four engines share. */
+export function jsonSpelling(value) {
+  try {
+    return canonicalJson(value);
+  } catch (error) {
+    if (!(error instanceof CanonicalJsonError)) throw error;
+    return error.code === 'number_out_of_range' ? 'an out-of-range number' : 'an unspellable value';
+  }
+}
+
 function write(value, parts) {
   if (value === null) {
     parts.push('null');
