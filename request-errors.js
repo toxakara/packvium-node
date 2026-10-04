@@ -24,6 +24,8 @@ import { compareCodePoints } from './commerce-model.js';
 import { jsonSpelling } from './canonical-json.js';
 
 export const SOLVER_PROFILES = Object.freeze(['fast', 'balanced', 'quality', 'exact_small']);
+export const OBJECTIVES = Object.freeze(['default', 'lowest_cost', 'shipping_cost', 'lowest_landed_cost', 'open_dimension_height', 'maximum_value']);
+export const ACCESS_DIRECTIONS = Object.freeze(['+x', '-x', '+y', '-y', '+z', '-z']);
 
 /** The request is not one any engine may answer. Nothing was solved. */
 export class InvalidRequestError extends RangeError {
@@ -84,6 +86,17 @@ function requireOneOf(value, field, allowed) {
   }
 }
 
+/**
+ * The schema closes this object: a key it does not name is refused, never ignored. The first
+ * unknown key in code-point order is named, the order every engine can share.
+ */
+function requireKnownFields(value, field, known) {
+  const unknown = Object.keys(value).filter((key) => !known.includes(key)).sort(compareCodePoints);
+  if (unknown.length > 0) {
+    throw new InvalidRequestError('not_allowed', field + pointer(unknown[0]), 'is not a known field');
+  }
+}
+
 function requireObject(value, field) {
   if (!isObject(value)) throw new InvalidRequestError('wrong_type', field, 'must be an object');
   return value;
@@ -132,6 +145,12 @@ const CONFIGURATION_INTEGERS = [['time_limit_ms', 1], ['alternatives', 1], ['max
   ['max_candidate_points', 16], ['container_plan_beam_width', 1], ['container_plan_node_limit', 1],
   ['dimensional_weight_divisor', 1]];
 const EFFORT_LIMITS = ['max_candidates_evaluated', 'max_placement_attempts', 'max_search_nodes', 'max_restarts'];
+/** Every key the request schema's `configuration` declares; it sets `additionalProperties: false`. */
+const CONFIGURATION_FIELDS = ['alternatives', 'clearance', 'container_plan_beam_width',
+  'container_plan_node_limit', 'dimensional_weight_divisor', 'dimensional_weight_length_unit',
+  'dimensional_weight_weight_unit', 'effort_budget', 'exact_item_limit', 'max_candidate_points',
+  'max_candidates_per_item', 'max_containers', 'minimum_support_ratio', 'multi_start_orders', 'objective',
+  'require_placement_coordinates', 'seed', 'solver_profile', 'solvers', 'time_limit_ms'];
 const SIDES = ['length', 'width', 'height'];
 const AXES = ['x', 'y', 'z'];
 const atLeast = (minimum) => (value, field) => requireInteger(value, field, minimum);
@@ -169,12 +188,15 @@ function checkUnits(raw, lengths) {
 function checkConfiguration(raw, length) {
   if (raw == null) return;
   const configuration = requireObject(raw, '/configuration');
+  requireKnownFields(configuration, '/configuration', CONFIGURATION_FIELDS);
   optional(configuration, 'solver_profile', '/configuration', (v, f) => requireOneOf(v, f, SOLVER_PROFILES));
+  optional(configuration, 'objective', '/configuration', (v, f) => requireOneOf(v, f, OBJECTIVES));
   for (const [name, minimum] of CONFIGURATION_INTEGERS) optional(configuration, name, '/configuration', atLeast(minimum));
   optional(configuration, 'minimum_support_ratio', '/configuration', requireRatio);
   optional(configuration, 'clearance', '/configuration', length);
   if (configuration.effort_budget == null) return;
   const budget = requireObject(configuration.effort_budget, '/configuration/effort_budget');
+  requireKnownFields(budget, '/configuration/effort_budget', EFFORT_LIMITS);
   for (const name of EFFORT_LIMITS) optional(budget, name, '/configuration/effort_budget', atLeast(1));
 }
 
@@ -204,9 +226,15 @@ function checkContainer(raw, where, length, weight) {
   optional(container, 'max_items', where, atLeast(1));
   optional(container, 'cost_minor', where, atLeast(0));
   optional(container, 'void_fill_reserve_ratio', where, requireRatio);
+  optional(container, 'access_directions', where, accessDirections);
   optional(container, 'tag_limits', where, tagLimits);
   optional(container, 'rate_table', where, rateTable);
   optional(container, 'obstacles', where, (v, f) => obstacles(v, f, length));
+}
+
+function accessDirections(raw, where) {
+  const directions = requireList(raw, where);
+  directions.forEach((direction, index) => requireOneOf(direction, where + pointer(index), ACCESS_DIRECTIONS));
 }
 
 function dimensions(raw, where, length) {

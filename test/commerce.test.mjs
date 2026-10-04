@@ -111,8 +111,7 @@ if (hasFixtures) {
     let native = null;
     // The same specifiers `force-fallback.cjs` blocks, so a coverage run pinned to the
     // fallback cannot accidentally load -- and measure -- the native addon here.
-    for (const candidate of ['./packvium-native.node', '@packvium/native',
-      '../../packvium-rust/bindings/node']) {
+    for (const candidate of ['./packvium-native.node', '../../packvium-rust/bindings/node']) {
       try { native = require(candidate); break; } catch { /* not installed or blocked */ }
     }
     if (!native?.commerceQuoteJson) {

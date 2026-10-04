@@ -385,7 +385,7 @@ for (const [name, events, message] of [
   ['a sequence beyond 2^53 - 1', [locked({ sequence: 2 ** 53 })], 'event sequence an out-of-range number does not continue the chain at 1'],
   ['a text sequence', [locked({ sequence: '1' })], 'event sequence "1" does not continue the chain at 1'],
   ['an extra axis', [{ ...locked(), placement: { ...locked().placement, position: { w: '5' } } }],
-    'placement.position does not carry ["w"]'],
+    'placement.position cannot carry ["w"]'],
   ['a boolean axis', [{ ...locked(), placement: { ...locked().placement, position: { x: true } } }],
     'placement.position.x is a measure'],
   ['a null instance', [{ ...locked(), placement: { ...locked().placement, container_instance: null } }],

@@ -4,6 +4,44 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0]
+
+No API changes. The JavaScript engine's beam search is faster; route packing,
+`rebalanceWeight` and the `quality` termination report are fixed, and a misspelt configuration
+key is now refused (see *Fixed*).
+
+### Changed
+
+- **Beam search 7–9% faster in the JavaScript engine, same results.** Expansions that cannot
+  beat the best plan so far are no longer copied, and the bound that ranks beam nodes is one
+  binary search per node.
+- **No probe for `@packvium/native`.** The package tried to load that name, which is neither
+  published nor declared, so a supply-chain scanner reported an unresolved dependency. A
+  compiled addon is still loaded from `packvium-native.node` beside `index.js`; an
+  `npm install` runs the JavaScript engine, as it already did.
+
+### Fixed
+
+- **`quality` with `minimum_support_ratio` no longer returns unsupported items.** The
+  homogeneous block solver ran even when the request asked for support, and a block set on a
+  smaller one overhangs it: the result could hold items below the requested ratio, some
+  resting on nothing, reported as `best_found`. Such a request is now left to the per-item
+  search, and every item meets the ratio. Present since the block solver was added.
+- **A misspelt `configuration` key is refused.** A key the request schema does not declare in
+  `configuration` or its `effort_budget` (`profile` for `solver_profile`, `top_k` for
+  `alternatives`) was silently ignored, so the request ran on defaults. `pack` now throws
+  `InvalidRequestError` with reason `not_allowed` and the key's pointer, for example
+  `/configuration/profile`.
+- **`rebalanceWeight` no longer strands a supported item.** It could move the item underneath
+  and leave the one above floating; such a move is now discarded, as documented.
+- **`quality` reports `effort_limit` when the effort budget stopped it,** not `time_limit`.
+- **Route packing with a `-x` door now packs all five items** in the regression scene (formerly
+  two), keeps next-stop parcels behind the first stop's pallet, and orients upright pallets to
+  save length.
+- **An unknown `objective` or access direction is refused with its pointer** (`not_allowed`,
+  e.g. `/configuration/objective`) instead of `invalid_value` with an empty field; refusal
+  messages match the documentation.
+
 ## [1.4.0]
 
 Replanning a job that has already started, and container ids that match the other engines.

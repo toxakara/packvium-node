@@ -3,7 +3,7 @@
  *
  * `commerce.test.mjs` proves the real Rust addon and the JavaScript fallback agree, but
  * it loads the addon itself, by its in-workspace build path. The package's own probe
- * list is `['./packvium-native.node', '@packvium/native']`, and neither resolves in this
+ * list is `['./packvium-native.node']`, and it does not resolve in this
  * workspace -- so `viaNative`, the branch every installed user with the addon takes, was
  * never executed by any test or measured by any coverage run.
  *
@@ -28,7 +28,7 @@ const stub = {};
 
 const previousLoad = Module._load;
 Module._load = function loadWithStubbedNativeBackend(request, parent, isMain) {
-  if (request === '@packvium/native') return stub;
+  if (request === './packvium-native.node') return stub;
   return previousLoad.call(this, request, parent, isMain);
 };
 const engine = await import('../index.js');

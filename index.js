@@ -22,30 +22,28 @@ export { CommerceInputError } from './commerce.js';
 const require = createRequire(import.meta.url);
 
 /**
- * Every module this package can load as a compiled backend, in probe order: a binary
- * built beside this file first, then the `@packvium/native` optional dependency.
+ * Every module this package can load as a compiled backend: a binary built beside this
+ * file. No npm package is probed -- a specifier the manifest does not declare cannot be
+ * resolved by a supply-chain scanner, and none is published to declare.
  *
  * `test/force-fallback.cjs` blocks exactly this list, and asserts it stays identical to
  * the specifiers `loadNative` passes.
  */
-const NATIVE_CANDIDATES = ['./packvium-native.node', '@packvium/native'];
+const NATIVE_CANDIDATES = ['./packvium-native.node'];
 
 /**
  * Resolve the compiled backend, or report that there is none.
  *
- * Each candidate is required by a *literal* specifier rather than through a loop
- * variable, so every module this package is able to load can be resolved by reading it.
- * A probe that misses is not an error: absent, unbuilt and ABI-incompatible addons all
- * land here, and every one of them means the same thing -- answer from the JavaScript
- * fallback, which returns the same result more slowly.
+ * The candidate is required by a *literal* specifier rather than through a variable, so
+ * every module this package is able to load can be resolved by reading it. A probe that
+ * misses is not an error: absent, unbuilt and ABI-incompatible addons all land here, and
+ * every one of them means the same thing -- answer from the JavaScript fallback, which
+ * returns the same result more slowly.
  */
 function loadNative() {
   try {
     return require('./packvium-native.node');
   } catch { /* no addon beside this file */ }
-  try {
-    return require('@packvium/native');
-  } catch { /* optional dependency absent or unloadable */ }
   return null;
 }
 
@@ -82,7 +80,7 @@ export function rebalanceWeight(request, result, { maxMoves = 64 } = {}) {
   return rebalanceFallback(request, result, { maxMoves });
 }
 
-export const version = () => native?.version?.() ?? '1.4.0-js-fallback';
+export const version = () => native?.version?.() ?? '1.5.0-js-fallback';
 
 /**
  * The exported commercial and control-plane API: a quote, a policy decision and catalog

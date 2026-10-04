@@ -49,11 +49,10 @@ local and needs no coordination.
 
 ## Native backend
 
-This repository ships the pure-JavaScript fallback only. The optional N-API addon comes
-from `@packvium/native`, built from a separate Rust workspace this repository does not
-carry. It is **not** declared as a dependency, so nothing is installed automatically and
-nothing has to resolve; install `@packvium/native` yourself if you want the compiled
-backend. When it is not resolvable at `require()` time,
+This repository ships the pure-JavaScript fallback only. The optional N-API addon is
+built from a separate Rust workspace this repository does not carry, and is loaded only
+from `packvium-native.node` beside `index.js`; no npm package is probed, so nothing is
+installed automatically and nothing has to resolve. When no addon loads at `require()` time,
 `backend()` reports `'javascript'` and every call runs the fallback above. Treat the
 native path as best-effort acceleration, not a dependency to code against.
 

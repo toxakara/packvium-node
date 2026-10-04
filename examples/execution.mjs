@@ -30,7 +30,7 @@ const request = {
   units: { length: 'mm' },
   configuration: {
     objective: 'default',
-    profile: 'balanced',
+    solver_profile: 'balanced',
     seed: 42,
     // A safety fuse, not a target -- nothing in this scene comes close to it.
     time_limit_ms: 60000,

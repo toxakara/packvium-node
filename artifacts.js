@@ -22,7 +22,7 @@ export const FORMAT = 'packvium-operational-artifact/v1';
  * The engine's own name is deliberately not recorded: four correct builders naming themselves
  * would emit four different documents.
  */
-export const SUITE_VERSION = '1.4.0';
+export const SUITE_VERSION = '1.5.0';
 
 /** The deterministic part of `result.algorithm`; `duration_ms` is wall-clock time. */
 const SOLVER_FIELDS = ['profile', 'solver', 'seed', 'time_limit_reached', 'effort_limit_reached'];

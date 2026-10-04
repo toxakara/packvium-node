@@ -107,6 +107,10 @@ const CASES = [
   ['units that are not an object', (r) => { r.units = 'mm'; }, 'wrong_type', '/units', 'must be an object'],
   ['an unknown profile', (r) => { r.configuration.solver_profile = 'fastest'; }, 'not_allowed', '/configuration/solver_profile',
     'must be one of ["fast","balanced","quality","exact_small"]'],
+  ['an unknown configuration key', (r) => { Object.assign(r.configuration, { top_k: 2, profile: 'balanced' }); },
+    'not_allowed', '/configuration/profile', 'is not a known field'],
+  ['an unknown effort key', (r) => { r.configuration.effort_budget = { max_nodes: 1 }; }, 'not_allowed',
+    '/configuration/effort_budget/max_nodes', 'is not a known field'],
   ['a configuration that is not an object', (r) => { r.configuration = [1]; }, 'wrong_type', '/configuration',
     'must be an object'],
   ['an effort budget that is not an object', (r) => { r.configuration.effort_budget = 5; }, 'wrong_type',
@@ -152,8 +156,19 @@ test('null optional fields are absent, and a valid request is admitted', () => {
   assert.equal(packFallback({ ...base(), units: null }).status, 'feasible');
 });
 
+test('an unknown objective or access direction is refused with not_allowed and its pointer', () => {
+  const objError = refusalOf((r) => { r.configuration.objective = 'cheapest'; });
+  assert.ok(objError instanceof InvalidRequestError);
+  assert.equal(objError.reason, 'not_allowed');
+  assert.equal(objError.field, '/configuration/objective');
+
+  const dirError = refusalOf((r) => { r.containers[0].access_directions = ['+w']; });
+  assert.ok(dirError instanceof InvalidRequestError);
+  assert.equal(dirError.reason, 'not_allowed');
+  assert.equal(dirError.field, '/containers/0/access_directions/0');
+});
+
 test('an error the rule table does not name still reaches the caller as a request error', () => {
-  assertRefusedWith((r) => { r.configuration.objective = 'cheapest'; }, 'invalid_request: unknown objective "cheapest"');
   assertRefusedWith((r) => { r.items[0].nesting_height = '100'; },
     "invalid_request: nesting_height must be at least zero and strictly less than the item's own height");
 });
@@ -165,11 +180,9 @@ function assertRefusedWith(edit, message) {
 }
 
 test('an error that carries its own code is not relabelled', () => {
-  const direction = refusalOf((r) => { r.containers[0].access_directions = ['+w']; });
-  assert.equal(direction.code, 'invalid_direction');
-  assert.ok(!(direction instanceof InvalidRequestError));
   const unsupported = refusalOf((r) => { r.containers[0].pallet_overhang_limit = '10'; });
   assert.ok(unsupported instanceof UnsupportedFeatureError);
+  assert.equal(unsupported.code, 'unsupported_feature');
 });
 
 test('an unsupported field is refused ahead of a malformed shape, without crashing on it', () => {
