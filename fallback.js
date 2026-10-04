@@ -152,7 +152,7 @@ function requireFixedPlacementShapes(raw,u){
 function requireFixedEntryShape(entry,where,field,u){
   if(!isObject(entry))throw malformed(`${where} is an object`,field);
   const unknown=unknownKeys(entry,FIXED_FIELDS);
-  if(unknown.length)throw malformed(`${where} does not carry ${jsonSpelling(unknown)}`,field);
+  if(unknown.length)throw malformed(`${where} cannot carry ${jsonSpelling(unknown)}`,field);
   const missing=FIXED_REQUIRED.filter(name=>!hasOwn(entry,name));
   if(missing.length)throw malformed(`${where} needs ${jsonSpelling(missing)}`,field);
   for(const name of ['item_type','container_type'])
@@ -179,7 +179,7 @@ const fixedInstance=entry=>jsonInteger(hasOwn(entry,'container_instance')?entry.
 export function requirePointShape(point,where,field,error){
   if(!isObject(point))throw error(`${where} is a point object`,field);
   const unknown=unknownKeys(point,AXES);
-  if(unknown.length)throw error(`${where} does not carry ${jsonSpelling(unknown)}`,field);
+  if(unknown.length)throw error(`${where} cannot carry ${jsonSpelling(unknown)}`,field);
   for(const axis of AXES)if(hasOwn(point,axis)&&(point[axis]===null||typeof point[axis]==='boolean'||Array.isArray(point[axis])))
     throw error(`${where}.${axis} is a measure`,`${field}/${axis}`);
 }
@@ -485,7 +485,7 @@ function hullShape(vertices){
  *
  *  `fallback.js` is an internal package file: package.json exposes only `index.js`, which does
  *  not re-export this function. Keeping the probe beside the algorithm lets the suite assert
- *  edge identity and ordering without widening `@packvium/native`'s public API or handing a
+ *  edge identity and ordering without widening `@packvium/engine`'s public API or handing a
  *  mutable cached shape to a caller. */
 export function __inspectHullShapeForTests(vertices){
   const shape=hullShape(vertices),copy=axes=>axes.map(axis=>axis.map(value=>value.toString()));
@@ -1300,6 +1300,7 @@ function accessibleAgainst(base,candidateBox){
   // not take.
   for(let index=0;index<base.clear.length;index++){
     if(base.stop<=base.stops[index])continue;
+    if(!base.clear[index].length)continue;
     if(!base.clear[index].some(sweep=>!sweptHits(sweep,candidateBox)))return false;
   }
   // An item riding the whole route is never unloaded, so it needs no door of its own.
@@ -1880,7 +1881,8 @@ const exactItemLimit=req.configuration?.exact_item_limit??7;
 const requestedItemCount=(req.items??[]).reduce((total,item)=>total+(item.quantity??1),0)-(Array.isArray(req.fixed_placements)?req.fixed_placements.length:0);
 if(requestedSolvers.includes('exact_small')&&requestedItemCount>exactItemLimit)throw new RangeError('exact-small item limit exceeded');
 const effort=req.configuration?.effort_budget??null;
-for(const [name,value] of Object.entries(effort??{}))if(!Number.isSafeInteger(value)||value<=0)throw new RangeError(`effort_budget.${name} must be a positive safe integer`);
+// A null limit is an absent one, as in every other engine (docs/ERRORS.md).
+for(const [name,value] of Object.entries(effort??{}))if(value!=null&&(!Number.isSafeInteger(value)||value<=0))throw new RangeError(`effort_budget.${name} must be a positive safe integer`);
 const multiStartOrders=req.configuration?.multi_start_orders??1;
 if(!Number.isSafeInteger(multiStartOrders)||multiStartOrders<1)throw new RangeError('multi_start_orders must be a positive safe integer');
 const restartLimit=effort?.max_restarts??Number.MAX_SAFE_INTEGER;
@@ -1929,6 +1931,7 @@ if(solverAlias===null&&requestedSolvers.length){
     for(let index=0;index<plan.count;index++)starts.push(unstartedRecord(plan.name,index,globalDeadlineReached));
   winner.termination=aggregateTermination(starts);
   winner.algorithm=withPortfolioEffort(winner,runs);
+  if(winner.algorithm.effort_limit_reached&&!winner.algorithm.time_limit_reached&&!globalDeadlineReached)winner.termination.code='effort_limit';
   const alternativeLimit=Math.max(0,(req.configuration?.alternatives??3)-1);
   // The sentinel is a search device, never an answer -- alternatives included (review).
   winner.alternatives=runs.filter((run,index)=>index!==winnerIndex&&!run.unpriceableDetail).sort((a,b)=>compareScore(a.score,b.score)).slice(0,alternativeLimit);
@@ -1956,6 +1959,7 @@ if(startIndex===null&&multiStartOrders>1){
   }:unstartedRecord(solverAlias,index,globalDeadlineReached));
   winner.termination=aggregateTermination(starts);
   winner.algorithm=withPortfolioEffort(winner,runs);
+  if(winner.algorithm.effort_limit_reached&&!winner.algorithm.time_limit_reached&&!globalDeadlineReached)winner.termination.code='effort_limit';
   if(winnerIndex>0)winner.algorithm={...winner.algorithm,solver:`${winner.algorithm.solver}:seeded_${winnerIndex}`};
   return finalizeOutermost(winner);
 }
@@ -1975,7 +1979,8 @@ if(objective==='lowest_landed_cost'){
 if(!['mm','cm','m','in','ft'].includes(dimLengthUnit))throw new RangeError('dimensional_weight_length_unit must be mm, cm, m, in or ft');
 if(!['mg','g','kg','oz','lb'].includes(dimWeightUnit))throw new RangeError('dimensional_weight_weight_unit must be mg, g, kg, oz or lb');
 const dimensionalWeight=d=>Number(volume(d)*BigInt(WT[dimWeightUnit])/(BigInt(LEN[dimLengthUnit])**3n*BigInt(dimDivisor??1)));
-const globalSupportPpm=Math.round((req.configuration?.minimum_support_ratio??0)*SUPPORT_SCALE);
+const globalSupportRatio=req.configuration?.minimum_support_ratio??0;
+const globalSupportPpm=globalSupportRatio>0?Math.max(1,Math.round(globalSupportRatio*SUPPORT_SCALE)):0;
 const maxCandidatePoints=req.configuration?.max_candidate_points??4096;
 const qualityProfile=(req.configuration?.solver_profile??'balanced')==='quality';
 const maxCandidatesPerItem=req.configuration?.max_candidates_per_item??(qualityProfile?16:1);
@@ -2051,7 +2056,7 @@ items.sort((a,b)=>{
   // must be loaded to end up underneath. An item with no stop rides the whole route and
   // loads with the last one. Every stop is Infinity when nothing declares one, so an
   // unrouted request keeps the ordering below untouched.
-  {const stop=(b.stopIndex??Infinity)-(a.stopIndex??Infinity);if(stop)return stop}
+  const minusX=(req.containers??[]).some(c=>(c.access_directions??[]).includes("-x")&&!(c.access_directions??[]).includes("+x"));{const stop=minusX?((a.stopIndex??Infinity)-(b.stopIndex??Infinity)):((b.stopIndex??Infinity)-(a.stopIndex??Infinity));if(stop)return stop}
   if(qualityProfile&&(startIndex===null||startIndex===0))return a.longest-b.longest||ascendingVolume(a,b)||compareId(a.id,b.id);
   if(qualityProfile&&startIndex===1)return ascendingVolume(a,b)||a.longest-b.longest||compareId(a.id,b.id);
   if(solverAlias==='layer')return (b.d[2]-a.d[2])||(b.d[0]*b.d[1]-a.d[0]*a.d[1])||compareId(a.id,b.id);
@@ -2226,13 +2231,16 @@ const candidatesFor=(tmpl,item,state,points,index,used,width)=>{
       if(upperBound+tmpl.reserve>tmpl.innerVolume
         &&usedVolume([...placements,candidate])+tmpl.reserve>tmpl.innerVolume)continue}
     metrics.feasible_candidates++;
+    const routeSensitive=tmpl.doors.length>0&&(item.stopIndex!=null||state.placements.some(p=>p.item.stopIndex!=null));
     const score=solverAlias==='grid'
       ?z*1e12+y*1e6+x
       :solverAlias==='layer'
         ?z2*1e12+z*1e8+y*1e4+x
         :solverAlias==='maximal_spaces'
           ?x2+y2+z2*1e6
-          :z2*1e9+y2*1e4+x2;
+          :routeSensitive
+            ?x2*1e9+y2*1e4+z2
+            :z2*1e9+y2*1e4+x2;
     if(width===1){if(!found.length||score<found[0].score)found[0]={score,...candidate};continue}
     if(width!=null){retainCandidate(found,width,score,metrics.feasible_candidates,candidate);continue}
     found.push({score,...candidate})}}
@@ -2280,16 +2288,17 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     node.used=compressionSensitive?usedVolume([...node.state.placements,candidate]):node.used+usedVolumeDelta(node.state.placements,candidate);
     node.state.placements.push(candidate);indexAdd(node.index,node.state.placements.length-1,{x:candidate.x,y:candidate.y,z:candidate.z,d:candidate.ed});
     retirePointsForPlacement(node.points,candidate);for(const point of pointsFrom(candidate))insertPoint(node.points,point)};
-  const sortCosts=costs=>costs.sort((a,b)=>a<b?-1:a>b?1:0);
-  const maxCount=(sortedCosts,capacity)=>{let used=0n,count=0;for(const cost of sortedCosts){if(used+cost>capacity)break;used+=cost;count++}return count};
+  // Prefix sums of the ascending costs. Costs are non-negative, so the sums never decrease
+  // and `maxCount` is one binary search: O(log f) per node instead of the O(f) walk.
+  const cumulativeCosts=costs=>{costs.sort((a,b)=>a<b?-1:a>b?1:0);let used=0n;return costs.map(cost=>used+=cost)};
+  const maxCount=(cumulative,capacity)=>{let low=0,high=cumulative.length;while(low<high){const middle=(low+high)>>1;if(cumulative[middle]<=capacity)low=middle+1;else high=middle}return low};
   // `future` is the same array for every comparison inside one `expansions.sort(...)`
-  // call, so its sorted volume/weight arrays are hoisted by the caller and
-  // passed in here -- falls back to sorting on the fly for the trivial future=[] call
-  // sites below, which never reach the sort's cost. Reused arrays are read-only:
-  // `maxCount` no longer sorts in place.
-  const lowerBound=(node,future,sortedVolumes=null,sortedWeights=null)=>{let possible=future.length;
-    if(!future.some(item=>item.nesting!=null))possible=Math.min(possible,maxCount(sortedVolumes??sortCosts(future.map(item=>volume(item.d))),volume(tmpl.d)-node.used));
-    if(tmpl.max!=null)possible=Math.min(possible,maxCount(sortedWeights??sortCosts(future.map(item=>BigInt(item.w))),BigInt(Math.max(0,tmpl.max-node.state.payload))));
+  // call, so its cumulative volume/weight arrays are hoisted by the caller and
+  // passed in here -- falls back to building them on the fly for the trivial future=[]
+  // call sites below, which never reach the sort's cost. Reused arrays are read-only.
+  const lowerBound=(node,future,cumulativeVolumes=null,cumulativeWeights=null)=>{let possible=future.length;
+    if(!future.some(item=>item.nesting!=null))possible=Math.min(possible,maxCount(cumulativeVolumes??cumulativeCosts(future.map(item=>volume(item.d))),volume(tmpl.d)-node.used));
+    if(tmpl.max!=null)possible=Math.min(possible,maxCount(cumulativeWeights??cumulativeCosts(future.map(item=>BigInt(item.w))),BigInt(Math.max(0,tmpl.max-node.state.payload))));
     return node.unplaced.length+future.length-possible};
   // Compared states are complete; placement always mutates a fresh clone first.
   // Weak keys let discarded branches release their cached strings with their state.
@@ -2320,10 +2329,12 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
     // The incumbent is only ever compared and returned (state + unplaced); it never
     // re-enters the beam, so cloning the candidate points and spatial index for it
     // was pure allocation per expansion.
-    for(const node of expansions){const complete={state:{tmpl,placements:node.state.placements.slice(),payload:node.state.payload},used:node.used,unplaced:[...node.unplaced,...future]};if(compareNode(complete,incumbent)<0)incumbent=complete}
+    // More unplaced items already loses compareNode's first criterion, so the copies
+    // below are made only for a candidate that can displace the incumbent.
+    for(const node of expansions){if(node.unplaced.length+future.length>incumbent.unplaced.length)continue;const complete={state:{tmpl,placements:node.state.placements.slice(),payload:node.state.payload},used:node.used,unplaced:[...node.unplaced,...future]};if(compareNode(complete,incumbent)<0)incumbent=complete}
     if(!expansions.length||exhausted){pendingFrom=position;break}
-    const futureVolumes=future.some(item=>item.nesting!=null)?null:sortCosts(future.map(item=>volume(item.d)));
-    const futureWeights=tmpl.max!=null?sortCosts(future.map(item=>BigInt(item.w))):null;
+    const futureVolumes=future.some(item=>item.nesting!=null)?null:cumulativeCosts(future.map(item=>volume(item.d)));
+    const futureWeights=tmpl.max!=null?cumulativeCosts(future.map(item=>BigInt(item.w))):null;
     const bounds=new Map(expansions.map(node=>[node,lowerBound(node,future,futureVolumes,futureWeights)]));
     expansions.sort((a,b)=>compareNode(a,b,bounds));beam=expansions.slice(0,containerPlanBeamWidth)}
   // Without the unreached tail a beam leader looks better than every complete incumbent,
@@ -2468,7 +2479,9 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
 // Deterministic solid single-type block search. Candidate enumeration is
 // O(B*S*T*R*X*Y) time and O(S+n) space; the shared deadline/effort counters and
 // containerPlanNodeLimit bound it exactly as in Python, PHP and Rust.
-const homogeneousBlocksSupported=()=>policyRules.length===0&&templates.every(t=>!t.obs.length&&t.axleSpec==null
+// A block set on a smaller one overhangs it, so a request that asks for support is left
+// to the per-item search.
+const homogeneousBlocksSupported=()=>policyRules.length===0&&globalSupportRatio===0&&templates.every(t=>!t.obs.length&&t.axleSpec==null
     &&Object.keys(t.tagLimits).length===0&&t.maxStackDensity==null&&t.reservePpm===0)
   &&items.every(i=>i.group==null&&!i.tags.length&&!i.incompatible.length&&!i.eligibleTags.length
     &&i.stackable&&!i.raw.must_be_on_floor&&i.maxTop==null&&i.maxStacked==null
@@ -2775,6 +2788,7 @@ function rebalanceValid(context,result){
     const placed=[];
     for(const candidate of [...state.placements].sort((a,b)=>a.z-b.z||a.y-b.y||a.x-b.x||compareCodePoints(a.item.id,b.item.id))){
       if(!allowed(candidate,placed,state.tmpl,context.globalSupportPpm,{support_checks:0}))return false;
+      if(candidate.z!==0&&candidate.publicPlacement&&Number(candidate.publicPlacement.support_ratio)>0&&supportRatioOf(candidate,placed)<=0)return false;
       // A move the rules forbid must fail the same check a placement did. Replaying the
       // container in this order is what makes a cap or a segregation answerable at all:
       // both are statements about what an item joins, so they need a partial container to

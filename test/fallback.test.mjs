@@ -169,6 +169,73 @@ test('randomized weight rebalancing never loses an item or widens payload spread
   }
 });
 
+test('rebalancing reads axles, obstacles, groups and unpacked items back from the result', () => {
+  // Each of these is parsed from the request and re-checked on every trial scene, so a
+  // rebalance of a packing that carries them must round-trip them rather than drop them.
+  const payload = request(
+    [
+      cube('heavy', 10, { weight: '500', priority: 2 }),
+      cube('light', 10, { weight: '100', priority: 1 }),
+      cube('alone', 10, { weight: '100', group: 'g' }),
+      cube('huge', 50, { weight: '1' }),
+    ],
+    [box('box', 40, 10, 10, {
+      quantity: 2, max_items: 2,
+      axles: [{ position: '0', max_load: '100000' }, { position: '40', max_load: '100000' }],
+      obstacles: [{ origin: { x: '30', y: '0', z: '0' }, dimensions: mm(10, 10, 10) }],
+    })],
+    { configuration: { time_limit_ms: 60_000 } },
+  );
+  const original = packSound(payload);
+  assert.deepEqual(original.unpacked_items.map(item => item.item_id), ['huge#1']);
+  const balanced = rebalanceWeight(payload, original);
+  assert.deepEqual(balanced.moves,
+    [{ item_id: 'light#1', from_container_id: 'box#1', to_container_id: 'box#2' }]);
+  assert.deepEqual(
+    balanced.containers.map(container => container.placements.map(placement => placement.item_id)),
+    [['heavy#1'], ['alone#1', 'light#1']]);
+  for (const container of balanced.containers) {
+    assert.equal(container.axle_reactions.basis, 'gross');
+  }
+  assert.deepEqual(validate(payload, { ...original, containers: balanced.containers }), []);
+});
+
+test('rebalanceWeight must not strand a supported item in the source container', () => {
+  const payload = request(
+    [
+      cube('base', 40, { weight: '5000' }),
+      cube('top', 40, { weight: '1000' }),
+    ],
+    [box('box', 200, 200, 200, { quantity: 2 })],
+  );
+  const original = {
+    status: 'feasible',
+    containers: [
+      {
+        id: 'box#1',
+        container_type: 'box',
+        placements: [
+          { item_id: 'base#1', position: { x: { ticks: 0 }, y: { ticks: 0 }, z: { ticks: 0 } }, dimensions: { length: { ticks: 40 }, width: { ticks: 40 }, height: { ticks: 40 } }, orientation: 'LWH', support_ratio: '1.000000', top_load: { ticks: 0 } },
+          { item_id: 'top#1', position: { x: { ticks: 0 }, y: { ticks: 0 }, z: { ticks: 40 } }, dimensions: { length: { ticks: 40 }, width: { ticks: 40 }, height: { ticks: 40 } }, orientation: 'LWH', support_ratio: '1.000000', top_load: { ticks: 0 } },
+        ],
+      },
+      {
+        id: 'box#2',
+        container_type: 'box',
+        placements: [],
+      },
+    ],
+  };
+  const balanced = rebalanceWeight(payload, original);
+  assert.deepEqual(balanced.moves, [{ item_id: 'top#1', from_container_id: 'box#1', to_container_id: 'box#2' }]);
+  assert.deepEqual(
+    balanced.containers.map(c => c.placements.map(p => p.item_id)),
+    [['base#1'], ['top#1']],
+  );
+  assert.equal(balanced.containers[0].placements[0].support_ratio, '1.000000');
+  assert.equal(balanced.containers[1].placements[0].support_ratio, '1.000000');
+});
+
 function packSound(payload) {
   const result = packFallback(payload);
   assert.deepEqual(validate(payload, result), [], 'the fallback produced an unsound packing');
@@ -248,6 +315,54 @@ test('an unrouted item cannot bury routed cargo in a seeded restart', () => {
   assert.deepEqual(validate(payload, result), []);
   assert.deepEqual(placements(result).map(placement => placement.item_type), ['routed']);
   assert.deepEqual(result.unpacked_items.map(item => item.item_type), ['unrouted']);
+});
+
+test('a nesting item on a route is held to stop order against the whole column', () => {
+  // A nesting candidate cannot use the one-plane shortcut: an item it nests inside is below
+  // its top face, so the route rule walks the scene for it.
+  const payload = request(
+    [
+      cube('cup', 10, { quantity: 3, stop_index: 1, nesting_height: '2', allowed_rotations: ['LWH'] }),
+      cube('late', 10, { stop_index: 2, allowed_rotations: ['LWH'] }),
+    ],
+    [box('bin', 20, 10, 30, { quantity: 1 })],
+    { configuration: { time_limit_ms: 60_000 } },
+  );
+  const result = packSound(payload);
+  assert.equal(result.status, 'feasible');
+  assert.deepEqual(placements(result).map(placement => [placement.item_id, at(placement)]), [
+    ['late#1', [0, 0, 0]], ['cup#1', [10 * MM, 0, 0]], ['cup#2', [10 * MM, 0, 8 * MM]],
+    ['cup#3', [0, 0, 10 * MM]],
+  ]);
+
+  // Reversed stops: the later-stop cups fill the only column, and the earlier-stop cargo
+  // cannot go beneath them.
+  const reversed = request(
+    [
+      cube('cup', 10, { quantity: 3, stop_index: 2, nesting_height: '2', allowed_rotations: ['LWH'] }),
+      cube('early', 10, { quantity: 2, stop_index: 1, allowed_rotations: ['LWH'] }),
+    ],
+    [box('bin', 10, 10, 30, { quantity: 1 })],
+    { configuration: { time_limit_ms: 60_000 } },
+  );
+  const blocked = packSound(reversed);
+  assert.deepEqual(placements(blocked).map(placement => placement.item_id), ['cup#1', 'cup#2', 'cup#3']);
+  assert.deepEqual(blocked.unpacked_items.map(item => item.item_id), ['early#1', 'early#2']);
+});
+
+test('a nesting item placed beneath its own column is held to that column\'s stop', () => {
+  // The fixed cup hangs where the request put it; the free cup's top face meets its base in
+  // the same nesting column, so it is a supporter rather than a nested predecessor.
+  const payload = request(
+    [cube('cup', 10, { quantity: 2, stop_index: 1, nesting_height: '2', allowed_rotations: ['LWH'] })],
+    [box('bin', 10, 10, 30, { quantity: 1 })],
+    { fixed_placements: [{ item_type: 'cup', container_type: 'bin', position: { x: '0', y: '0', z: '10' }, orientation: 'LWH' }],
+      configuration: { time_limit_ms: 60_000 } },
+  );
+  const result = packSound(payload);
+  assert.equal(result.status, 'feasible');
+  assert.deepEqual(placements(result).map(placement => [placement.item_id, at(placement), placement.fixed === true]),
+    [['cup#1', [0, 0, 10 * MM], true], ['cup#2', [0, 0, 0], false]]);
 });
 
 test('axle reactions use gross load and include centred tare', () => {
@@ -461,6 +576,17 @@ test('effort budget stops at the exact counted boundary without claiming a wall-
   assert.equal(result.algorithm.time_limit_reached, false);
   assert.equal(result.termination.code, 'effort_limit');
   assert.ok(result.unpacked_items.every((item) => item.reason === 'effort_limit'));
+});
+
+test('quality profile effort budget reports effort_limit without claiming time_limit', () => {
+  const result = packFallback(request(
+    [cube('a', 10, { quantity: 20 })],
+    [box('c', 100, 100, 100)],
+    { configuration: { solver_profile: 'quality', time_limit_ms: 60_000, effort_budget: { max_search_nodes: 5 } } },
+  ));
+  assert.equal(result.algorithm.time_limit_reached, false);
+  assert.equal(result.algorithm.effort_limit_reached, true);
+  assert.equal(result.termination.code, 'effort_limit');
 });
 
 // ------------------------------------------------------------------------- units
@@ -1932,6 +2058,39 @@ test('a shape refuses data belonging to another shape', () => {
     /a compressible item requires both/);
 });
 
+test('a hull with no interior is refused', () => {
+  // A flat hull is separated from everything along its own normal, so it would pass through
+  // every other item; Python raises the same words.
+  const flat = [[0, 0, 0], [100, 0, 0], [0, 100, 0], [100, 100, 0]];
+  assert.throws(() => __inspectHullShapeForTests(flat),
+    /convex hull vertices are coplanar and enclose no volume/);
+  assert.throws(
+    () => packFallback(request([{
+      ...cube('flat'), shape_type: 'convex_hull',
+      hull_vertices: flat.map(([x, y, z]) => ({ x: String(x), y: String(y), z: String(z) })),
+    }], [box('c')])),
+    /convex hull vertices are coplanar and enclose no volume/);
+});
+
+test('a hull is tested against an obstacle as a solid, not as its bounding box', () => {
+  // An obstacle is always a box, so meeting a hull is where a box is turned into a shape. The
+  // wedge's bounding box overlaps both posts; only the one in its empty half lets it in.
+  const wedge = [[0, 0, 0], [100, 0, 0], [0, 100, 0], [0, 0, 100], [100, 0, 100], [0, 100, 100]];
+  const attempt = (x, y) => {
+    const payload = request([{
+      ...cube('wedge'), shape_type: 'convex_hull', allowed_rotations: ['LWH'],
+      hull_vertices: wedge.map(([vx, vy, vz]) => ({ x: String(vx), y: String(vy), z: String(vz) })),
+    }], [box('crate', 100, 100, 100, {
+      quantity: 1, obstacles: [{ origin: { x: String(x), y: String(y), z: '0' }, dimensions: mm(20, 20, 100) }],
+    })], { configuration: { time_limit_ms: 60_000 } });
+    return packSound(payload);
+  };
+  const beside = attempt(80, 80);
+  assert.equal(beside.status, 'feasible');
+  assert.deepEqual(placements(beside).map(placement => at(placement)), [[0, 0, 0]]);
+  assert.deepEqual(attempt(0, 0).unpacked_items.map(item => item.item_id), ['wedge#1']);
+});
+
 test('a compressible column compresses its own base', () => {
   // Ordering cannot vary here -- two identical items in a one-footprint crate -- so this is
   // the scene that makes `compression_ratio` observable in this engine as well as the other
@@ -2104,6 +2263,29 @@ test('exact_small searches rather than relabelling the greedy pass', () => {
   );
   assert.equal(result.summary.unpacked_item_count, 1);
 });
+
+for (const [name, configuration] of [
+  ['quality beam', { solver_profile: 'quality' }],
+  ['exact_small', { solvers: ['exact_small'] }],
+]) {
+  test(`a group is placed whole or not at all by the ${name} search`, () => {
+    // One bin holds two cubes. The two-member `wide` group fits one member and not the
+    // other, so it must be left out entirely; the `pair` group fills the bin exactly.
+    const payload = request(
+      [
+        cube('pair', 10, { quantity: 2, group: 'g' }),
+        cube('single', 10, { group: 'h' }),
+        { id: 'wide', quantity: 2, group: 'w', dimensions: mm(20, 10, 10) },
+      ],
+      [{ id: 'bin', quantity: 1, inner_dimensions: mm(20, 10, 10) }],
+      { configuration: { ...configuration, max_containers: 1, time_limit_ms: 60_000 } },
+    );
+    const result = packSound(payload);
+    assert.deepEqual(placements(result).map(placement => placement.item_id), ['pair#1', 'pair#2']);
+    assert.deepEqual(result.unpacked_items.map(item => item.item_id).sort(),
+      ['single#1', 'wide#1', 'wide#2']);
+  });
+}
 
 test('exact_small evaluates later containers against the requested objective', () => {
   const payload = request(
@@ -2370,6 +2552,79 @@ test('homogeneous-block search falls back for placement-distinguishing rules', (
   assert.equal(result.summary.packed_item_count, 1);
   assert.match(result.algorithm.solver, /^homogeneous_blocks:/);
   assert.deepEqual(validate(payload, result), []);
+});
+
+// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate: the base ends on two tops
+// and overhangs them.
+const aBaseAndThreeTops = (configuration = {}) => request(
+  [{ id: 'base', dimensions: mm(60, 60, 40) }, { id: 'top', quantity: 3, dimensions: mm(40, 60, 50) }],
+  [box('crate', 100, 100, 100, { quantity: 1 })],
+  { configuration: {
+    solver_profile: 'quality', solvers: ['homogeneous_blocks'], time_limit_ms: 60_000,
+    effort_budget: { max_search_nodes: 100_000 }, ...configuration,
+  } },
+);
+
+// The share of a placement's base on the floor or on a top face, from geometry alone.
+function restingShare(all, placement) {
+  const ticks = (p) => ({
+    x1: p.position.x.ticks, y1: p.position.y.ticks, z1: p.position.z.ticks,
+    x2: p.position.x.ticks + p.dimensions.length.ticks,
+    y2: p.position.y.ticks + p.dimensions.width.ticks,
+    z2: p.position.z.ticks + p.dimensions.height.ticks,
+  });
+  const base = ticks(placement);
+  if (base.z1 === 0) return 1;
+  const resting = all.map(ticks).filter((below) => below.z2 === base.z1).reduce((sum, below) => sum
+    + Math.max(0, Math.min(base.x2, below.x2) - Math.max(base.x1, below.x1))
+    * Math.max(0, Math.min(base.y2, below.y2) - Math.max(base.y1, below.y1)), 0);
+  return resting / ((base.x2 - base.x1) * (base.y2 - base.y1));
+}
+
+test('a block set on a smaller one reports the support it really has', () => {
+  const payload = aBaseAndThreeTops();
+  const result = packFallback(payload);
+  const all = placements(result);
+  const overhanging = all.filter((placement) => restingShare(all, placement) < 1);
+  assert.equal(overhanging.length, 1);
+  assert.equal(restingShare(all, overhanging[0]).toFixed(6), (5 / 6).toFixed(6));
+  for (const placement of all) {
+    assert.equal(Number(placement.support_ratio).toFixed(6), restingShare(all, placement).toFixed(6));
+  }
+  assert.deepEqual(validate(payload, result), []);
+});
+
+test('the block solver leaves a request that asks for support to the per-item search', () => {
+  const payload = aBaseAndThreeTops({ minimum_support_ratio: 1 });
+  const result = packFallback(payload);
+  const all = placements(result);
+  assert.ok(all.length > 0);
+  for (const placement of all) assert.equal(restingShare(all, placement), 1);
+  assert.deepEqual(validate(payload, result), []);
+});
+
+test('a positive support ratio below one ppm still bypasses the block solver', () => {
+  const payload = aBaseAndThreeTops({ minimum_support_ratio: 0.0000001 });
+  const result = packFallback(payload);
+  const all = placements(result);
+  assert.equal(all.length, 4);
+  assert.ok(all.every((placement) => restingShare(all, placement) === 1));
+  assert.deepEqual(validate(payload, result), []);
+});
+
+test('a positive support ratio below one ppm still requires contact in per-item search', () => {
+  const payload = request([
+    { id: 'i0', dimensions: mm(72, 37, 50) },
+    { id: 'i1', dimensions: mm(65, 42, 36) },
+    { id: 'i2', dimensions: mm(23, 89, 64) },
+    { id: 'i3', dimensions: mm(38, 85, 23) },
+  ], [box('box', 100, 100, 100, { quantity: 1 })], {
+    configuration: { solver_profile: 'balanced', minimum_support_ratio: 0.0000001 },
+  });
+  const result = packFallback(payload);
+  const all = placements(result);
+  assert.ok(all.some((placement) => placement.position.z.ticks > 0));
+  assert.ok(all.every((placement) => restingShare(all, placement) > 0));
 });
 
 function compareScores(left, right) {

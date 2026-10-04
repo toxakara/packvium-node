@@ -56,6 +56,19 @@ test('replay independently rejects outside and colliding geometry',()=>{
   ],container,[0,1]),SequenceReplayError);
 });
 
+test('a built dependency graph is acyclic and a hand-made cycle is not',()=>{
+  // Support strictly decreases height, so a graph built from a scene cannot cycle. The
+  // constructor accepts any adjacency, which is what lets a cycle be asked about at all.
+  const boxes=[box(0,0,0,10,10,10),box(0,0,10,10,10,10),box(0,0,20,10,10,10)];
+  assert.equal(LoadingDependencyGraph.build(boxes).isAcyclic(),true);
+  assert.equal(UnloadingDependencyGraph.build(boxes).isAcyclic(),true);
+  assert.equal(new LoadingDependencyGraph([]).isAcyclic(),true);
+  // A diamond revisits a finished node, which is not a cycle.
+  assert.equal(new LoadingDependencyGraph([[],[0],[0],[1,2]]).isAcyclic(),true);
+  assert.equal(new LoadingDependencyGraph([[1],[2],[0]]).isAcyclic(),false);
+  assert.equal(new UnloadingDependencyGraph([[0]]).isAcyclic(),false);
+});
+
 test('shared fixtures pin the canonical graph and evidence across four languages',(t)=>{
   const fixture=new URL('../../../../conformance/scene/sequence-fixtures.json',import.meta.url);
   if(!existsSync(fixture)){t.skip('the shared cross-language scene fixture is not part of this package');return;}

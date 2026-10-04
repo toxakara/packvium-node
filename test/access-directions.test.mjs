@@ -21,6 +21,10 @@ import { packFallback } from '../fallback.js';
  * way in, and therefore the only place these rules can be checked at all.
  */
 
+// Counted work, not a clock, decides where the search stops: under the default wall-clock
+// limit a loaded host truncated one of two otherwise identical solves, and the comparisons
+// below reported the host rather than the engine. The time limit is only a fuse, far above
+// what one cube needs.
 const request = (doors) => {
   const container = {
     id: 'van',
@@ -29,6 +33,7 @@ const request = (doors) => {
   if (doors !== undefined) container.access_directions = doors;
   return {
     units: { length: 'mm' },
+    configuration: { effort_budget: { max_search_nodes: 20000 }, time_limit_ms: 60000 },
     items: [{
       id: 'cube', quantity: 1,
       dimensions: { length: '100', width: '100', height: '100' },
@@ -90,8 +95,9 @@ test('an unknown direction is refused rather than dropped', () => {
   for (const direction of ['north', 'x', '+X', '+w', '', '-x ']) {
     const error = refusal([direction]);
     assert.ok(error, `${JSON.stringify(direction)} should be refused, not dropped`);
-    assert.equal(error.code, 'invalid_direction');
-    assert.match(error.message, /unknown movement direction/);
+    assert.equal(error.code, 'invalid_request');
+    assert.equal(error.reason, 'not_allowed');
+    assert.equal(error.field, '/containers/0/access_directions/0');
   }
 });
 
@@ -100,13 +106,36 @@ test('an unknown direction is refused rather than dropped', () => {
 test('one bad direction refuses the whole list', () => {
   const error = refusal(['-x', 'sideways', '+z']);
   assert.ok(error);
-  assert.equal(error.code, 'invalid_direction');
+  assert.equal(error.code, 'invalid_request');
+  assert.equal(error.reason, 'not_allowed');
+  assert.equal(error.field, '/containers/0/access_directions/1');
 });
 
 test('a non-string entry is refused', () => {
   for (const entry of [1, null, ['-x'], {}]) {
     const error = refusal([entry]);
     assert.ok(error, `${JSON.stringify(entry)} should be refused`);
-    assert.equal(error.code, 'invalid_direction');
+    assert.equal(error.code, 'invalid_request');
+    assert.equal(error.reason, 'not_allowed');
+    assert.equal(error.field, '/containers/0/access_directions/0');
   }
+});
+
+test('with access_directions -x and stops, all items are packed', () => {
+  const req = {
+    units: { length: 'mm', weight: 'g' },
+    configuration: { solver_profile: 'fast' },
+    containers: [{
+      id: 'truck',
+      inner_dimensions: { length: '5000', width: '2000', height: '2000' },
+      access_directions: ['-x'],
+    }],
+    items: [
+      { id: 'stop1', quantity: 2, stop_index: 1, dimensions: { length: '1000', width: '1000', height: '1000' } },
+      { id: 'stop2', quantity: 3, stop_index: 2, dimensions: { length: '500', width: '500', height: '500' } },
+    ],
+  };
+  const res = packFallback(req);
+  assert.equal(res.status, 'feasible');
+  assert.equal(res.containers[0].placements.length, 5);
 });

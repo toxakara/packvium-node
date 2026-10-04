@@ -7,11 +7,13 @@
  *
  * `@packvium/engine` takes and returns the same JSON contract every Packvium
  * implementation speaks, so a request you build here also works against the Python CLI,
- * the PHP CLI or the Rust core, and comes back with the same answer.
+ * the PHP CLI or the Rust core.
  *
- * The package prefers the compiled N-API addon when `@packvium/native` is installed and
+ * The package prefers a compiled N-API addon when one is built beside `index.js` and
  * falls back to a deterministic JavaScript engine otherwise. You do not choose, and you
- * do not need to: `backend()` reports which one answered, and both answer the same.
+ * do not need to: `backend()` reports which one answered. Both return a valid packing
+ * that honours every rule in the request, but they are independent searches and may
+ * arrive at different arrangements for the same order.
  */
 
 import { backend, pack, version } from '../index.js';
@@ -19,10 +21,10 @@ import { backend, pack, version } from '../index.js';
 console.log(`engine ${version()} using the ${backend()} backend\n`);
 
 const request = {
-  // An example must not change answer merely because the host was busy. This solve needs
-  // a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
-  // loaded machine cannot cut the multi-start portfolio short and let a different start win.
-  configuration: { time_limit_ms: 60000 },
+  // An example must not change answer merely because the host was busy. `effort_budget`
+  // bounds the search by counted work, the same on every machine; the generous wall-clock
+  // value is only a safety fuse. See examples/reproducibility.mjs.
+  configuration: { time_limit_ms: 60000, effort_budget: { max_candidates_evaluated: 1000000 } },
   items: [
     // Lengths and weights are strings on purpose. They are parsed into exact integers,
     // so '0.1' means a tenth of a millimetre and never 0.09999999999999999. Plain

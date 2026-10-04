@@ -220,7 +220,7 @@ const SHAPES = [
   ['not a list', 'x', 'fixed_placements is a list', '/fixed_placements'],
   ['an object', { 0: entry() }, 'fixed_placements is a list', '/fixed_placements'],
   ['an entry that is not an object', [5], 'fixed_placements[0] is an object', '/fixed_placements/0'],
-  ['an unknown key', [{ ...entry(), note: 'strapped', ab: 1 }], 'fixed_placements[0] does not carry ["ab","note"]', '/fixed_placements/0'],
+  ['an unknown key', [{ ...entry(), note: 'strapped', ab: 1 }], 'fixed_placements[0] cannot carry ["ab","note"]', '/fixed_placements/0'],
   ['a missing key', [{ item_type: 'cube' }], 'fixed_placements[0] needs ["container_type","orientation"]', '/fixed_placements/0'],
   ['an empty item type', [{ ...entry(), item_type: '' }], 'fixed_placements[0].item_type is a non-empty string', '/fixed_placements/0/item_type'],
   ['a numeric container type', [{ ...entry(), container_type: 5 }], 'fixed_placements[0].container_type is a non-empty string', '/fixed_placements/0/container_type'],
@@ -233,7 +233,7 @@ const SHAPES = [
   ['an instance beyond 2^53 - 1', [{ ...entry(), container_instance: 2 ** 53 }], 'fixed_placements[0].container_instance counts from 1', '/fixed_placements/0/container_instance'],
   ['a position list', [{ ...entry(), position: ['100', '0', '0'] }], 'fixed_placements[0].position is a point object', '/fixed_placements/0/position'],
   ['a null position', [{ ...entry(), position: null }], 'fixed_placements[0].position is a point object', '/fixed_placements/0/position'],
-  ['an extra axis', [{ ...entry(), position: { x: '100', w: '5' } }], 'fixed_placements[0].position does not carry ["w"]', '/fixed_placements/0/position'],
+  ['an extra axis', [{ ...entry(), position: { x: '100', w: '5' } }], 'fixed_placements[0].position cannot carry ["w"]', '/fixed_placements/0/position'],
   ['a boolean axis', [{ ...entry(), position: { x: true } }], 'fixed_placements[0].position.x is a measure', '/fixed_placements/0/position/x'],
   ['a null axis', [{ ...entry(), position: { y: null } }], 'fixed_placements[0].position.y is a measure', '/fixed_placements/0/position/y'],
   ['a list axis', [{ ...entry(), position: { z: [0] } }], 'fixed_placements[0].position.z is a measure', '/fixed_placements/0/position/z'],
@@ -287,6 +287,9 @@ const RULES = [
   ['top load', [item('a', { max_top_load: '500' }), item('b')], room(), [at('a'), at('b', '0', '100')], 'top_load_exceeded: box#1: a#1'],
   ['stacked limit', [item('a', { max_stacked_items: 1 })], room(), [at('a'), at('a', '0', '100'), at('a', '0', '200')],
     'stacked_item_limit_exceeded: box#1: a#1'],
+  // Two 1 kg cubes on a 0.01 m² base load the lower one at 200 kg/m².
+  ['stack density', [item('a')], room({ max_stack_density: '150000' }), [at('a'), at('a', '0', '100')],
+    'stack_density_exceeded: box#1: a#1'],
   ['single contact', [item('a'), item('b', { ground_contact_rule: 'single', dimensions: wide })], room(),
     [at('a'), at('a', '100'), at('b', '0', '100')], 'ground_contact_violation: b#1: single: rests on 2 item(s)'],
   ['covered contact', [item('a'), item('b', { ground_contact_rule: 'covered', dimensions: wide })], room(),
@@ -304,6 +307,28 @@ for (const [name, items, container, placements, detail] of RULES) {
   test(`the fixed set is held to the ordinary rules: ${name}`, () => {
     assert.equal(refusal({ items, containers: [container], fixed_placements: placements }),
       `invalid_fixed_placement: ${detail}`);
+  });
+}
+
+// The rules above each refuse; the same rules must also let a lawful set through, or a check
+// that always refuses would pass the table.
+const LAWFUL = [
+  ['tags within their limit', [item('a', { tags: ['food'] }), item('b', { incompatible_tags: ['chem'] })],
+    room({ tag_limits: { food: 2 } }), [at('a'), at('b', '100')]],
+  ['a route that unloads in stop order', [item('a', { stop_index: 2 }), item('b', { stop_index: 1 })],
+    { id: 'box', quantity: 3, inner_dimensions: { length: '100', width: '100', height: '200' } },
+    [at('a'), at('b', '0', '100')]],
+  ['a stack under its density limit', [item('a')], room({ max_stack_density: '250000' }),
+    [at('a'), at('a', '0', '100')]],
+];
+
+for (const [name, items, container, placements] of LAWFUL) {
+  test(`a fixed set that keeps the rules is accepted: ${name}`, () => {
+    const data = { items, containers: [container], fixed_placements: placements };
+    const result = packFallback(data);
+    assert.equal(result.status, 'feasible');
+    assert.equal(fixedRows(result).length, placements.length);
+    assert.deepEqual(validate(data, result), []);
   });
 }
 

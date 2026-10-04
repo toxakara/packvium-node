@@ -26,10 +26,12 @@ const HOOK = path.join(HERE, 'force-fallback.cjs');
 const PROBE = "import {backend} from './index.js'; process.stdout.write(backend());";
 
 /**
- * A copy of the package with a resolvable `@packvium/native` beside it. The stand-in
- * is plain JavaScript rather than a compiled addon because `index.js` only ever asks
- * whether the module resolves and exposes `packJson` -- nothing about the block depends
- * on it being real machine code, and a real one cannot be built inside a unit test.
+ * A copy of the package with a resolvable `./packvium-native.node` beside it. The
+ * stand-in is plain JavaScript rather than a compiled addon because `index.js` only ever
+ * asks whether the module resolves and exposes `packJson` -- nothing about the block
+ * depends on it being real machine code, and a real one cannot be built inside a unit
+ * test. It is a *directory* of that name: a file ending in `.node` is handed to
+ * `dlopen`, while a directory resolves through its `package.json` like any package.
  */
 function packageWithAFakeNativeBackend() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'packvium-forced-fallback-'));
@@ -42,8 +44,8 @@ function packageWithAFakeNativeBackend() {
     fs.copyFileSync(path.join(PACKAGE, name), path.join(root, name));
   }
   fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ type: 'module' }));
-  const fake = path.join(root, 'node_modules/@packvium/native');
-  fs.mkdirSync(fake, { recursive: true });
+  const fake = path.join(root, 'packvium-native.node');
+  fs.mkdirSync(fake);
   fs.writeFileSync(path.join(fake, 'package.json'), JSON.stringify({ main: 'index.cjs' }));
   fs.writeFileSync(path.join(fake, 'index.cjs'), 'module.exports={packJson:(s)=>s};');
   fs.writeFileSync(path.join(root, 'probe.mjs'), PROBE);

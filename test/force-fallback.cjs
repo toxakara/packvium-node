@@ -17,7 +17,7 @@ const Module = require('node:module');
 // Exactly what `index.js` probes, and nothing else -- `force-fallback.test.mjs` asserts
 // the two lists stay identical, which is what makes "this hook blocks the package's
 // native backend" a checkable claim rather than a comment.
-const NATIVE_CANDIDATES = ['./packvium-native.node', '@packvium/native'];
+const NATIVE_CANDIDATES = ['./packvium-native.node'];
 
 // Paths only a test reaches for: the in-workspace build directory the commerce suite
 // loads when it compares the native and fallback backends against each other. Blocked

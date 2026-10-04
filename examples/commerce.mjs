@@ -11,7 +11,7 @@
  * starting at 1 — so `tariff_version: 2` always means "the second entry under this
  * carrier and service", with no separate numbering to keep in sync.
  *
- * `commerce` picks the native addon when @packvium/native is installed and the
+ * `commerce` picks the native addon when one is built beside `index.js` and the
  * deterministic JavaScript engine otherwise. Both return the same answer;
  * `commerce.backend()` says which one answered.
  */
