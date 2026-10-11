@@ -199,6 +199,20 @@ test('a loading prefix that stacks onto a non-stackable item is caught',()=>{
   );
 });
 
+test('a loading prefix that breaks the stacking-group rule is caught in either order',()=>{
+  const placements=[
+    stacked(0,0,0,5,{accepts_stacking_groups:['A']}),
+    stacked(0,0,5,5,{stacking_group:'C'}),
+  ];
+  for(const order of [[0,1],[1,0]]){
+    assert.throws(
+      ()=>verifyLoadingPrefixBusinessRules(placements,order,{}),
+      error=>error instanceof SequenceReplayError&&error.step===1&&error.reason==='stacking_group_incompatible',
+    );
+  }
+  verifyLoadingPrefixBusinessRules([stacked(0,0,0,5,{accepts_stacking_groups:['A']}),stacked(0,0,5,5,{stacking_group:'A'})],[0,1],{});
+});
+
 test('a loading prefix that violates a ground contact rule is caught',()=>{
   // "single" requires resting on exactly one supporter; two half-width bases side by
   // side under one full-width rider violate it.
@@ -226,5 +240,26 @@ test('a malformed business rule order is rejected before any rule check',()=>{
   assert.throws(
     ()=>verifyLoadingPrefixBusinessRules(placements,[0,0],{}),
     SequenceReplayError,
+  );
+});
+
+test('safeRemovalOrder tie-breaks multiple unblocked items by lowest index in linear scan',()=>{
+  const container={length:40,width:20,height:20};
+  const b0=box(0,0,0,10,10,10);
+  const b1=box(10,0,0,10,10,10);
+  const b2=box(20,0,0,10,10,10);
+  const order=safeRemovalOrder([b0,b1,b2],container,['+z']);
+  assert.deepEqual(order,[0,1,2]);
+});
+
+test('safeRemovalOrder throws SequenceError on circular deadlock',()=>{
+  const container={length:20,width:20,height:20};
+  const b0=box(0,0,0,10,10,10);
+  const b1=box(0,0,10,10,10,10);
+  // b1 rests on b0 (b0 cannot unload until b1 is unloaded).
+  // With only -z allowed, b1 is blocked by b0 below it.
+  assert.throws(
+    ()=>safeRemovalOrder([b0,b1],container,['-z']),
+    SequenceError,
   );
 });

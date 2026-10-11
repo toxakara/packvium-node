@@ -263,7 +263,7 @@ test('explicit solver selection is reported honestly', () => {
   const ordered = packFallback(request(
     [cube('a', 50), cube('b', 40)],
     [box('c')],
-    { configuration: { solvers: ['grid', 'layer', 'extreme_points'] } },
+    { configuration: { solvers: ['grid', 'layer', 'extreme_points'], multi_start_orders: 1 } },
   ));
   assert.deepEqual(
     ordered.termination.starts.map(start => start.id),
@@ -301,16 +301,17 @@ test('malformed public constraints fail admission instead of being ignored', () 
 
 test('an unrouted item cannot bury routed cargo in a seeded restart', () => {
   const payload = request(
-    [cube('routed', 10, { stop_index: 0 }), cube('unrouted', 10)],
+    [cube('routed', 10, { stop_index: 0, priority: 1 }), cube('unrouted', 10)],
     [box('box', 10, 10, 20, { quantity: 1 })],
-    { configuration: { time_limit_ms: 60_000 } },
+    { configuration: { time_limit_ms: 60_000, multi_start_orders: 1 } },
   );
 
-  // Seeded start 4 visits the routed item first. The old JS-only exemption for a
-  // candidate without stop_index then put the unrouted item above it. All languages
-  // define an absent stop as Infinity: it rides the whole route and may block routed
-  // cargo from below, but it may never be placed above that cargo.
-  const result = packFallback(payload, Date.now, null, 4);
+  // Priority leads every ordering, so the routed item is visited first. The old JS-only
+  // exemption for a candidate without stop_index then put the unrouted item above it. All
+  // languages define an absent stop as Infinity: it rides the whole route and may block
+  // routed cargo from below, but it may never be placed above that cargo. A seeded start
+  // reached this ordering until 1.6.0, when shuffles began keeping the lead keys.
+  const result = packFallback(payload);
 
   assert.deepEqual(validate(payload, result), []);
   assert.deepEqual(placements(result).map(placement => placement.item_type), ['routed']);
@@ -1216,7 +1217,7 @@ test('compact lattice reports structured metrics that mirror legacy counters', (
   const result = packFallback(request(
     [cube('a', 10, { quantity: 3 })],
     [box('c')],
-    { configuration: { require_placement_coordinates: false } },
+    { configuration: { require_placement_coordinates: false, multi_start_orders: 1 } },
   ));
   const { metrics } = result.algorithm;
   for (const field of [
@@ -1320,6 +1321,120 @@ test('maximum_value scores the total value of whatever is left unpacked', () => 
   const unpackedValue = result.unpacked_items.reduce((sum, u) => sum + (u.item_type === 'a' ? 30 : 7), 0);
   assert.equal(result.score[1], unpackedValue);
   assert.equal(result.summary.unpacked_item_count, 1);
+});
+
+// ------------------------------------------------------------------ maximum volume
+//
+// The score leads with the share of the requested nominal volume left unpacked, in parts
+// per million and rounded up; the default objective's first four keys follow it. Every
+// expected number below is worked out by hand from the dimensions, and the validator's
+// own recomputation -- which shares no code with the solver -- must agree with it.
+
+const byVolume = (items, containers, configuration = {}) => request(
+  items, containers, { configuration: { objective: 'maximum_volume', ...configuration } },
+);
+const packedTypes = (result) => placements(result).map((placement) => placement.item_type).sort();
+
+test('maximum_volume rounds the unpacked share up, so an incomplete answer never scores zero', () => {
+  // 1 mm^3 left behind out of 10^9 + 1: far below one part per million, reported as one.
+  const req = byVolume([cube('big', 1000), cube('speck', 1)], [box('c', 1000, 1000, 1000, { quantity: 1 })]);
+  const result = packFallback(req);
+  assert.equal(result.objective, 'maximum_volume');
+  assert.deepEqual(packedTypes(result), ['big']);
+  assert.deepEqual(result.score, [1, 1, 1, 0, 0]);
+  assert.deepEqual(recomputeObjective(req, result), result.score);
+  assert.deepEqual(validate(req, result), []);
+});
+
+test('maximum_volume scores a complete answer zero and keeps the default keys behind it', () => {
+  const req = byVolume([cube('a', 100), cube('b', 50)], [box('c', 200, 100, 100, { cost_minor: 7 })]);
+  const result = packFallback(req);
+  assert.equal(result.complete, true);
+  // 2,000,000 mm^3 of container holding 1,125,000: 437,500 ppm unused.
+  assert.deepEqual(result.score, [0, 0, 1, 7, 437_500]);
+  assert.deepEqual(recomputeObjective(req, result), result.score);
+});
+
+test('maximum_volume reports the same vector from the uniform-lattice path', () => {
+  // One item type takes the closed-form path. Two of three fit: ceil(10^6 / 3).
+  const req = byVolume([cube('a', 100, { quantity: 3 })], [box('c', 200, 100, 100, { quantity: 1 })]);
+  const result = packFallback(req);
+  assert.deepEqual(result.score, [333_334, 1, 1, 0, 0]);
+  assert.deepEqual(recomputeObjective(req, result), result.score);
+});
+
+test('maximum_volume keeps one large box where the default keeps more pieces', () => {
+  // The large cube and the three small ones cannot share the container. Small: 375,000
+  // of 1,375,000 mm^3 packed; large: 1,000,000 of it.
+  const items = [cube('large', 100), cube('small', 50, { quantity: 3 })];
+  const containers = [box('c', 100, 100, 100, { quantity: 1 })];
+  const configuration = { solver_profile: 'quality', time_limit_ms: 60_000 };
+  const pieces = packFallback(request(items, containers, { configuration }));
+  assert.deepEqual(packedTypes(pieces), ['small', 'small', 'small']);
+  assert.equal(pieces.score[0], 1);
+
+  const req = byVolume(items, containers, configuration);
+  const volume = packFallback(req);
+  assert.deepEqual(packedTypes(volume), ['large']);
+  assert.deepEqual(volume.score, [272_728, 3, 1, 0, 0]);
+  assert.deepEqual(recomputeObjective(req, volume), volume.score);
+});
+
+test('maximum_volume leads every solver and every start, not only the portfolio winner', () => {
+  const items = [cube('large', 100), cube('small', 50, { quantity: 3 })];
+  const containers = [box('c', 100, 100, 100, { quantity: 1 })];
+  const quality = { solver_profile: 'quality', time_limit_ms: 60_000 };
+  for (const solver of ['extreme_points', 'homogeneous_blocks', 'layer', 'maximal_spaces', 'exact_small']) {
+    const result = packFallback(byVolume(items, containers, { ...quality, solvers: [solver] }));
+    assert.deepEqual(packedTypes(result), ['large'], solver);
+  }
+  // Three quality starts: large-first, then the two small-first orderings. The first wins.
+  const started = packFallback(byVolume(items, containers,
+    { ...quality, solvers: ['extreme_points'], multi_start_orders: 3 }));
+  assert.deepEqual(packedTypes(started), ['large']);
+  assert.equal(started.termination.starts.findIndex((start) => start.selected), 0);
+});
+
+test('maximum_volume exact search ranks by volume when nothing at all can be placed', () => {
+  const req = byVolume([cube('huge', 200)], [box('c', 100, 100, 100)], { solvers: ['exact_small'] });
+  const result = packFallback(req);
+  assert.deepEqual(result.score, [1_000_000, 1, 0, 0, 0]);
+  assert.deepEqual(recomputeObjective(req, result), result.score);
+});
+
+test('maximum_volume opens the container type that takes the most volume, not the most pieces', () => {
+  // One container allowed. The small type holds all five small cubes and nothing else;
+  // the large type holds the large cube, which leaves no room for a small one.
+  const items = [cube('large', 100), cube('small', 10, { quantity: 5 })];
+  const containers = [box('roomy', 100, 100, 100), box('snug', 50, 50, 50)];
+  const pieces = packFallback(request(items, containers, { configuration: { max_containers: 1 } }));
+  assert.equal(pieces.containers[0].container_type, 'snug');
+  assert.equal(pieces.summary.packed_item_count, 5);
+
+  const req = byVolume(items, containers, { max_containers: 1 });
+  const volume = packFallback(req);
+  assert.equal(volume.containers[0].container_type, 'roomy');
+  // 5,000 of 1,005,000 mm^3 left behind: ceil(4975.12...).
+  assert.deepEqual(volume.score, [4_976, 5, 1, 0, 0]);
+  assert.deepEqual(recomputeObjective(req, volume), volume.score);
+});
+
+test('maximum_volume is deterministic: the same request twice gives the same JSON', () => {
+  // Bounded by effort, not the clock, so the two runs stop at the same place.
+  const req = byVolume(
+    [
+      { id: 'slab', dimensions: mm(60, 40, 30), quantity: 6 },
+      { id: 'tile', dimensions: mm(50, 50, 20), quantity: 5 },
+      cube('block', 30, { quantity: 8 }),
+    ],
+    [box('c', 120, 100, 80, { quantity: 1 })],
+    { solver_profile: 'quality', time_limit_ms: 60_000, effort_budget: { max_search_nodes: 2_000 } },
+  );
+  const masked = (result) => JSON.stringify(result, (key, value) => (key === 'duration_ms' ? 0 : value));
+  const first = packFallback(req);
+  assert.equal(masked(packFallback(req)), masked(first));
+  assert.deepEqual(validate(req, first), []);
+  assert.deepEqual(recomputeObjective(req, first), first.score);
 });
 
 // ---------------------------------------------------- landed cost
@@ -1566,15 +1681,15 @@ test('lowest_landed_cost refuses a request it cannot price', () => {
 });
 
 // One pinned solver crams everything into the snug box, the other splits the load and
-// prices it. `extreme_points` (volume-descending) seats the lid first and stacks every
-// brick on it, so both boxes take all nine items in one round; both bill 3300 g, the
-// tie falls to the snug box, and its ladder stops at 2000 g -- unpriceable. `layer`
-// (height-descending) floors the bricks first, which walls the lid out of the spot the
-// other order used, so it ships bricks in the snug box (1350 g billed, 900) and the lid
-// in the roomy one (2500 g billed, 1500).
+// prices it. `layer` (base-area-descending, as in Python and Rust) seats the thin lid
+// first and stacks every brick on it, so both boxes take all nine items in one round;
+// both bill 3300 g, the tie falls to the snug box, and its ladder stops at 2000 g --
+// unpriceable. `extreme_points` (volume-descending) floors the bricks first, which walls
+// the lid out of the spot the other order used, so it ships bricks in the snug box and
+// the lid in the roomy one (2400 in all).
 const splitPortfolio = (betaBracketG, extra = {}) => request(
   [
-    { id: 'lid', dimensions: mm(300, 300, 100), weight: '2500 g' },
+    { id: 'lid', dimensions: mm(300, 300, 10), weight: '2500 g' },
     { id: 'brick', dimensions: mm(100, 100, 150), weight: '100 g', quantity: 8 },
   ],
   [
@@ -1590,14 +1705,15 @@ const splitPortfolio = (betaBracketG, extra = {}) => request(
       minimum_support_ratio: 1,
       solvers: ['extreme_points', 'layer'],
       alternatives: 3,
+      multi_start_orders: 1,
       ...extra,
     },
   },
 );
 
 test('a portfolio returns the priceable sibling instead of propagating a child run refusal', () => {
-  // The engine used to throw the no-published-price refusal inside the extreme_points
-  // child run, aborting the request its layer sibling could price at 2400. The refusal
+  // The engine used to throw the no-published-price refusal inside one child run,
+  // aborting the request its sibling could price at 2400. The refusal
   // now fires once, at the outermost frame, on the packing actually selected for
   // return -- the choke point Rust, Python and PHP already refuse at (second
   // review) -- so the priceable sibling wins on the ordinary score comparison.
@@ -1610,7 +1726,7 @@ test('a portfolio returns the priceable sibling instead of propagating a child r
 });
 
 test('alternatives never surface the unpriceable sentinel', () => {
-  // The losing extreme_points run carries score[1] = MAX_SAFE_INTEGER. The sentinel is
+  // The losing layer run carries score[1] = MAX_SAFE_INTEGER. The sentinel is
   // a search device, never an answer -- alternatives included (review): the run
   // is filtered out rather than offered as a packing costing 2^53-1 minor units.
   const filtered = packFallback(splitPortfolio(2600));
@@ -2377,7 +2493,7 @@ test('exact_small stops at an admissible complete objective floor', () => {
     [cube('cube', 45, { quantity: 8, allowed_rotations: ['LWH'] })],
     [box('bin', 90, 90, 90, { quantity: 1 })],
     { configuration: {
-      solvers: ['exact_small'], solver_profile: 'exact_small', exact_item_limit: 8,
+      solvers: ['exact_small'], solver_profile: 'exact_small', exact_item_limit: 8, multi_start_orders: 1,
       max_containers: 1,
       time_limit_ms: 60_000,
       effort_budget: {
@@ -2438,8 +2554,10 @@ test('every requested restart runs and is recorded', () => {
 
   const one = build(1);
   const eight = build(8);
-  assert.equal(one.termination.starts.length, 1);
-  assert.equal(eight.termination.starts.length, 8);
+  // Two item types and nothing the lattice cannot express: each run ends with the block
+  // start `balanced` adds to its own.
+  assert.equal(one.termination.starts.length, 2);
+  assert.equal(eight.termination.starts.length, 9);
   assert.ok(
     eight.algorithm.metrics.search_nodes_expanded > one.algorithm.metrics.search_nodes_expanded,
     'eight restarts must cost more search than one',
@@ -2486,9 +2604,14 @@ test('all restarts share one absolute deadline and preserve unstarted records', 
     { configuration: { multi_start_orders: 3, time_limit_ms: 1 } },
   ), () => ++tick);
 
-  assert.equal(result.termination.starts.length, 3);
+  // The three orderings, then the block start `balanced` adds: it never began either.
+  assert.deepEqual(result.termination.starts.map((start) => start.id), [
+    'javascript_fallback', 'javascript_fallback:seeded_1', 'javascript_fallback:seeded_2',
+    'homogeneous_blocks:javascript_fallback',
+  ]);
   assert.equal(result.termination.starts.filter((start) => start.started).length, 1);
-  assert.equal(result.termination.starts.filter((start) => !start.started).length, 2);
+  assert.equal(result.termination.starts.filter((start) => !start.started).length, 3);
+  assert.equal(result.algorithm.solver, 'javascript_fallback');
   assert.equal(result.termination.global_deadline_reached, true);
   assert.equal(result.termination.code, 'time_limit');
 });
@@ -2655,4 +2778,240 @@ test('spatial forks share reads but isolate writes from parents and siblings', (
     assert.deepEqual(child.cells.get(key), [0,3]);
     assert.deepEqual(grandchild.cells.get(key), [0,4]);
   }
+});
+
+// The block start `fast` and `balanced` add to their own. A restart budget of one drops
+// it -- it is the last start -- which is how these tests obtain the profile's own answer.
+const blockStartId = 'homogeneous_blocks:javascript_fallback';
+const startIds = (result) => result.termination.starts.map((start) => start.id);
+const cartons = (profile, configuration = {}) => request(
+  [
+    ...['b1', 'b2', 'b4'].map((id) => ({ id, dimensions: mm(350, 250, 140) })),
+    { id: 'b3', dimensions: mm(350, 230, 130) },
+  ],
+  [box('carton-box', 600, 400, 250)],
+  // One ordering, so the added block start is the only other start these tests look at.
+  { configuration: { solver_profile: profile, multi_start_orders: 1, ...configuration } },
+);
+const ownAnswer = (payload) => packFallback({
+  ...payload, configuration: { ...payload.configuration, effort_budget: { max_restarts: 1 } },
+});
+const withoutDuration = (result) => JSON.stringify(result, (key, value) => (key === 'duration_ms' ? 0 : value));
+
+for (const profile of ['fast', 'balanced']) {
+  test(`${profile} tries the block solver as one more start after its own`, () => {
+    const result = packFallback(cartons(profile));
+    assert.deepEqual(startIds(result), ['javascript_fallback', blockStartId]);
+    assert.equal(result.termination.starts.filter((start) => start.selected).length, 1);
+    assert.equal(result.termination.starts.every((start) => start.started && start.completed), true);
+    assert.equal(result.algorithm.profile, profile);
+  });
+
+  test(`${profile} answers a supported request identically every time`, () => {
+    assert.equal(withoutDuration(packFallback(cartons(profile))), withoutDuration(packFallback(cartons(profile))));
+  });
+}
+
+test('the added block start replaces an answer it strictly beats', () => {
+  const payload = cartons('balanced');
+  const own = ownAnswer(payload);
+  const result = packFallback(payload);
+  assert.deepEqual(startIds(own), ['javascript_fallback']);
+  assert.equal(own.summary.container_count, 2);
+  assert.equal(result.summary.container_count, 1);
+  assert.equal(compareScores(result.score, own.score) < 0, true);
+  assert.equal(result.algorithm.solver, blockStartId);
+  assert.deepEqual(result.termination.starts.map((start) => start.selected), [false, true]);
+  assert.deepEqual(validate(payload, result), []);
+  assert.deepEqual(recomputeObjective(payload, result), result.score);
+  // The profile's own answer stays on offer, as a losing solver's does under `quality`.
+  assert.deepEqual(result.alternatives.map((alternative) => alternative.score), [own.score]);
+  assert.deepEqual(packFallback(cartons('balanced', { alternatives: 1 })).alternatives, []);
+  // Both runs are counted: the reported effort is the portfolio's, not the winner's.
+  assert.equal(result.algorithm.metrics.search_nodes_expanded > own.algorithm.metrics.search_nodes_expanded, true);
+  assert.equal(result.algorithm.candidates_evaluated > own.algorithm.candidates_evaluated, true);
+});
+
+test('the added block start is discarded when it only ties', () => {
+  const payload = request(
+    [cube('light', 100, { weight: 1 }), cube('heavy', 100, { weight: 3 })],
+    [box('column', 100, 100, 200)],
+    { configuration: { solver_profile: 'fast' } },
+  );
+  const own = ownAnswer(payload);
+  const result = packFallback(payload);
+  assert.deepEqual(startIds(result), ['javascript_fallback', blockStartId]);
+  assert.deepEqual(result.termination.starts.map((start) => start.selected), [true, false]);
+  assert.equal(result.algorithm.solver, 'javascript_fallback');
+  assert.deepEqual(result.score, own.score);
+  assert.deepEqual(result.containers, own.containers);
+  assert.deepEqual(result.alternatives, []);
+});
+
+test('fast enumerates one block mode where balanced enumerates both', () => {
+  const spent = (profile) => packFallback(cartons(profile)).algorithm.metrics.search_nodes_expanded;
+  const own = ownAnswer(cartons('fast')).algorithm.metrics.search_nodes_expanded;
+  assert.equal(spent('fast') > own, true);
+  assert.equal(spent('balanced') - own, 2 * (spent('fast') - own));
+});
+
+test('the added block start carries its own node limit, not the container plan limit', () => {
+  // Selected by name on `balanced` the solver keeps the profile's limit of one node and
+  // stops before its first block; the added start must not inherit that.
+  const selected = packFallback(cartons('balanced', { solvers: ['homogeneous_blocks'] }));
+  assert.equal(selected.summary.packed_item_count, 0);
+  assert.equal(packFallback(cartons('balanced', { container_plan_node_limit: 1 })).summary.container_count, 1);
+});
+
+test('the added block start stays out where it does not belong', () => {
+  const floorBound = cartons('balanced');
+  floorBound.items[3].must_be_on_floor = true;
+  const prioritised = cartons('fast');
+  prioritised.items[0].priority = 5;
+  const valued = cartons('balanced', { objective: 'maximum_value' });
+  valued.items[0].value = 7;
+  const soft = cartons('balanced');
+  soft.items[3].shape_type = 'compressible';
+  soft.items[3].compression_ratio = 0.5;
+  soft.items[3].max_compression_pressure_kpa = 100;
+  const oneType = request(
+    [{ id: 'b1', quantity: 4, dimensions: mm(350, 250, 140) }],
+    [box('carton-box', 600, 400, 250, { obstacles: [{ origin: { x: '0', y: '0', z: '0' }, dimensions: mm(10, 10, 10) }] })],
+  );
+  const cases = {
+    'an explicit solver selection': cartons('balanced', { solvers: ['extreme_points'] }),
+    'the exact_small profile': cartons('exact_small'),
+    'a restart budget the profile uses up': cartons('balanced', { multi_start_orders: 2, effort_budget: { max_restarts: 2 } }),
+    'one item type': oneType,
+    'differing priorities': prioritised,
+    'differing values under maximum_value': valued,
+    'a must-be-on-floor item': floorBound,
+    'a request-wide support ratio': cartons('fast', { minimum_support_ratio: 0.8 }),
+    'an item that is not a rigid cuboid': soft,
+  };
+  for (const [name, payload] of Object.entries(cases)) {
+    const result = packFallback(payload);
+    assert.equal(startIds(result).some((id) => id.startsWith('homogeneous_blocks')), false, name);
+    assert.doesNotMatch(result.algorithm.solver, /homogeneous_blocks/, name);
+    assert.deepEqual(result.alternatives, [], name);
+  }
+  // `quality` keeps its own portfolio, block solver first, exactly as before.
+  assert.deepEqual(startIds(packFallback(cartons('quality'))), [
+    blockStartId, 'extreme_points:javascript_fallback', 'maximal_spaces:javascript_fallback', 'layer:javascript_fallback',
+  ]);
+});
+
+test('the added block start joins a multi-start run once, after every ordering', () => {
+  const result = packFallback(cartons('balanced', { multi_start_orders: 3 }));
+  assert.deepEqual(startIds(result), [
+    'javascript_fallback', 'javascript_fallback:seeded_1', 'javascript_fallback:seeded_2', blockStartId,
+  ]);
+  assert.equal(result.algorithm.solver, blockStartId);
+  assert.equal(result.summary.container_count, 1);
+});
+
+test('an added block start that exhausts its effort says so', () => {
+  const payload = cartons('balanced', { effort_budget: { max_search_nodes: 1 } });
+  const result = packFallback(payload);
+  assert.deepEqual(startIds(result), ['javascript_fallback', blockStartId]);
+  assert.equal(result.termination.starts[1].truncated, true);
+  assert.equal(result.algorithm.solver, 'javascript_fallback');
+  assert.deepEqual(result.alternatives, []);
+  assert.deepEqual(validate(payload, result), []);
+});
+
+// ------------------------------------------------------------ stacking groups
+
+const twoTier = (lower, upper, rest = {}) => request(
+  [cube('lower', 100, { must_be_on_floor: true, ...lower }), cube('upper', 100, upper)],
+  [box('crate', 100, 100, 200, { quantity: 1 })], rest,
+);
+
+test('stacking groups: an accepted group rests on the lower item, an omitted one is refused', () => {
+  const lower = { stacking_group: 'A', accepts_stacking_groups: ['A', 'B'] };
+  assert.deepEqual(packedTypes(packSound(twoTier(lower, { stacking_group: 'B' }))), ['lower', 'upper']);
+  assert.deepEqual(packedTypes(packSound(twoTier(lower, { stacking_group: 'C' }))), ['lower']);
+});
+
+test('stacking groups: empty or absent lists are unconstrained, a non-empty one is closed', () => {
+  for (const accepts of [undefined, null, []]) {
+    const lower = accepts === undefined ? {} : { accepts_stacking_groups: accepts };
+    assert.deepEqual(packedTypes(packSound(twoTier(lower, {}))), ['lower', 'upper']);
+  }
+  assert.deepEqual(packedTypes(packSound(twoTier({ accepts_stacking_groups: ['A'] }, {}))), ['lower']);
+  assert.deepEqual(packedTypes(packSound(twoTier({ accepts_stacking_groups: ['B'] }, { stacking_group: 'b' }))), ['lower']);
+});
+
+test('stacking groups: non-stackable dominates a list naming the upper group', () => {
+  const lower = { stackable: false, accepts_stacking_groups: ['B'] };
+  assert.deepEqual(packedTypes(packSound(twoTier(lower, { stacking_group: 'B' }))), ['lower']);
+});
+
+test('stacking groups: every supporter of a bridging item must accept it', () => {
+  const pillar = (id, extra) => ({ id, dimensions: mm(50, 100, 100), must_be_on_floor: true, allowed_rotations: ['LWH'], ...extra });
+  const payload = (accepts) => request(
+    [pillar('left', { accepts_stacking_groups: accepts }), pillar('right', {}),
+      { id: 'wide', dimensions: mm(100, 100, 40), keep_upright: true, stacking_group: 'B' }],
+    [box('crate', 100, 100, 140, { quantity: 1 })],
+  );
+  assert.deepEqual(packedTypes(packSound(payload(['A']))), ['left', 'right']);
+  assert.deepEqual(packedTypes(packSound(payload(['B']))), ['left', 'right', 'wide']);
+});
+
+test('stacking groups: a candidate slid under a fixed item is judged by its own list', () => {
+  const payload = (accepts) => request(
+    [{ id: 'drum', dimensions: mm(100, 100, 50), stacking_group: 'C' },
+      cube('crate', 100, { accepts_stacking_groups: accepts })],
+    [box('bay', 100, 100, 150, { quantity: 1 })],
+    { fixed_placements: [{ item_type: 'drum', container_type: 'bay', orientation: 'LWH',
+      position: { x: '0', y: '0', z: '100' } }] },
+  );
+  assert.deepEqual(packedTypes(packSound(payload(['A']))), ['drum']);
+  assert.deepEqual(packedTypes(packSound(payload(['C']))), ['crate', 'drum']);
+});
+
+test('stacking groups: a nested column needs the item to accept its own group', () => {
+  const payload = (accepts) => request(
+    [{ id: 'tote', quantity: 3, dimensions: mm(10, 10, 10), nesting_height: '5', allowed_rotations: ['LWH'],
+      stacking_group: 'T', accepts_stacking_groups: accepts }],
+    [box('rack', 10, 10, 20, { quantity: 1 })],
+    { configuration: { solvers: ['extreme_points'] } },
+  );
+  assert.equal(placements(packSound(payload(['U']))).length, 1);
+  assert.equal(placements(packSound(payload(['T']))).length, 3);
+});
+
+test('stacking groups: the grid lattice caps at one layer when the type refuses its own group', () => {
+  const payload = (accepts) => request(
+    [cube('tile', 40, { quantity: 8, stacking_group: 'A', accepts_stacking_groups: accepts })],
+    [box('box', 100, 100, 100, { quantity: 1 })],
+    { configuration: { solver_profile: 'fast' } },
+  );
+  const capped = packSound(payload(['B']));
+  assert.equal(placements(capped).length, 4);
+  assert.ok(placements(capped).every((p) => p.position.z.ticks === 0));
+  assert.equal(placements(packSound(payload(['A']))).length, 8);
+});
+
+test('stacking groups: the block solver delegates and keeps the rule', () => {
+  const payload = request(
+    [{ id: 'a', dimensions: mm(100, 100, 50), allowed_rotations: ['LWH'], stacking_group: 'A', accepts_stacking_groups: ['A'] },
+      cube('b', 50, { quantity: 8, stacking_group: 'B' })],
+    [box('cube', 200, 100, 100, { quantity: 1 })],
+    { configuration: { solver_profile: 'quality', solvers: ['homogeneous_blocks'] } },
+  );
+  assert.equal(placements(packSound(payload)).length, 9);
+});
+
+test('stacking groups: rebalancing never moves an item onto a lower item that refuses it', () => {
+  const payload = request(
+    [cube('base', 100, { weight: '100', must_be_on_floor: true, accepts_stacking_groups: ['A'] }),
+      cube('drum', 100, { quantity: 2, weight: '500', stacking_group: 'C' })],
+    [box('crate', 100, 100, 200, { quantity: 2 })],
+  );
+  const original = packSound(payload);
+  const balanced = rebalanceWeight(payload, original);
+  assert.deepEqual(validate(payload, { ...original, containers: balanced.containers }), []);
+  const withBase = balanced.containers.find((c) => c.placements.some((p) => p.item_type === 'base'));
+  assert.deepEqual(withBase.placements.map((p) => p.item_type), ['base']);
 });

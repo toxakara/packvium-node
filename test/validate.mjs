@@ -252,6 +252,26 @@ function fixedPlacementIssues(request, result, lengthUnit) {
   return issues;
 }
 
+/**
+ * A flat bag reports the package its placements make, and that package passes the
+ * girth rule. Measured on the physical boxes, as the score below is: meaningful only when no
+ * clearance was configured.
+ */
+function flatBagIssues(template, container, boxes, inner) {
+  if (template.deformable_boundary == null) {
+    const soft = template.made_to_measure != null;
+    return container.achieved_dimensions != null && !soft ? ['achieved_dimensions_mismatch'] : [];
+  }
+  const [a, b, c] = bagExtent(boxes);
+  const issues = [];
+  const reported = container.achieved_dimensions == null ? null : size(container.achieved_dimensions);
+  if (reported == null || reported[0] !== a || reported[1] !== b || reported[2] !== c) issues.push('achieved_dimensions_mismatch');
+  if (a + c > inner[0] || b + c > inner[1]) issues.push('bag_girth_exceeded');
+  return issues;
+}
+
+const bagExtent = (boxes) => [0, 1, 2].map((axis) => boxes.reduce((top, box) => Math.max(top, box.at[axis] + box.size[axis]), 0));
+
 export function validate(request, result) {
   const issues = [];
   const itemsById = new Map(request.items.map((item) => [item.id, item]));
@@ -275,6 +295,7 @@ export function validate(request, result) {
     const boxes = boxesOf(container, latticeSequences);
 
     if (template.max_items != null && boxes.length > template.max_items) issues.push('max_items_exceeded');
+    issues.push(...flatBagIssues(template, container, boxes, inner));
 
     boxes.forEach((box, index) => {
       if (seen.has(box.id)) issues.push('duplicate_item');
@@ -311,8 +332,12 @@ export function validate(request, result) {
           box.at[axis] < other.at[axis] + other.size[axis] && box.at[axis] + box.size[axis] > other.at[axis]);
         if (!sharesFootprint) continue;
         const otherItem = itemsById.get(other.type);
-        if (other.at[2] + other.size[2] === box.at[2] && otherItem?.stackable === false) {
+        if (other.at[2] + other.size[2] !== box.at[2]) continue;
+        const accepts = otherItem?.accepts_stacking_groups ?? [];
+        if (otherItem?.stackable === false) {
           issues.push('non_stackable');
+        } else if (accepts.length > 0 && !accepts.includes(item.stacking_group)) {
+          issues.push('stacking_group_incompatible');
         }
       }
 
@@ -399,6 +424,19 @@ function addCharge(total, container, billedTicks) {
  *
  * @returns {number[]}
  */
+/**
+ * A container's price: its declared `cost_minor`, plus, for a box cut to measure, its
+ * material at `cost_per_square_metre_minor`, rounded up, on the reported inner size.
+ */
+function containerCost(template, inner) {
+  const fee = template?.cost_minor ?? 0;
+  const price = BigInt(template?.made_to_measure?.cost_per_square_metre_minor ?? 0);
+  if (price === 0n) return fee;
+  const [l, w, h] = inner.map(BigInt), squareMetre = 16000000n ** 2n;
+  const area = 2n * (l * w + l * h + w * h);
+  return fee + Number((price * area + squareMetre - 1n) / squareMetre);
+}
+
 export function objective(request, result) {
   const containersById = new Map(request.containers.map((container) => [container.id, container]));
   const itemsById = new Map(request.items.map((item) => [item.id, item]));
@@ -412,9 +450,9 @@ export function objective(request, result) {
   const latticeSequences = new Map();
 
   for (const container of result.containers) {
-    cost += containersById.get(container.container_type)?.cost_minor ?? 0;
-
     const inner = size(container.inner_dimensions);
+    cost += containerCost(containersById.get(container.container_type), inner);
+
     const total = volume(inner);
     const boxes = boxesOf(container, latticeSequences);
     // Occupied volume follows the shape: a hull's own volume, a compressible item's height
@@ -455,7 +493,10 @@ export function objective(request, result) {
       const lengthTicks = BigInt(LENGTH_TICKS[request.configuration.dimensional_weight_length_unit ?? 'in']);
       const weightTicks = BigInt(WEIGHT_TICKS[request.configuration.dimensional_weight_weight_unit ?? 'lb']);
       const divisor = BigInt(request.configuration.dimensional_weight_divisor);
-      const dimensional = volume(size(container.outer_dimensions)) * weightTicks
+      // A flat bag is billed on the package it conformed to.
+      const billedSize = containersById.get(container.container_type)?.deformable_boundary != null
+        ? bagExtent(boxes) : size(container.outer_dimensions);
+      const dimensional = volume(billedSize) * weightTicks
         / (lengthTicks ** 3n * divisor);
       const billed = BigInt(ticks(container.gross_weight)) > dimensional
         ? BigInt(ticks(container.gross_weight)) : dimensional;
@@ -482,6 +523,19 @@ export function objective(request, result) {
     const valueForgone = result.unpacked_items.reduce(
       (sum, item) => sum + (itemsById.get(item.item_type)?.value ?? 0), 0);
     return [standard[0], valueForgone, standard[1], standard[2], standard[3]];
+  }
+  if (selected === 'maximum_volume') {
+    // Nominal volume, from the request's own dimensions: the share left unpacked, rounded
+    // up so an incomplete answer never scores zero.
+    const nominal = (item) => volume(['length', 'width', 'height'].map(
+      (edge) => requestLengthTicks(item.dimensions[edge], lengthUnit)));
+    const requested = request.items.reduce(
+      (sum, item) => sum + nominal(item) * BigInt(item.quantity ?? 1), 0n);
+    const unpackedVolume = result.unpacked_items.reduce(
+      (sum, item) => sum + (itemsById.has(item.item_type) ? nominal(itemsById.get(item.item_type)) : 0n), 0n);
+    const unpackedPpm = requested > 0n
+      ? Number((unpackedVolume * SCORE_SCALE + requested - 1n) / requested) : 0;
+    return [unpackedPpm, standard[0], standard[1], standard[2], standard[3]];
   }
   return standard;
 }

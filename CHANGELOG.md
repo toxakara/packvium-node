@@ -4,6 +4,57 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0]
+
+Boxes cut to measure, flat bags, stacking groups and a volume-first objective in the request.
+A request that uses none of them keeps its meaning; `fast` and `balanced` may now answer better.
+
+### Added
+
+- **`made_to_measure` on a container**: an on-demand box machine (largest box, minimum, cut
+  step, board price and weight per m²); each packed box is the load's extent rounded up onto
+  the machine grid and priced as cut, reported with `achieved_dimensions`.
+- **`deformable_boundary: {kind: 'flat_bag'}` on a container**: a poly mailer that admits a load
+  when length plus thickness and width plus thickness fit.
+- **`stacking_group` and `accepts_stacking_groups` on an item**: which classes may rest directly
+  on which.
+- **`objective: 'maximum_volume'`**, ranking the volume left behind ahead of the piece count.
+- **A warning for items resting on nothing** when `minimum_support_ratio` is 0. No answer
+  changes. TypeScript types cover every new field.
+
+### Changed
+
+- **An unpacked item names the limit that left it out, the same in every engine.**
+  Where the search used to fall back to `no_feasible_placement` or `search_exhausted`, an item a
+  fresh container would take but none is left reports `container_inventory_exhausted`, and one
+  that overloads an axle wherever it stands alone reports `axle_overloaded`; both are
+  `inferred`. Code that matched the old reason for these cases must match the new one.
+- **`balanced` and `quality` try eight orderings by default**, as the other engines
+  do; `multi_start_orders` defaulted to 1. Answers can improve, and these profiles take longer:
+  on our benchmark `balanced` 2-25 times as long, `quality` 1.7-2.8 times. `fast` keeps one
+  ordering, and now ignores a larger `multi_start_orders`, as the other engines do. Set
+  `multi_start_orders: 1` for the 1.5 speed. The candidate search allocates about 80% less, so
+  eight orderings peak within about 13% of the memory one ordering took in 1.5.0.
+- **Equal-volume items are ordered longest edge first, then heavier first, as in the other engines
+,** and the layer start keeps its own order in every profile, so `quality` no longer
+  packs a simple pallet/carton/drum load worse than `balanced`.
+- **`quality` orders its beam by a `convex_hull` item's own solid**, not its box, so
+  it no longer assumes a second wedge cannot fit when it can.
+- **The container plan counts a `convex_hull` item by its own solid too**, so
+  `quality` no longer ranks a plan as if wedges that share a container each needed their own.
+- **`fast` and `balanced` add the block solver as one more start** on multi-type loads and keep
+  its answer only when strictly better.
+
+### Fixed
+
+- **`effort_budget` caps the whole request, not each start.** With several orderings or the
+  `quality` portfolio every start got the full budget, so `max_search_nodes: 5` could spend 40.
+- **A restart keeps item priority.** A shuffled ordering could put a low-priority item ahead of
+  a high-priority one; it now keeps priority, value under `maximum_value` and stop order first.
+- **Exact search with a `convex_hull` item.** It bounded a hull by its box volume: two wedges
+  that share one crate went into two, and a small order with a jar spent most of its time limit.
+  It now finishes in a handful of search nodes.
+
 ## [1.5.0]
 
 No API changes. The JavaScript engine's beam search is faster; route packing,
