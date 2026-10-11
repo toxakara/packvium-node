@@ -66,6 +66,11 @@ is a tenth of a millimetre and never `0.09999999999999999`. Every measurement in
 comes back as `{ ticks, value, unit }` -- `ticks` is the exact integer the engine reasoned
 with, `value` the same number written for a person.
 
+Support is not required by default: `minimum_support_ratio` is 0, so an item may rest on
+nothing above the container floor, and the result then says so in `warnings`
+(`unsupported_placements: N placement(s) rest on nothing above the container floor; ...`).
+To require support, set it above 0 — `configuration: { minimum_support_ratio: 0.75 }` for three quarters of the base.
+
 ## Two backends
 
 `pack()` uses a compiled native addon when one is built beside `index.js` and loads,
@@ -307,7 +312,7 @@ CodeMeta form.
 @software{packvium_node,
   author  = {{Packvium contributors}},
   title   = {Packvium for Node.js},
-  version = {1.5.0},
+  version = {1.6.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

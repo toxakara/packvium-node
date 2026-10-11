@@ -130,6 +130,16 @@ const CASES = [
   }, 'wrong_type', '/containers/0/obstacles/0/origin', 'must be an object'],
   ['an obstacle without dimensions', (r) => { r.containers[0].obstacles = [{ id: 'p' }]; }, 'missing_field',
     '/containers/0/obstacles/0/dimensions', 'is required'],
+  ['a numeric stacking group', (r) => { r.items[0].stacking_group = 7; }, 'wrong_type', '/items/0/stacking_group',
+    'must be a string'],
+  ['an empty stacking group', (r) => { r.items[0].stacking_group = ''; }, 'invalid_value', '/items/0/stacking_group',
+    'must not be empty'],
+  ['accepted groups that are not a list', (r) => { r.items[0].accepts_stacking_groups = 'A'; }, 'wrong_type',
+    '/items/0/accepts_stacking_groups', 'must be a list'],
+  ['a numeric accepted group', (r) => { r.items[0].accepts_stacking_groups = ['A', 3]; }, 'wrong_type',
+    '/items/0/accepts_stacking_groups/1', 'must be a string'],
+  ['an empty accepted group', (r) => { r.items[0].accepts_stacking_groups = ['A', '']; }, 'invalid_value',
+    '/items/0/accepts_stacking_groups/1', 'must not be empty'],
 ];
 
 for (const [name, edit, reason, field, detail] of CASES) {

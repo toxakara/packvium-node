@@ -22,9 +22,10 @@
 
 import { compareCodePoints } from './commerce-model.js';
 import { jsonSpelling } from './canonical-json.js';
+import { boxCost } from './made-to-measure.js';
 
 export const SOLVER_PROFILES = Object.freeze(['fast', 'balanced', 'quality', 'exact_small']);
-export const OBJECTIVES = Object.freeze(['default', 'lowest_cost', 'shipping_cost', 'lowest_landed_cost', 'open_dimension_height', 'maximum_value']);
+export const OBJECTIVES = Object.freeze(['default', 'lowest_cost', 'shipping_cost', 'lowest_landed_cost', 'open_dimension_height', 'maximum_value', 'maximum_volume']);
 export const ACCESS_DIRECTIONS = Object.freeze(['+x', '-x', '+y', '-y', '+z', '-z']);
 
 /** The request is not one any engine may answer. Nothing was solved. */
@@ -171,7 +172,8 @@ export function checkRequest(data, measures) {
   items.forEach((raw, index) => checkItem(raw, pointer('items', index), length, weight));
   requireUniqueIds(items, 'items');
   const containers = requiredList(request, 'containers', '');
-  containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight));
+  const lengthTicks = (value) => measures.length.parse(value, unit);
+  containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight, lengthTicks));
   requireUniqueIds(containers, 'containers');
 }
 
@@ -214,9 +216,20 @@ function checkItem(raw, where, length, weight) {
   optional(item, 'max_compression_pressure_kpa', where, atLeast(0));
   optional(item, 'minimum_support_ratio', where, requireRatio);
   optional(item, 'compression_ratio', where, requireUnbounded);
+  optional(item, 'stacking_group', where, stackingGroupName);
+  optional(item, 'accepts_stacking_groups', where, stackingGroupNames);
 }
 
-function checkContainer(raw, where, length, weight) {
+function stackingGroupName(value, field) {
+  if (typeof value !== 'string') throw new InvalidRequestError('wrong_type', field, 'must be a string');
+  if (value === '') throw new InvalidRequestError('invalid_value', field, 'must not be empty');
+}
+
+function stackingGroupNames(raw, where) {
+  requireList(raw, where).forEach((name, index) => stackingGroupName(name, where + pointer(index)));
+}
+
+function checkContainer(raw, where, length, weight, lengthTicks) {
   const container = requireObject(raw, where);
   requiredString(container, 'id', where);
   optional(container, 'quantity', where, atLeast(1));
@@ -230,6 +243,68 @@ function checkContainer(raw, where, length, weight) {
   optional(container, 'tag_limits', where, tagLimits);
   optional(container, 'rate_table', where, rateTable);
   optional(container, 'obstacles', where, (v, f) => obstacles(v, f, length));
+  optional(container, 'deformable_boundary', where, (v, f) => deformableBoundary(container, v, f, where));
+  optional(container, 'made_to_measure', where, (v, f) => madeToMeasure(container, v, f, where, { length, weight, lengthTicks }));
+}
+
+/** Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`. */
+const MADE_TO_MEASURE_FIELDS = ['cost_per_square_metre_minor', 'increment', 'minimum', 'outer_allowance',
+  'tare_per_square_metre'];
+
+/**
+ * The made-to-measure block's shape top to bottom, then each axis's four rules, then the
+ * price ceiling. Run after every other container field, so an existing error always wins. O(1).
+ */
+function madeToMeasure(container, raw, field, where, { length, weight, lengthTicks }) {
+  const machine = requireObject(raw, field);
+  requireKnownFields(machine, field, MADE_TO_MEASURE_FIELDS);
+  for (const name of ['minimum', 'increment']) required(machine, name, field);
+  for (const name of ['minimum', 'increment', 'outer_allowance']) optional(machine, name, field, (v, f) => dimensions(v, f, length));
+  optional(machine, 'cost_per_square_metre_minor', field, atLeast(0));
+  optional(machine, 'tare_per_square_metre', field, weight);
+  if (container.outer_dimensions != null) {
+    throw new InvalidRequestError('not_allowed', where + pointer('outer_dimensions'), 'cannot be combined with made_to_measure');
+  }
+  const ticks = (sides) => SIDES.map((side) => lengthTicks(sides[side]));
+  const inner = ticks(container.inner_dimensions), minimum = ticks(machine.minimum), increment = ticks(machine.increment);
+  SIDES.forEach((side, axis) => {
+    if (minimum[axis] === 0) throw new InvalidRequestError('invalid_value', field + pointer('minimum', side), 'must be positive');
+    if (increment[axis] === 0) throw new InvalidRequestError('invalid_value', field + pointer('increment', side), 'must be positive');
+    if (minimum[axis] > inner[axis]) {
+      throw new InvalidRequestError('invalid_value', field + pointer('minimum', side), 'exceeds inner_dimensions');
+    }
+    if ((inner[axis] - minimum[axis]) % increment[axis] !== 0) {
+      throw new InvalidRequestError('invalid_value', field + pointer('increment', side), 'does not divide inner_dimensions minus minimum');
+    }
+  });
+  if (boxCost(machine.cost_per_square_metre_minor ?? 0, container.cost_minor ?? 0, inner) > BigInt(MAX_EXACT_MAGNITUDE)) {
+    throw new InvalidRequestError('invalid_value', field + pointer('cost_per_square_metre_minor'),
+      `prices the largest box above ${MAX_EXACT_MAGNITUDE}`);
+  }
+}
+
+/**: the kinds `deformable_boundary` admits. */
+export const DEFORMABLE_BOUNDARY_KINDS = Object.freeze(['flat_bag']);
+/** Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md). */
+const BAG_EXCLUSIONS = Object.freeze(['obstacles', 'axles', 'access_directions', 'max_stack_density',
+  'outer_dimensions', 'void_fill_reserve_ratio', 'made_to_measure']);
+
+function deformableBoundary(container, raw, field, where) {
+  const boundary = requireObject(raw, field);
+  requireOneOf(required(boundary, 'kind', field), field + pointer('kind'), DEFORMABLE_BOUNDARY_KINDS);
+  requireKnownFields(boundary, field, ['kind']);
+  for (const name of BAG_EXCLUSIONS) {
+    if (setBesideABag(name, hasOwn(container, name) ? container[name] : null)) {
+      throw new InvalidRequestError('not_allowed', where + pointer(name), 'cannot be combined with deformable_boundary');
+    }
+  }
+}
+
+// An empty obstacle list and a zero reserve change nothing, so only they are let through.
+function setBesideABag(name, value) {
+  if (name === 'obstacles') return Array.isArray(value) && value.length > 0;
+  if (name === 'void_fill_reserve_ratio') return value != null && value > 0;
+  return value != null;
 }
 
 function accessDirections(raw, where) {
