@@ -9,12 +9,13 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+
+import { packageWithNativeStandIn } from './native-stand-in.mjs';
 
 const require = createRequire(import.meta.url);
 const { NATIVE_CANDIDATES } = require('./force-fallback.cjs');
@@ -25,29 +26,9 @@ const HOOK = path.join(HERE, 'force-fallback.cjs');
 
 const PROBE = "import {backend} from './index.js'; process.stdout.write(backend());";
 
-/**
- * A copy of the package with a resolvable `./packvium-native.node` beside it. The
- * stand-in is plain JavaScript rather than a compiled addon because `index.js` only ever
- * asks whether the module resolves and exposes `packJson` -- nothing about the block
- * depends on it being real machine code, and a real one cannot be built inside a unit
- * test. It is a *directory* of that name: a file ending in `.node` is handed to
- * `dlopen`, while a directory resolves through its `package.json` like any package.
- */
+/** A copy of the package with a fake but resolvable addon of this release beside it. */
 function packageWithAFakeNativeBackend() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'packvium-forced-fallback-'));
-  // Every module the package ships, taken from the manifest rather than listed again
-  // here: a hand-written copy silently stops being a copy of the package the day a
-  // module is added, and the probe fails to resolve an import for reasons nothing in
-  // the diff explains.
-  const shipped = JSON.parse(fs.readFileSync(path.join(PACKAGE, 'package.json'), 'utf8')).files;
-  for (const name of shipped.filter((file) => file.endsWith('.js'))) {
-    fs.copyFileSync(path.join(PACKAGE, name), path.join(root, name));
-  }
-  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ type: 'module' }));
-  const fake = path.join(root, 'packvium-native.node');
-  fs.mkdirSync(fake);
-  fs.writeFileSync(path.join(fake, 'package.json'), JSON.stringify({ main: 'index.cjs' }));
-  fs.writeFileSync(path.join(fake, 'index.cjs'), 'module.exports={packJson:(s)=>s};');
+  const root = packageWithNativeStandIn('module.exports={packJson:(s)=>s,version:()=>SUITE_VERSION};');
   fs.writeFileSync(path.join(root, 'probe.mjs'), PROBE);
   return root;
 }

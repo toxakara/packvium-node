@@ -73,3 +73,12 @@ export const commerce:{
   evaluatePolicy(document:unknown,request:unknown):CommerceResult;
   catalogVersionInfo(document:unknown,request:unknown):CommerceResult;
 };
+
+/** One way a result fails to be a sound answer to its request (docs/VALIDATION-CONTRACT.md). */
+export interface ResultIssue{code:string;detail:string}
+/** The result does not have the documented shape; `kind` says how the reference answers it. */
+export class MalformedResult extends Error{readonly kind:'contract'|'shape';constructor(message:string,kind:'contract'|'shape')}
+/** `validate` was called without the compiled addon; the fallback's validator is. */
+export class ValidatorUnavailableError extends Error{readonly code:'validator_unavailable'}
+/** The reference validator's issues, identical across packages; empty when valid. Needs the compiled addon. */
+export function validate(request:PackingRequest,result:PackingResult):ResultIssue[];

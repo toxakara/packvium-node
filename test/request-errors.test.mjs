@@ -179,8 +179,8 @@ test('an unknown objective or access direction is refused with not_allowed and i
 });
 
 test('an error the rule table does not name still reaches the caller as a request error', () => {
-  assertRefusedWith((r) => { r.items[0].nesting_height = '100'; },
-    "invalid_request: nesting_height must be at least zero and strictly less than the item's own height");
+  assertRefusedWith((r) => { r.containers[0].rate_table = { weight_brackets_g: [5000, 1000], prices_minor: [500, 900] }; },
+    'invalid_request: rate_table weight_brackets_g must be strictly ascending');
 });
 
 function assertRefusedWith(edit, message) {
@@ -221,4 +221,63 @@ test('the native backend gets the same InvalidRequestError, and only well-formed
   assert.equal(calls.length, 0);
   assert.equal(root.packJsonWith(binding, JSON.stringify(base())), '{"native":true}');
   assert.equal(calls.length, 1);
+});
+
+test('a value outside any schema enum is not_allowed at its own pointer', () => {
+  const rotations = '["LWH","LHW","WLH","WHL","HLW","HWL"]';
+  const lengths = '["mm","cm","m","in","ft"]', weights = '["mg","g","kg","oz","lb"]';
+  const cases = [
+    [(r) => { r.items[0].allowed_rotations = ['LWH', 'XYZ']; }, '/items/0/allowed_rotations/1', rotations],
+    [(r) => { r.items[0].ground_contact_rule = 'floating'; }, '/items/0/ground_contact_rule',
+      '["free","covered","single","multiple"]'],
+    [(r) => { r.items[0].shape_type = 'sphere'; }, '/items/0/shape_type', '["rigid_cuboid","convex_hull","compressible"]'],
+    [(r) => { r.configuration.solvers = ['grid', 'simplex']; }, '/configuration/solvers/1',
+      '["grid","extreme_points","homogeneous_blocks","layer","maximal_spaces","exact_small"]'],
+    [(r) => { r.configuration.dimensional_weight_length_unit = 'furlong'; },
+      '/configuration/dimensional_weight_length_unit', lengths],
+    [(r) => { r.configuration.dimensional_weight_weight_unit = 'stone'; },
+      '/configuration/dimensional_weight_weight_unit', weights],
+    [(r) => { r.output = { length_unit: 'furlong' }; }, '/output/length_unit', lengths],
+    [(r) => { r.output = { weight_unit: 'stone' }; }, '/output/weight_unit', weights],
+  ];
+  for (const [edit, field, allowed] of cases) assertRefused(edit, 'not_allowed', field, `must be one of ${allowed}`);
+  assertRefused((r) => { r.items[0].allowed_rotations = 'LWH'; }, 'wrong_type', '/items/0/allowed_rotations', 'must be a list');
+  assertRefused((r) => { r.output = 'mm'; }, 'wrong_type', '/output', 'must be an object');
+});
+
+test('a fixed placement orientation outside the six codes names them as a requirement', () => {
+  const error = refusalOf((r) => {
+    r.fixed_placements = [{ item_type: 'cube', container_type: 'box', orientation: 'XYZ' }];
+  });
+  assert.ok(error instanceof FixedPlacementError, `${error.name}: ${error.message}`);
+  assert.deepEqual([error.reason, error.field, error.message], ['malformed', '/fixed_placements/0/orientation',
+    'invalid_fixed_placement: fixed_placements[0].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]']);
+});
+
+test('a nesting height not below the item height is refused at its pointer', () => {
+  for (const nesting of ['100', { value: '11', unit: 'cm' }]) {
+    assertRefused((r) => { r.items[0].nesting_height = nesting; }, 'invalid_value', '/items/0/nesting_height',
+      "must be less than the item's height");
+  }
+});
+
+test('a unit code is matched ignoring surrounding space at every measure, as in Python', () => {
+  const request = base();
+  request.units = { length: ' in ' };
+  request.items[0].weight = { value: '1', unit: ' KG ' };
+  request.items[0].dimensions.length = { value: '1', unit: ' ft ' };
+  const result = packFallback(request);
+  assert.equal(result.containers[0].inner_dimensions.length.unit, 'in');
+  assert.equal(result.containers[0].inner_dimensions.length.ticks, 200 * 406_400);
+  assert.equal(result.containers[0].payload_weight.value, '2000');
+  const { length, width, height } = result.containers[0].placements[0].dimensions;
+  assert.ok([length, width, height].some((measure) => measure.ticks === 12 * 406_400));
+});
+
+test('without an output block the result is in the request unit spelt as its code', () => {
+  for (const [unit, code] of [['cm', 'cm'], ['MM', 'mm'], ['IN', 'in'], ['Inches', 'in'], ['millimeter', 'mm'], ['tick', 'mm']]) {
+    const request = base();
+    request.units = { length: unit };
+    assert.equal(packFallback(request).containers[0].inner_dimensions.length.unit, code, unit);
+  }
 });

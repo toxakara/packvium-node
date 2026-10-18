@@ -23,8 +23,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Module from 'node:module';
 
-/** Reshaped per case; `index.js` reads its entry points at call time, not at load time. */
-const stub = {};
+import { SUITE_VERSION } from '../artifacts.js';
+
+/**
+ * Reshaped per case; `index.js` reads its entry points at call time, not at load time. The
+ * one thing it reads at load time is `version()`: an addon from another release is not used
+ * at all, so the stub reports this one and every case keeps it.
+ */
+const version = () => SUITE_VERSION;
+const stub = { version };
 
 const previousLoad = Module._load;
 Module._load = function loadWithStubbedNativeBackend(request, parent, isMain) {
@@ -40,7 +47,7 @@ const REQUEST = { marker: 'probe' };
 /** @param {Record<string, unknown>} entries what this case's addon exports */
 function addon(entries) {
   for (const key of Object.keys(stub)) delete stub[key];
-  Object.assign(stub, entries);
+  Object.assign(stub, { version }, entries);
 }
 
 test('each commerce function reaches its own native entry point', () => {

@@ -154,6 +154,31 @@ A request that is valid but does not fit completely is not an error: the result 
 left out, and why, in `unpacked_items`. [`examples/errors.mjs`](examples/errors.mjs) walks every
 case above.
 
+## Checking a result
+
+*New in 1.7.0.*
+
+`validate(request, result)` checks a result against the request it answers, from the JSON alone:
+geometry, support and load, accounting, the result's facts and its score. It is the same
+reference validator every Packvium package exports, so it returns the same list.
+
+The validator runs only in the compiled native addon, and the published package does not ship
+one yet, so after a plain `npm install` `validate` throws `ValidatorUnavailableError` (code
+`validator_unavailable`) instead of answering. The JavaScript fallback's validator is planned
+for 1.8. Check `backend()` first:
+
+```js
+import { MalformedResult, backend, pack, validate } from '@packvium/engine';
+
+if (backend() === 'rust') {
+  const issues = validate(request, pack(request)); // [] -- valid
+  // [{ code: 'collision', detail: 'cube#1 with cube#2 in box#1' }] for two boxes in one place
+}
+```
+
+It judges any engine's result, not only this package's. A result without the documented shape
+throws `MalformedResult`, whose `kind` is `contract` or `shape`.
+
 ## Quotes, policy and catalog versions
 
 `commerce` has three functions, all deterministic and all over one document you supply —
@@ -207,7 +232,7 @@ and execute without a project around it, and each prints what it teaches.
 | File | What it shows |
 | --- | --- |
 | [`basic.mjs`](examples/basic.mjs) | Pack an order, read placements, and see why an item was refused. |
-| [`objectives.mjs`](examples/objectives.mjs) | All six objectives on scenes where they genuinely disagree about which container to open. |
+| [`objectives.mjs`](examples/objectives.mjs) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree about which container to open. |
 | [`constraints.mjs`](examples/constraints.mjs) | Rotations and `keep_upright`, support ratio, top load, stacking caps, incompatible tags and atomic groups — each with and without the rule — and `explainUnpackedItem` turning a refusal into a sentence. |
 | [`limits.mjs`](examples/limits.mjs) | Wheel arches as `obstacles` with `additional_boxes`, `max_items` and `tag_limits` per container, and what happens when container stock or `max_containers` runs out. |
 | [`trucking.mjs`](examples/trucking.mjs) | A multi-drop van: `stop_index` and a rear door in `access_directions`, two `axles` with load limits, and a safe loading order fed into `buildExecutionPlan`. |
@@ -229,7 +254,7 @@ node examples/basic.mjs
 
 ## Subpath modules
 
-The main entry point has packing, sequencing, explanations, rebalancing and `commerce`. Four
+The main entry point has packing, sequencing, explanations, rebalancing and `commerce`. Five
 more modules are separate imports, so an application that only packs never loads them:
 
 ```js
@@ -237,12 +262,19 @@ import { buildExecutionPlan, canonicalPlanJson } from '@packvium/engine/executio
 import { buildOperationalArtifact, canonicalArtifactJson } from '@packvium/engine/artifacts.js';
 import { exportCsv, exportJson, exportWorkOrderHtml } from '@packvium/engine/artifact-exports.js';
 import { deriveRevision, rootRevision, verifyRevisionChain } from '@packvium/engine/revisions.js';
+import { artifactToScene, resultToScenes, sceneItemId } from '@packvium/engine/scene.js';
 ```
 
 `execution.js` turns a result into numbered work-order steps. It never computes a loading order
 itself: pass one from `safeLoadingOrder()` as `loadingOrders`, or the plan says its order is
 `unavailable` rather than guessing. `artifacts.js` and `artifact-exports.js` package a result for a
 system with no engine; `revisions.js` records changes against an approved plan.
+`scene.js` turns a result into one drawable scene per container
+(`packvium-visualization-scene/v1`): every length an exact tick string beside a display-only `mm`
+value, items already rotated, each id spelled from the placement's type, position and orientation. `resultToScenes(request, result)`
+returns them all; `artifactToScene(artifact, index)` reads one from an operational artifact, with a
+loading sequence when the artifact's plan carries one. `sceneItemId(reference)` spells a plan
+step's placement the way its scene item is named, to match one to the other.
 
 ## Features
 
@@ -281,7 +313,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.0"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.7"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -312,7 +344,7 @@ CodeMeta form.
 @software{packvium_node,
   author  = {{Packvium contributors}},
   title   = {Packvium for Node.js},
-  version = {1.6.0},
+  version = {1.7.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

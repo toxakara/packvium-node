@@ -202,7 +202,7 @@ const MALFORMED_EVENTS = [
   [[{ sequence: 1, type: 'item_missing', item_type: 'cube', quantity: 0 }], 'item_missing.quantity is a positive integer'],
   [[{ sequence: true, type: 'item_missing', item_type: 'cube', quantity: 1 }], 'event sequence true does not continue the chain at 1'],
   [[{ sequence: 1, type: 'placement_locked', placement: { ...locked().placement, orientation: 'XYZ' } }],
-    'placement.orientation is one of the six codes'],
+    'placement.orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]'],
   [[{ sequence: 1, type: 'placement_locked', placement: { ...locked().placement, container_instance: 0 } }],
     'placement.container_instance counts from 1'],
   [['item_missing'], 'an event is a JSON object'],

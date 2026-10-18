@@ -100,3 +100,37 @@ test('usedVolume over nesting placements alone equals the every-pair scan', () =
     assert.equal(usedVolume(placements), everyPairVolume(placements));
   }
 });
+
+// --------------------------------------------------------------------------------
+
+test('six-place ratios round an exact half to even, from the exact fraction (S13)', async () => {
+  const { __ratiosForTests: { sixPlaces, doubleFraction } } = await import('../fallback.js');
+  assert.equal(sixPlaces(1, 128), '0.007812');       // 0.0078125: toFixed gives 0.007813
+  assert.equal(sixPlaces(3, 128), '0.023438');       // 0.0234375: the half rounds up to even
+  assert.equal(sixPlaces(1, 1), '1.000000');
+  assert.equal(sixPlaces(0, 7), '0.000000');
+  assert.equal(sixPlaces(2, 3), '0.666667');
+  // Past 2^53 a Number division is already wrong in the sixth place; the fraction is not.
+  const huge = 2n ** 60n;
+  assert.equal(sixPlaces(huge - 1n, huge), '1.000000');
+  assert.equal(sixPlaces(huge / 3n, huge), '0.333333');
+  const equals = ([numerator, denominator], [n, d]) => numerator * d === n * denominator;
+  assert.ok(equals(doubleFraction(0.0078125), [1n, 128n]));
+  assert.ok(equals(doubleFraction(3), [3n, 1n]));
+  assert.ok(equals(doubleFraction(0), [0n, 1n]));
+  assert.equal(sixPlaces(...doubleFraction(0.0078125)), '0.007812');
+  assert.equal(sixPlaces(...doubleFraction(0.1)), (0.1).toFixed(6));
+  assert.ok(equals(doubleFraction(Number.MIN_VALUE), [1n, 2n ** 1074n]));
+});
+
+test('support_ratio and volume_utilization are written half to even (S13)', async () => {
+  const { packFallback } = await import('../fallback.js');
+  const mm = (side) => ({ length: side, width: side, height: side });
+  // 1 / 128 of the box: a utilization of exactly 0.0078125.
+  const result = packFallback({
+    units: { length: 'mm' }, configuration: { solver_profile: 'fast' },
+    items: [{ id: 'cube', dimensions: mm('10') }],
+    containers: [{ id: 'box', quantity: 1, inner_dimensions: { length: '80', width: '40', height: '40' } }],
+  });
+  assert.equal(result.containers[0].volume_utilization, '0.007812');
+});

@@ -252,7 +252,7 @@ function validatePlacement(event) {
   requireName(get(placement, 'item_type'), 'placement.item_type');
   requireName(get(placement, 'container_type'), 'placement.container_type');
   if (!ORIENTATIONS.includes(get(placement, 'orientation'))) {
-    throw new PlanRevisionError('invalid_event', 'placement.orientation is one of the six codes');
+    throw new PlanRevisionError('invalid_event', `placement.orientation must be one of ${jsonSpelling(ORIENTATIONS)}`);
   }
   const instance = jsonInteger(hasOwn(placement, 'container_instance') ? placement.container_instance : 1);
   if (instance === null || instance < 1) {

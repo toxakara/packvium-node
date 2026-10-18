@@ -4,6 +4,59 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0]
+
+A validator and a scene converter join the package, `quality` looks ahead in its block solver,
+and the JavaScript `quality` beam does the same search for about a third of the work. No request
+or result field changes.
+
+### Added
+
+- **`validate(request, result)`, `MalformedResult` and `ValidatorUnavailableError`.** The
+  reference validator: a list of issues (`code`, `detail`), empty when the result is valid, and
+  `MalformedResult` for a result of the wrong shape. It needs the compiled addon; without it,
+  `validate` throws `ValidatorUnavailableError` (`code: 'validator_unavailable'`) until the
+  JavaScript engine's own port lands.
+- **`@packvium/engine/scene.js`**: `resultToScenes(request, result)` returns one
+  `packvium-visualization-scene/v1` per packed container; `artifactToScene(artifact, index)` and
+  `sceneItemId` build one from an operational artifact. TypeScript types included.
+
+### Changed
+
+- **Every schema enum value is refused as `not_allowed`.** A value outside its list in
+  `allowed_rotations`, the output and dimensional-weight units, `shape_type`,
+  `ground_contact_rule` or `configuration.solvers` throws `InvalidRequestError` with reason
+  `not_allowed` at its JSON Pointer, where the JavaScript engine threw a `TypeError`. **`ticks`
+  as an output unit is now refused**; the schema never listed it.
+- **`quality` looks ahead in the block solver.** Each round completes its leading
+  blocks greedily and commits the best, so the answer is never worse than the greedy pass. On
+  our benchmark 87 of 89 answers improved and none got worse. Under a tight effort budget the
+  block start can now report `truncated` / `effort_limit`. `fast` and `balanced` are unchanged.
+- **`quality` does the same search for less.** On our 11 pinned instances it takes 37%
+  of 1.6.0's CPU, `balanced` 95% and `fast` 99%, with byte-identical output on every
+  conformance fixture.
+- **Candidates are ranked by a lexicographic key**, far corner z, y, x, then origin and
+  rotation; on hull fixtures 10 equal-score layouts changed.
+- **A start that repeats another's item-type order runs a neighbouring order instead**,
+  kept only on a strict win; its record id ends in `+swap-N`. No measured answer changed.
+- **Axle-balanced candidate points are offered as a last resort.** On the conformance
+  and benchmark requests one answer improved and none got worse; on a synthetic axle corpus of
+  120 requests 27 improved and 4 got worse.
+- **`no_eligible_container` is reported `proven`, and `insufficient_support` is reported**
+  (`observed`) where the support rule is the only blocker.
+- **A `nesting_height` not below the item's height is refused as `invalid_value`**, and padded
+  unit codes such as `' in '` are accepted, as the native addon accepts them.
+
+### Fixed
+
+- **Native-addon errors carry `code`, `reason` and `field`** and are thrown as the same classes
+  the JavaScript engine throws; they were a plain `Error`.
+- **`rebalanceWeight`'s `maxMoves` outside `0..=4294967295` is refused** on both backends, not
+  wrapped into range.
+- **An addon of another release is ignored** and the JavaScript engine answers.
+- **`volume_utilization` and `support_ratio` round half-even exactly**, the support ratio is
+  converted one way everywhere, and the default clock is monotonic.
+
 ## [1.6.0]
 
 Boxes cut to measure, flat bags, stacking groups and a volume-first objective in the request.

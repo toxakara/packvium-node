@@ -76,3 +76,10 @@ test('a single restart packs worse than the full portfolio', () => {
   assert.equal(unpacked(1), 4);
   assert.equal(unpacked(null), 3);
 });
+
+test('an item no container tags admit is proven unplaceable', () => {
+  const result = solve([cube('cold-item', 1, '10', { eligible_container_tags: ['cold'] }), cube('dry-item', 1)],
+    [box('20', '20', '20', { tags: ['dry'] })]);
+  assert.deepEqual(reasons(result), [['no_eligible_container', 'proven']]);
+  assert.equal(result.summary.packed_item_count, 1);
+});
