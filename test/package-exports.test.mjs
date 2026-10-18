@@ -57,6 +57,14 @@ test('plan revisions resolve by package name', async () => {
   assert.equal(revisions.FORMAT, 'packvium-plan-revision/v1');
 });
 
+test('visualization scenes resolve by package name', async () => {
+  const scene = await import(`${manifest.name}/scene.js`);
+  for (const name of ['resultToScenes', 'artifactToScene']) {
+    assert.equal(typeof scene[name], 'function', name);
+  }
+  assert.equal(scene.SCENE_FORMAT, 'packvium-visualization-scene/v1');
+});
+
 test('a module an export imports is published even when it is not exported itself', () => {
   // `canonical-json.js` is internal: absent from `exports` on purpose, but `artifacts.js` and
   // `execution.js` import it, so a tarball without it would break both at load time.

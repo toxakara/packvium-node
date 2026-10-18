@@ -224,8 +224,8 @@ const SHAPES = [
   ['a missing key', [{ item_type: 'cube' }], 'fixed_placements[0] needs ["container_type","orientation"]', '/fixed_placements/0'],
   ['an empty item type', [{ ...entry(), item_type: '' }], 'fixed_placements[0].item_type is a non-empty string', '/fixed_placements/0/item_type'],
   ['a numeric container type', [{ ...entry(), container_type: 5 }], 'fixed_placements[0].container_type is a non-empty string', '/fixed_placements/0/container_type'],
-  ['an unknown orientation', [{ ...entry(), orientation: 'XYZ' }], 'fixed_placements[0].orientation is one of the six codes', '/fixed_placements/0/orientation'],
-  ['an orientation in a list', [{ ...entry(), orientation: ['LWH'] }], 'fixed_placements[0].orientation is one of the six codes', '/fixed_placements/0/orientation'],
+  ['an unknown orientation', [{ ...entry(), orientation: 'XYZ' }], 'fixed_placements[0].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]', '/fixed_placements/0/orientation'],
+  ['an orientation in a list', [{ ...entry(), orientation: ['LWH'] }], 'fixed_placements[0].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]', '/fixed_placements/0/orientation'],
   ['a text instance', [{ ...entry(), container_instance: '1' }], 'fixed_placements[0].container_instance counts from 1', '/fixed_placements/0/container_instance'],
   ['a boolean instance', [{ ...entry(), container_instance: true }], 'fixed_placements[0].container_instance counts from 1', '/fixed_placements/0/container_instance'],
   ['a fractional instance', [{ ...entry(), container_instance: 1.5 }], 'fixed_placements[0].container_instance counts from 1', '/fixed_placements/0/container_instance'],
@@ -243,7 +243,7 @@ const SHAPES = [
     'fixed_placements[0].position.y is a measure', '/fixed_placements/0/position/y'],
   ['a negative coordinate', [{ ...entry(), position: { x: '100', z: '-1' } }], 'fixed_placements[0].position.z cannot be negative',
     '/fixed_placements/0/position/z'],
-  ['a later entry', [entry(), { ...entry(), orientation: 'lwh' }], 'fixed_placements[1].orientation is one of the six codes', '/fixed_placements/1/orientation'],
+  ['a later entry', [entry(), { ...entry(), orientation: 'lwh' }], 'fixed_placements[1].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]', '/fixed_placements/1/orientation'],
 ];
 
 for (const [name, placements, detail, field] of SHAPES) {

@@ -7,7 +7,7 @@ import {
   BoundOverflowError, __spatialIndexForTests, __inspectHullShapeForTests, __objectiveBoundsForTests,
   __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
   InvalidRequestError, explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
-  verifyLoadingPrefixBusinessRules,
+  verifyLoadingPrefixBusinessRules, __ratiosForTests, __planBeamForTests,
 } from '../fallback.js';
 import { objective as recomputeObjective, validate } from './validate.mjs';
 
@@ -51,6 +51,27 @@ test('bounded candidate retention equals the stable full-sort prefix', () => {
     }
   }
 });
+
+// Mirrors Rust's `far_corner_y_outranks_any_x_on_a_long_container`. Past the
+// sheet, the tile's far corner is half a millimetre deeper in y at x=0 than at x=12 m; a
+// weighted `y2 * 1e4 + x2` let the 12 m of x outweigh that step, the lexicographic key does not.
+for (const profile of ['fast', 'balanced', 'quality']) {
+  test(`far-corner y outranks any x on a long container (${profile})`, () => {
+    const result = packFallback({
+      configuration: { solver_profile: profile },
+      items: [
+        { id: 'sheet', quantity: 1, dimensions: { length: '12000', width: '0.5', height: '100' }, allowed_rotations: ['LWH'] },
+        { id: 'tile', quantity: 1, dimensions: { length: '400', width: '999', height: '100' }, allowed_rotations: ['LWH'] },
+      ],
+      containers: [{ id: 'long', quantity: 1, inner_dimensions: { length: '12400', width: '1000', height: '100' } }],
+      fixed_placements: [{ item_type: 'sheet', container_type: 'long', container_instance: 1,
+        position: { x: '0', y: '0', z: '0' }, orientation: 'LWH' }],
+    });
+    const tile = result.containers.flatMap((container) => container.placements)
+      .find((placement) => placement.item_id.startsWith('tile'));
+    assert.deepEqual([tile.position.x.value, tile.position.y.value, tile.position.z.value], ['12000', '0', '0']);
+  });
+}
 
 test('group batching preserves first occurrence and member order', () => {
   const items = ['00', null, '0', '00', '1', '0', null, '1']
@@ -278,7 +299,7 @@ test('explicit solver selection is reported honestly', () => {
     () => packFallback(request([cube('a', 50)], [box('c')], {
       configuration: { solvers: ['unknown'] },
     })),
-    /unknown solver/,
+    /\/configuration\/solvers\/0: must be one of/,
   );
 });
 
@@ -344,7 +365,7 @@ test('a nesting item on a route is held to stop order against the whole column',
       cube('early', 10, { quantity: 2, stop_index: 1, allowed_rotations: ['LWH'] }),
     ],
     [box('bin', 10, 10, 30, { quantity: 1 })],
-    { configuration: { time_limit_ms: 60_000 } },
+    { configuration: { multi_start_orders: 1, time_limit_ms: 60_000 } },
   );
   const blocked = packSound(reversed);
   assert.deepEqual(placements(blocked).map(placement => placement.item_id), ['cup#1', 'cup#2', 'cup#3']);
@@ -380,6 +401,26 @@ test('axle reactions use gross load and include centred tare', () => {
   const reaction = result.containers[0].axle_reactions;
   assert.equal(reaction.basis, 'gross');
   assert.equal(reaction.front_numerator, reaction.rear_numerator);
+});
+
+test('an item only an axle limit places floats on the floor at that limit, as in Python', () => {
+  // Alone, the heavy item overloads the front axle flush against the front wall and is legal
+  // only from x = 42.857 mm, which touches no wall and no box. Every other candidate point is
+  // flush against one, so without the axle-balanced points it was left unpacked; one start,
+  // so no shuffle can stand in for the missing candidate.
+  const slab = { dimensions: mm(200, 100, 100), allowed_rotations: ['LWH'] };
+  const result = packSound(request(
+    [{ id: 'light', quantity: 3, weight: '100 g', ...slab }, { id: 'heavy', weight: '700 g', ...slab }],
+    [box('truck', 2000, 100, 100, {
+      axles: [{ position: '0', max_load: '650 g' }, { position: '2000', max_load: '650 g' }],
+    })],
+    { configuration: { time_limit_ms: 60_000, multi_start_orders: 1 } },
+  ));
+  assert.deepEqual(result.unpacked_items, []);
+  assert.deepEqual(placements(result).map((placement) => [placement.item_id, at(placement)]), [
+    ['heavy#1', [685_715, 0, 0]],
+    ['light#1', [0, 0, 0]], ['light#2', [200 * MM, 0, 0]], ['light#3', [400 * MM, 0, 0]],
+  ]);
 });
 
 test('nesting height fits an extra layer and removes double-counted volume', () => {
@@ -789,8 +830,7 @@ test('top-load shares use exact integer multiplication at the safe-number bounda
   });
   const payload = (leftLimit) => ({
     units: { length: 'ticks' },
-    output: { length_unit: 'ticks', weight_unit: 'ticks' },
-    configuration: { max_containers: 1, time_limit_ms: 60_000 },
+    configuration: { max_containers: 1, multi_start_orders: 1, time_limit_ms: 60_000 },
     items: [
       {
         id: 'left', priority: 3, must_be_on_floor: true,
@@ -836,7 +876,9 @@ test('cumulative top load stays exact beyond the safe-number boundary', () => {
     ],
     [box('column', 10, 10, 30)],
     {
-      output: { weight_unit: 'ticks' },
+      // `ticks` is no output unit the schema names; a milligram is 8000 ticks, so
+      // 2^53 + 1 ticks is an exact decimal no Number division could write.
+      output: { weight_unit: 'mg' },
       configuration: { solvers: ['extreme_points'], max_containers: 1, time_limit_ms: 60_000 },
     },
   );
@@ -853,7 +895,7 @@ test('cumulative top load stays exact beyond the safe-number boundary', () => {
   const reported = packFallback(payload(null));
   const bottom = placements(reported).find(placement => placement.item_type === 'bottom');
   assert.equal(bottom.top_load.ticks, boundary);
-  assert.equal(bottom.top_load.value, '9007199254740993');
+  assert.equal(bottom.top_load.value, '1125899906842.624125');
   assert.doesNotThrow(() => JSON.stringify(reported));
 });
 
@@ -890,6 +932,7 @@ test('a high-priority item leads the ordering', () => {
   const result = packSound(request(
     [cube('big', 100), cube('small', 10, { priority: 5 })],
     [box('box', 100, 100, 100, { quantity: 1 })],
+    { configuration: { multi_start_orders: 1 } },
   ));
   assert.deepEqual(placements(result).map((p) => p.item_id), ['small#1']);
 });
@@ -2569,7 +2612,9 @@ test('explicit solvers retain every nested restart record and honour max_restart
   // The first cartesian-portfolio implementation executed every run, but the outer
   // solver loop collapsed each solver's restarts to one synthetic record. It also
   // ignored max_restarts, unlike Python, PHP and Rust. Four is a total portfolio cap:
-  // three exact-small orders followed by the first extreme-point order.
+  // three exact-small orders followed by the first extreme-point order. The third
+  // exact-small shuffle repeats an earlier item order, so its start runs a neighbour of
+  // the first order instead.
   const result = packFallback(request(
     [cube('a', 30), cube('b', 25), cube('c', 20)],
     [box('box', 60, 50, 40, { quantity: 2 })],
@@ -2586,7 +2631,7 @@ test('explicit solvers retain every nested restart record and honour max_restart
     [
       'exact_small:javascript_fallback',
       'exact_small:javascript_fallback:seeded_1',
-      'exact_small:javascript_fallback:seeded_2',
+      'exact_small:javascript_fallback+swap-0',
       'extreme_points:javascript_fallback',
     ],
   );
@@ -2614,6 +2659,52 @@ test('all restarts share one absolute deadline and preserve unstarted records', 
   assert.equal(result.algorithm.solver, 'javascript_fallback');
   assert.equal(result.termination.global_deadline_reached, true);
   assert.equal(result.termination.code, 'time_limit');
+});
+
+// The shared conformance fixture `regression-stacking-under`, verbatim.
+const stackingUnderRequest = {
+  units: { length: 'mm' },
+  configuration: {
+    solver_profile: 'balanced', time_limit_ms: 300000, clearance: '2', minimum_support_ratio: 0.5,
+    effort_budget: { max_candidates_evaluated: 1000000, max_placement_attempts: 1000000, max_search_nodes: 1000000 },
+  },
+  items: [
+    { id: 'wide', quantity: 2, dimensions: { length: '83', width: '75', height: '54' },
+      weight: { value: '473', unit: 'g' }, stackable: false },
+    { id: 'tall', quantity: 2, dimensions: { length: '56', width: '24', height: '68' },
+      weight: { value: '271', unit: 'g' }, group: 'a' },
+    { id: 'small', dimensions: { length: '45', width: '24', height: '33' },
+      weight: { value: '479', unit: 'g' }, stackable: false, minimum_support_ratio: 0.75 },
+  ],
+  containers: [
+    { id: 'tallbox', inner_dimensions: { length: '100', width: '136', height: '203' }, quantity: 2, cost_minor: 390 },
+    { id: 'widebox', inner_dimensions: { length: '100', width: '148', height: '136' }, cost_minor: 74 },
+  ],
+};
+
+test('a start never repeats an earlier start\'s item-type order', () => {
+  // On two items, starts 1, 2, 3 repeat start 0's order, so none of seeded_1..3 runs;
+  // freed starts run an adjacent-swap neighbour instead.
+  const twoItems = packFallback(request(
+    [cube('a', 30), cube('b', 25)],
+    [box('box', 60, 50, 40)],
+    { configuration: { multi_start_orders: 4, time_limit_ms: 60_000, seed: 42 } },
+  ));
+  assert.ok(!twoItems.termination.starts.some((start) => start.id.startsWith('javascript_fallback:seeded_')));
+  assert.equal(twoItems.algorithm.solver, 'javascript_fallback');
+
+  // Conformance `regression-stacking-under`, inlined so the published package, which ships
+  // no conformance tree, runs the same check: the sixth start repeats an earlier order, so
+  // its start runs the first order with its second and third items swapped. That neighbour
+  // does not strictly beat the fifth start's answer, so the fifth start keeps it.
+  const result = packFallback(stackingUnderRequest);
+  const ids = result.termination.starts.map((start) => start.id);
+  assert.deepEqual(ids, [
+    'javascript_fallback', 'javascript_fallback:seeded_1', 'javascript_fallback:seeded_2', 'javascript_fallback:seeded_3',
+    'javascript_fallback:seeded_4', 'javascript_fallback:seeded_6', 'javascript_fallback:seeded_7', 'javascript_fallback+swap-1',
+  ]);
+  assert.equal(result.algorithm.solver, 'javascript_fallback:seeded_4');
+  assert.deepEqual(result.score, [0, 1, 74, 557470, 992647]);
 });
 
 test('restart orderings are a pure function of the seed', () => {
@@ -2677,16 +2768,28 @@ test('homogeneous-block search falls back for placement-distinguishing rules', (
   assert.deepEqual(validate(payload, result), []);
 });
 
-// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate: the base ends on two tops
-// and overhangs them.
+// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate. The greedy block pass, which
+// `balanced` runs, ends the base on two tops so that it overhangs them; `quality`'s lookahead
+// finds a layout with nothing overhanging.
 const aBaseAndThreeTops = (configuration = {}) => request(
   [{ id: 'base', dimensions: mm(60, 60, 40) }, { id: 'top', quantity: 3, dimensions: mm(40, 60, 50) }],
   [box('crate', 100, 100, 100, { quantity: 1 })],
   { configuration: {
-    solver_profile: 'quality', solvers: ['homogeneous_blocks'], time_limit_ms: 60_000,
-    effort_budget: { max_search_nodes: 100_000 }, ...configuration,
+    solver_profile: 'balanced', solvers: ['homogeneous_blocks'], container_plan_node_limit: 100_000,
+    time_limit_ms: 60_000, effort_budget: { max_search_nodes: 100_000 }, ...configuration,
   } },
 );
+
+test('the quality lookahead finds a layout with nothing overhanging', () => {
+  const greedy = packFallback(aBaseAndThreeTops());
+  const payload = aBaseAndThreeTops({ solver_profile: 'quality' });
+  const result = packFallback(payload);
+  const all = placements(result);
+  assert.equal(all.length, 4);
+  assert.ok(all.every((placement) => restingShare(all, placement) === 1));
+  assert.notDeepEqual(result.score, greedy.score);
+  assert.deepEqual(validate(payload, result), []);
+});
 
 // The share of a placement's base on the floor or on a top face, from geometry alone.
 function restingShare(all, placement) {
@@ -3014,4 +3117,64 @@ test('stacking groups: rebalancing never moves an item onto a lower item that re
   assert.deepEqual(validate(payload, { ...original, containers: balanced.containers }), []);
   const withBase = balanced.containers.find((c) => c.placements.some((p) => p.item_type === 'base'));
   assert.deepEqual(withBase.placements.map((p) => p.item_type), ['base']);
+});
+
+// --------------------------------------------------------------------------------
+
+test('every support ratio crosses into ppm by one rule (S11)', () => {
+  const { scaledRatio, supportPpm } = __ratiosForTests;
+  // floor(r * 1e6 + 0.5), Python's `scaled_ratio`, for support, reserve and compression alike.
+  assert.equal(scaledRatio(0.5), 500_000);
+  assert.equal(scaledRatio(0.0000015), 2);
+  // A positive ratio never becomes "no support required", on any path.
+  assert.equal(supportPpm(0), 0);
+  assert.equal(supportPpm(0.0000001), 1);
+  assert.equal(supportPpm(0.75), 750_000);
+});
+
+test('a per-item support ratio below one ppm demands contact, as the global one does (S11)', () => {
+  const payload = request([
+    { id: 'i0', dimensions: mm(72, 37, 50), minimum_support_ratio: 0.0000001 },
+    { id: 'i1', dimensions: mm(65, 42, 36), minimum_support_ratio: 0.0000001 },
+    { id: 'i2', dimensions: mm(23, 89, 64), minimum_support_ratio: 0.0000001 },
+    { id: 'i3', dimensions: mm(38, 85, 23), minimum_support_ratio: 0.0000001 },
+  ], [box('box', 100, 100, 100, { quantity: 1 })], {
+    configuration: { solver_profile: 'balanced' },
+  });
+  const all = placements(packFallback(payload));
+  assert.ok(all.every((placement) => placement.position.z.ticks === 0 || Number(placement.support_ratio) > 0));
+});
+
+test('the default deadline reads a monotonic clock, and the clock stays injectable (S15)', () => {
+  const realNow = Date.now;
+  try {
+    // A wall clock stepped back an hour must not stretch the deadline.
+    let wall = realNow();
+    Date.now = () => { wall -= 3_600_000; return wall; };
+    const deadline = new Deadline(50);
+    assert.ok(deadline.elapsedMs() >= 0);
+    assert.ok(deadline.elapsedMs() < 3_600_000);
+  } finally {
+    Date.now = realNow;
+  }
+  let now = 1_000;
+  const driven = new Deadline(10, () => now);
+  now += 25;
+  assert.equal(driven.elapsedMs(), 25);
+});
+
+test('plan-beam dominance keys and their tie-break cannot be fooled by a separator in an id (S18)', () => {
+  const { planSignature, compareIdLists } = __planBeamForTests;
+  const plan = (ids, inventory) => ({ remaining: ids.map((id) => ({ id })), inventory: new Map(inventory) });
+  // Joined with "|" these two remaining lists were the same key.
+  assert.notEqual(planSignature(plan(['a|b'], [['box', 1]])), planSignature(plan(['a', 'b'], [['box', 1]])));
+  // Joined with ":" and "|" these two inventories were the same key.
+  assert.notEqual(planSignature(plan([], [['a:1|b', 2]])), planSignature(plan([], [['a', '1|b:2']])));
+  // Insertion order of the inventory does not change the key.
+  assert.equal(planSignature(plan(['x'], [['a', 1], ['b', 2]])), planSignature(plan(['x'], [['b', 2], ['a', 1]])));
+  // Python's tuple order: element by element, then the shorter first -- not the joined text.
+  assert.ok(compareIdLists(['a', 'c'], ['ab']) < 0);
+  assert.ok(compareIdLists(['box'], ['box-a']) < 0);
+  assert.ok(compareIdLists(['a'], ['a', 'b']) < 0);
+  assert.equal(compareIdLists(['a', 'b'], ['a', 'b']), 0);
 });

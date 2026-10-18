@@ -37,12 +37,12 @@ test('the effort budget is shared by every start', () => {
     [[true, true], ...Array.from({ length: 7 }, () => [true, true])]);
 });
 
-test('a shuffled ordering keeps priority ahead of size', () => {
-  // The box holds one of the two. Every one of the eight orderings must offer it to the
-  // high-priority item first, or a shuffle that leads with the big one fills the box.
+test('start 0 leads with priority; shuffled starts are free shuffles', () => {
+  // Start 0 respects priority. Later starts re-solve a plain shuffle, allowing the portfolio
+  // to try low-priority items first (JS gap 2 revert).
   const items = [cube('big', 100), cube('small', 10, { priority: 5 })];
-  for (let start = 1; start < 8; start++) {
-    const result = packFallback(scene({}, items), Date.now, null, start);
-    assert.deepEqual(result.containers.flatMap((c) => c.placements.map((p) => p.item_id)), ['small#1'], `start ${start}`);
-  }
+  const start0 = packFallback(scene({}, items), Date.now, null, 0);
+  assert.deepEqual(start0.containers.flatMap((c) => c.placements.map((p) => p.item_id)), ['small#1']);
+  const start4 = packFallback(scene({}, items), Date.now, null, 4);
+  assert.deepEqual(start4.containers.flatMap((c) => c.placements.map((p) => p.item_id)), ['big#1']);
 });

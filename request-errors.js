@@ -12,7 +12,7 @@
  * - `detail`: the fixed text for the reason, so the message is identical in every engine.
  *
  * `checkRequest` walks the schema's rules over the raw JSON before any model is built, and the
- * first violation wins, in the order every engine follows: units, configuration, items,
+ * first violation wins, in the order every engine follows: units, output, configuration, items,
  * containers. A cross-engine suite holds all four engines to the same reason, field and
  * message.
  *
@@ -27,6 +27,13 @@ import { boxCost } from './made-to-measure.js';
 export const SOLVER_PROFILES = Object.freeze(['fast', 'balanced', 'quality', 'exact_small']);
 export const OBJECTIVES = Object.freeze(['default', 'lowest_cost', 'shipping_cost', 'lowest_landed_cost', 'open_dimension_height', 'maximum_value', 'maximum_volume']);
 export const ACCESS_DIRECTIONS = Object.freeze(['+x', '-x', '+y', '-y', '+z', '-z']);
+// The schema's closed vocabularies, each refused as `not_allowed` like the two above.
+export const SOLVERS = Object.freeze(['grid', 'extreme_points', 'homogeneous_blocks', 'layer', 'maximal_spaces', 'exact_small']);
+export const ROTATIONS = Object.freeze(['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL']);
+export const LENGTH_UNITS = Object.freeze(['mm', 'cm', 'm', 'in', 'ft']);
+export const WEIGHT_UNITS = Object.freeze(['mg', 'g', 'kg', 'oz', 'lb']);
+export const GROUND_CONTACT_RULES = Object.freeze(['free', 'covered', 'single', 'multiple']);
+export const SHAPE_TYPES = Object.freeze(['rigid_cuboid', 'convex_hull', 'compressible']);
 
 /** The request is not one any engine may answer. Nothing was solved. */
 export class InvalidRequestError extends RangeError {
@@ -86,6 +93,12 @@ function requireOneOf(value, field, allowed) {
     throw new InvalidRequestError('not_allowed', field, `must be one of ${jsonSpelling([...allowed])}`);
   }
 }
+
+const oneOf = (allowed) => (value, field) => requireOneOf(value, field, allowed);
+
+const eachOneOf = (allowed) => (raw, where) => {
+  requireList(raw, where).forEach((value, index) => requireOneOf(value, where + pointer(index), allowed));
+};
 
 /**
  * The schema closes this object: a key it does not name is refused, never ignored. The first
@@ -165,14 +178,15 @@ const atLeast = (minimum) => (value, field) => requireInteger(value, field, mini
 export function checkRequest(data, measures) {
   const request = requireObject(data, '');
   const unit = checkUnits(request.units, measures.length);
+  checkOutput(request.output);
   const length = (value, field) => requireMeasure(value, field, measures.length, unit);
   const weight = (value, field) => requireMeasure(value, field, measures.weight, 'g');
   checkConfiguration(request.configuration, length);
   const items = requiredList(request, 'items', '');
-  items.forEach((raw, index) => checkItem(raw, pointer('items', index), length, weight));
+  const lengthTicks = (value) => measures.length.parse(value, unit);
+  items.forEach((raw, index) => checkItem(raw, pointer('items', index), length, weight, lengthTicks));
   requireUniqueIds(items, 'items');
   const containers = requiredList(request, 'containers', '');
-  const lengthTicks = (value) => measures.length.parse(value, unit);
   containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight, lengthTicks));
   requireUniqueIds(containers, 'containers');
 }
@@ -187,12 +201,22 @@ function checkUnits(raw, lengths) {
   return length;
 }
 
+function checkOutput(raw) {
+  if (raw == null) return;
+  const output = requireObject(raw, '/output');
+  optional(output, 'length_unit', '/output', oneOf(LENGTH_UNITS));
+  optional(output, 'weight_unit', '/output', oneOf(WEIGHT_UNITS));
+}
+
 function checkConfiguration(raw, length) {
   if (raw == null) return;
   const configuration = requireObject(raw, '/configuration');
   requireKnownFields(configuration, '/configuration', CONFIGURATION_FIELDS);
-  optional(configuration, 'solver_profile', '/configuration', (v, f) => requireOneOf(v, f, SOLVER_PROFILES));
-  optional(configuration, 'objective', '/configuration', (v, f) => requireOneOf(v, f, OBJECTIVES));
+  optional(configuration, 'solver_profile', '/configuration', oneOf(SOLVER_PROFILES));
+  optional(configuration, 'objective', '/configuration', oneOf(OBJECTIVES));
+  optional(configuration, 'solvers', '/configuration', eachOneOf(SOLVERS));
+  optional(configuration, 'dimensional_weight_length_unit', '/configuration', oneOf(LENGTH_UNITS));
+  optional(configuration, 'dimensional_weight_weight_unit', '/configuration', oneOf(WEIGHT_UNITS));
   for (const [name, minimum] of CONFIGURATION_INTEGERS) optional(configuration, name, '/configuration', atLeast(minimum));
   optional(configuration, 'minimum_support_ratio', '/configuration', requireRatio);
   optional(configuration, 'clearance', '/configuration', length);
@@ -202,7 +226,7 @@ function checkConfiguration(raw, length) {
   for (const name of EFFORT_LIMITS) optional(budget, name, '/configuration/effort_budget', atLeast(1));
 }
 
-function checkItem(raw, where, length, weight) {
+function checkItem(raw, where, length, weight, lengthTicks) {
   const item = requireObject(raw, where);
   requiredString(item, 'id', where);
   optional(item, 'quantity', where, atLeast(1));
@@ -210,6 +234,7 @@ function checkItem(raw, where, length, weight) {
   optional(item, 'weight', where, weight);
   optional(item, 'max_top_load', where, weight);
   optional(item, 'nesting_height', where, length);
+  optional(item, 'nesting_height', where, (value, field) => nestingBelowHeight(value, field, item, lengthTicks));
   optional(item, 'max_stacked_items', where, atLeast(1));
   optional(item, 'stop_index', where, atLeast(0));
   optional(item, 'value', where, atLeast(0));
@@ -218,6 +243,19 @@ function checkItem(raw, where, length, weight) {
   optional(item, 'compression_ratio', where, requireUnbounded);
   optional(item, 'stacking_group', where, stackingGroupName);
   optional(item, 'accepts_stacking_groups', where, stackingGroupNames);
+  optional(item, 'allowed_rotations', where, eachOneOf(ROTATIONS));
+  optional(item, 'ground_contact_rule', where, oneOf(GROUND_CONTACT_RULES));
+  optional(item, 'shape_type', where, oneOf(SHAPE_TYPES));
+}
+
+/**
+ * A nested copy sinks by less than its own height, or it would vanish into the one below
+ *. Both measures have passed their own rules already. O(1).
+ */
+function nestingBelowHeight(value, field, item, lengthTicks) {
+  if (lengthTicks(value) >= lengthTicks(item.dimensions.height)) {
+    throw new InvalidRequestError('invalid_value', field, "must be less than the item's height");
+  }
 }
 
 function stackingGroupName(value, field) {
@@ -307,10 +345,7 @@ function setBesideABag(name, value) {
   return value != null;
 }
 
-function accessDirections(raw, where) {
-  const directions = requireList(raw, where);
-  directions.forEach((direction, index) => requireOneOf(direction, where + pointer(index), ACCESS_DIRECTIONS));
-}
+const accessDirections = eachOneOf(ACCESS_DIRECTIONS);
 
 function dimensions(raw, where, length) {
   const sides = requireObject(raw, where);
