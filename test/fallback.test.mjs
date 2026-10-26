@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
   BoundOverflowError, __spatialIndexForTests, __inspectHullShapeForTests, __objectiveBoundsForTests,
+  __requestBoundForTests,
   __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
   InvalidRequestError, explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules, __ratiosForTests, __planBeamForTests,
@@ -2156,6 +2157,59 @@ test('the objective lower bound matches Python on every corpus case', (t) => {
     assert.deepEqual(__objectiveBoundsForTests(instances, containers), one.bounds,
       `bounds diverge from Python on ${one.fixture}`);
   }
+  // The edges are written from the oracle: the fixed-placement rule and every edge of the one
+  // refusal predicate, where null means this port must refuse too (finding F4).
+  assert.ok(scene.edges.length > 0, 'the refusal predicate\'s edges are not optional');
+  for (const edge of scene.edges) {
+    const instances = edge.instances.map((raw) => ({
+      volume: BigInt(raw.volume), weight: BigInt(raw.weight), shrinks: raw.shrinks,
+    }));
+    const containers = edge.containers.map((raw) => ({
+      usable: BigInt(raw.usable), inner: BigInt(raw.inner), baseArea: BigInt(raw.base_area),
+      height: BigInt(raw.height),
+      payload: raw.payload === null ? null : BigInt(raw.payload),
+      maxItems: raw.max_items === null ? null : BigInt(raw.max_items),
+      quantity: raw.quantity === null ? null : BigInt(raw.quantity),
+      costMinor: BigInt(raw.cost_minor),
+    }));
+    if (edge.bounds === null) {
+      assert.throws(() => __objectiveBoundsForTests(instances, containers), BoundOverflowError,
+        edge.name);
+    } else {
+      assert.deepEqual(__objectiveBoundsForTests(instances, containers), edge.bounds, edge.name);
+    }
+  }
+});
+
+test('the request bound is read from the request itself, in the objective\'s own order', () => {
+  // F3: the adapter forms volumes in BigInt from tick lengths and reads every item type's
+  // whole quantity, so a one-metre cube's 4.1e21 cubic ticks stay exact.
+  const metre = request([cube('m', 1000, { quantity: 2 })],
+    [box('b', 2000, 1000, 1000, { cost_minor: 3 })]);
+  assert.deepEqual(__requestBoundForTests(metre), [0, 1, 3, 0, 1000000]);
+  assert.deepEqual(__requestBoundForTests({ ...metre, configuration: { objective: 'lowest_cost' } }),
+    [0, 3, 1, 0, 1000000]);
+  assert.equal(__requestBoundForTests({ ...metre, configuration: { objective: 'maximum_value' } }), null);
+  assert.equal(__requestBoundForTests({ ...metre, configuration: { objective: 'constructor' } }), null);
+});
+
+test('a result states its bound, and attainment is the only route to optimal', () => {
+  // OPTIMALITY-GAP.md § 1.3: a perfect fill attains every key and is proven; a missed key
+  // carries the prefix and the gap; an uncovered objective states nothing.
+  const proven = packFallback(request([cube('c', 100, { quantity: 2 })], [box('b', 200, 100, 100)]));
+  assert.equal(proven.status, 'optimal');
+  assert.deepEqual(proven.optimality, { code: 'proven_optimal', lower_bound: proven.score });
+
+  const missed = packFallback(request([cube('c', 100)], [box('b', 300, 100, 100)]));
+  assert.equal(missed.status, 'feasible');
+  assert.equal(missed.optimality.code, 'not_proven');
+  assert.equal(missed.optimality.lower_bound.length, missed.optimality.gap_key + 1);
+  assert.equal(missed.optimality.absolute_gap,
+    missed.score[missed.optimality.gap_key] - missed.optimality.lower_bound[missed.optimality.gap_key]);
+
+  const uncovered = packFallback(request([cube('c', 100)], [box('b', 300, 100, 100)],
+    { configuration: { objective: 'maximum_volume' } }));
+  assert.deepEqual(uncovered.optimality, { code: 'not_proven' });
 });
 
 test('a sum past the declared ceiling is refused rather than answered', () => {
@@ -2958,11 +3012,12 @@ test('fast enumerates one block mode where balanced enumerates both', () => {
   assert.equal(spent('balanced') - own, 2 * (spent('fast') - own));
 });
 
-test('the added block start carries its own node limit, not the container plan limit', () => {
-  // Selected by name on `balanced` the solver keeps the profile's limit of one node and
-  // stops before its first block; the added start must not inherit that.
+test('the block solver carries its own node limit outside quality, not the container plan limit', () => {
+  // `balanced` leaves the container plan limit at one node, short of the first block; the
+  // solver selected by name and the added start both carry their own bound.
   const selected = packFallback(cartons('balanced', { solvers: ['homogeneous_blocks'] }));
-  assert.equal(selected.summary.packed_item_count, 0);
+  assert.equal(selected.summary.container_count, 1);
+  assert.equal(selected.unpacked_items.length, 0);
   assert.equal(packFallback(cartons('balanced', { container_plan_node_limit: 1 })).summary.container_count, 1);
 });
 

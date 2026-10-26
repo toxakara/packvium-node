@@ -20,6 +20,7 @@ export { FixedPlacementError, InvalidRequestError, UnsupportedFeatureError };
 import * as commerceFallback from './commerce.js';
 export { CommerceInputError } from './commerce.js';
 import { SUITE_VERSION } from './artifacts.js';
+import { validateDocuments } from './result-validation/index.js';
 const require = createRequire(import.meta.url);
 
 /** The largest `maxMoves` the addon's `u32` parameter holds; napi wraps anything above it. */
@@ -147,7 +148,7 @@ export function rebalanceWeightWith(binding, request, result, { maxMoves = 64 } 
   return rebalanceFallback(request, result, { maxMoves });
 }
 
-export const version = () => native?.version?.() ?? '1.7.0-js-fallback';
+export const version = () => native?.version?.() ?? '1.8.0-js-fallback';
 
 /**
  * The result is not a document the reference validator can judge (docs/VALIDATION-CONTRACT.md):
@@ -163,12 +164,15 @@ export class MalformedResult extends Error {
 }
 
 /**
- * `validate` needs the compiled addon: the reference validator is ported to the Rust core
- *, and the JavaScript fallback's own port is.
+ * Thrown by `validate` before 1.8.0 when the compiled addon was absent. The JavaScript fallback
+ * has its own port of the reference validator since then, so nothing throws it; it is
+ * still exported so code that imports or catches it keeps loading.
+ *
+ * @deprecated `validate` answers on every backend.
  */
 export class ValidatorUnavailableError extends Error {
   constructor() {
-    super('validate() needs the compiled addon; the JavaScript fallback has no validator yet');
+    super('validate() answers without the compiled addon since 1.8.0; nothing throws this error');
     this.name = 'ValidatorUnavailableError';
     this.code = 'validator_unavailable';
   }
@@ -177,18 +181,20 @@ export class ValidatorUnavailableError extends Error {
 /**
  * Every way `result` fails to be a sound answer to `request`, as `{code, detail}` objects
  * identical to `packvium.validate`'s in every package; an empty list means valid. Throws
- * `MalformedResult` for a result that does not have the documented shape at all.
+ * `MalformedResult` for a result that does not have the documented shape at all. The compiled
+ * addon answers when it is loaded, the JavaScript port otherwise; both are ports of the same
+ * reference and return the same list.
  */
 export function validate(request, result) {
   return validateWith(native, request, result);
 }
 
-// Separate from `validate` so the native path can be exercised without a native build.
+// Separate from `validate` so either path can be exercised whatever this host has built: a
+// binding without `validateJson` (or none) is answered by the JavaScript port.
 export function validateWith(binding, request, result) {
-  if (!binding?.validateJson) {
-    throw new ValidatorUnavailableError();
-  }
-  const outcome = JSON.parse(binding.validateJson(JSON.stringify(request), JSON.stringify(result)));
+  const outcome = binding?.validateJson
+    ? JSON.parse(binding.validateJson(JSON.stringify(request), JSON.stringify(result)))
+    : validateDocuments(request, result);
   if (outcome.refusal) {
     throw new MalformedResult(outcome.refusal.message, outcome.refusal.kind);
   }

@@ -1,9 +1,9 @@
 {
   "name":"@packvium/engine",
-  "version":"1.7.0",
+  "version":"1.8.0",
   "description":"Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results.",
   "author":{"name":"Packvium contributors","url":"https://packvium.com"},
-  "keywords":["3d-bin-packing","bin-packing","3d-packing","cartonization","container-loading","pallet-packing","truck-loading","packing-algorithm","logistics","deterministic"],
+  "keywords":["3d-bin-packing","bin-packing","3d-packing","cartonization","container-loading","pallet-packing","truck-loading","packing-algorithm","logistics","deterministic","box-packing","load-planning"],
   "homepage":"https://packvium.com",
   "repository":{"type":"git","url":"git+https://github.com/toxakara/packvium-node.git"},
   "bugs":{"url":"https://github.com/toxakara/packvium-node/issues"},
@@ -11,7 +11,7 @@
   "main":"index.js",
   "types":"index.d.ts",
   "exports":{".":{"types":"./index.d.ts","import":"./index.js"},"./execution.js":{"types":"./execution.d.ts","import":"./execution.js"},"./artifacts.js":{"types":"./artifacts.d.ts","import":"./artifacts.js"},"./artifact-exports.js":{"types":"./artifact-exports.d.ts","import":"./artifact-exports.js"},"./revisions.js":{"types":"./revisions.d.ts","import":"./revisions.js"},"./scene.js":{"types":"./scene.d.ts","import":"./scene.js"}},
-  "files":["index.js","fallback.js","contact-graph.js","policy.js","commerce.js","commerce-model.js","execution.js","canonical-json.js","artifacts.js","artifact-exports.js","revisions.js","scene.js","request-errors.js","made-to-measure.js","examples","index.d.ts","execution.d.ts","artifacts.d.ts","artifact-exports.d.ts","revisions.d.ts","scene.d.ts","README.md","SECURITY.md"],
+  "files":["index.js","fallback.js","contact-graph.js","policy.js","commerce.js","commerce-model.js","execution.js","canonical-json.js","artifacts.js","artifact-exports.js","revisions.js","scene.js","request-errors.js","made-to-measure.js","result-validation","examples","index.d.ts","execution.d.ts","artifacts.d.ts","artifact-exports.d.ts","revisions.d.ts","scene.d.ts","README.md","SECURITY.md"],
   "engines":{"node":">=16"},
   "scripts":{
     "test":"node test/run-tests.mjs",

@@ -13,7 +13,9 @@ const result = pack({
 
 assert.ok(['rust', 'javascript'].includes(backend()));
 assert.equal(typeof version(), 'string');
-assert.equal(result.status, 'feasible');
+// Two cubes fill the container exactly, so the 1.8 optimality check proves the answer optimal.
+assert.equal(result.status, 'optimal');
+assert.equal(result.optimality.code, 'proven_optimal');
 assert.equal(result.complete, true);
 assert.equal(result.summary.packed_item_count, 2);
 assert.equal(result.summary.unpacked_item_count, 0);

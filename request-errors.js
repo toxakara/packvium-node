@@ -88,6 +88,11 @@ function requireRatio(value, field, maximum = 1) {
 
 const requireUnbounded = (value, field) => requireRatio(value, field, null);
 
+/** Only JSON `true`/`false`: a truthiness reading would pack `"no"` as yes. O(1). */
+function requireBoolean(value, field) {
+  if (typeof value !== 'boolean') throw new InvalidRequestError('wrong_type', field, 'must be a boolean');
+}
+
 function requireOneOf(value, field, allowed) {
   if (typeof value !== 'string' || !allowed.includes(value)) {
     throw new InvalidRequestError('not_allowed', field, `must be one of ${jsonSpelling([...allowed])}`);
@@ -166,6 +171,8 @@ const CONFIGURATION_FIELDS = ['alternatives', 'clearance', 'container_plan_beam_
   'max_candidates_per_item', 'max_containers', 'minimum_support_ratio', 'multi_start_orders', 'objective',
   'require_placement_coordinates', 'seed', 'solver_profile', 'solvers', 'time_limit_ms'];
 const SIDES = ['length', 'width', 'height'];
+/** The item fields the request schema types `boolean`, in schema order. */
+const ITEM_BOOLEANS = ['keep_upright', 'stackable', 'must_be_on_floor'];
 const AXES = ['x', 'y', 'z'];
 const atLeast = (minimum) => (value, field) => requireInteger(value, field, minimum);
 
@@ -220,6 +227,7 @@ function checkConfiguration(raw, length) {
   for (const [name, minimum] of CONFIGURATION_INTEGERS) optional(configuration, name, '/configuration', atLeast(minimum));
   optional(configuration, 'minimum_support_ratio', '/configuration', requireRatio);
   optional(configuration, 'clearance', '/configuration', length);
+  optional(configuration, 'require_placement_coordinates', '/configuration', requireBoolean);
   if (configuration.effort_budget == null) return;
   const budget = requireObject(configuration.effort_budget, '/configuration/effort_budget');
   requireKnownFields(budget, '/configuration/effort_budget', EFFORT_LIMITS);
@@ -246,6 +254,7 @@ function checkItem(raw, where, length, weight, lengthTicks) {
   optional(item, 'allowed_rotations', where, eachOneOf(ROTATIONS));
   optional(item, 'ground_contact_rule', where, oneOf(GROUND_CONTACT_RULES));
   optional(item, 'shape_type', where, oneOf(SHAPE_TYPES));
+  for (const name of ITEM_BOOLEANS) optional(item, name, where, requireBoolean);
 }
 
 /**

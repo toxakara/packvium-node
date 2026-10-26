@@ -1,0 +1,75 @@
+name: rc
+
+# A pre-release tag (`v1.9.0-rc.1`) builds and tests exactly as `release.yml` does, then
+# publishes to npm under the `next` dist-tag. npm has no test registry, and a plain
+# `npm publish` moves `latest`, so without `--tag next` every `npm install @packvium/engine`
+# would get the RC. There is no GitHub Release: an RC is not a release.
+#
+# Before the first RC, once (the owner):
+#   1. On npmjs.com, @packvium/engine -> Settings -> Trusted Publisher, add a second publisher
+#      (a package may have up to ten; the existing `release.yml` one stays): repository
+#      `packvium-node`, workflow `rc.yml`, environment `npm`, with `Allow npm publish` ticked. A new
+#      publisher that has not published within two days expires, so add it just before
+#      the first RC tag.
+#   2. Set the repository variable RC_PUBLISHING to `enabled`.
+# A consumer then installs it with `npm install @packvium/engine@next`. After the final
+# release, `npm dist-tag rm @packvium/engine next` (or leave `next` on the RC).
+
+on:
+  push:
+    tags: ["v*-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22"}
+      - run: npm test
+
+      # The tag and the packaged version must agree. Without this, `git tag v0.2.0` on a
+      # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise,
+      # and the mistake is only visible after it is public and immutable.
+      - name: The tag must match the version in package.json
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          built=$(node -p "require('./package.json').version")
+          if [ "$tagged" != "$built" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $built" >&2
+            exit 1
+          fi
+
+      - run: npm pack
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tarball
+          path: "*.tgz"
+
+  # Inert until the owner sets the repository variable RC_PUBLISHING to `enabled` (Settings ->
+  # Secrets and variables -> Actions -> Variables). Without it the job is skipped and the run
+  # stays green, so an RC tag pushed before the accounts exist publishes nothing.
+  publish-next:
+    needs: build
+    if: vars.RC_PUBLISHING == 'enabled'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write      # npm Trusted Publishing and the attestation
+      attestations: write  # build provenance, so a consumer can verify where a file came from
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: "22", registry-url: "https://registry.npmjs.org"}
+      # OIDC trusted publishing needs npm 11.5.1 or newer; Node 22 bundles npm 10 (see release.yml).
+      - run: npm install -g npm@^11.5.1
+      - run: npm --version
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tarball
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: "*.tgz"
+      - run: npm publish ./*.tgz --provenance --access public --tag next
