@@ -163,7 +163,8 @@ test('null optional fields are absent, and a valid request is admitted', () => {
   });
   request.configuration.effort_budget = null;
   assert.equal(packFallback(request).status, 'feasible');
-  assert.equal(packFallback({ ...base(), units: null }).status, 'feasible');
+  // Without the obstacle the base request's packing attains its bound, which proves it.
+  assert.equal(packFallback({ ...base(), units: null }).status, 'optimal');
 });
 
 test('an unknown objective or access direction is refused with not_allowed and its pointer', () => {

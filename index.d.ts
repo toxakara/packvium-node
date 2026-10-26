@@ -78,7 +78,7 @@ export const commerce:{
 export interface ResultIssue{code:string;detail:string}
 /** The result does not have the documented shape; `kind` says how the reference answers it. */
 export class MalformedResult extends Error{readonly kind:'contract'|'shape';constructor(message:string,kind:'contract'|'shape')}
-/** `validate` was called without the compiled addon; the fallback's validator is. */
+/** @deprecated Thrown by `validate` before 1.8.0 without the compiled addon; nothing throws it now. */
 export class ValidatorUnavailableError extends Error{readonly code:'validator_unavailable'}
-/** The reference validator's issues, identical across packages; empty when valid. Needs the compiled addon. */
+/** The reference validator's issues, identical across packages; empty when valid. The compiled addon answers when loaded, the JavaScript port otherwise. */
 export function validate(request:PackingRequest,result:PackingResult):ResultIssue[];

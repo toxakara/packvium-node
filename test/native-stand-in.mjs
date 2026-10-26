@@ -23,6 +23,13 @@ function packageCopy() {
   for (const name of MANIFEST.files.filter((file) => file.endsWith('.js'))) {
     fs.copyFileSync(path.join(PACKAGE, name), path.join(root, name));
   }
+  // A declared directory of modules the entry point imports, such as `result-validation/`;
+  // `examples/` only imports the package and is left out.
+  const isModuleDirectory = (file) => file !== 'examples' && fs.existsSync(path.join(PACKAGE, file))
+    && fs.statSync(path.join(PACKAGE, file)).isDirectory();
+  for (const name of MANIFEST.files.filter(isModuleDirectory)) {
+    fs.cpSync(path.join(PACKAGE, name), path.join(root, name), { recursive: true });
+  }
   fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ type: 'module' }));
   return root;
 }

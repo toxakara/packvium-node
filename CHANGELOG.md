@@ -4,6 +4,47 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0]
+
+`validate` works after a plain `npm install`, results say how far they can be from the best
+possible answer, and a mistyped flag is refused instead of guessed.
+
+### Added
+
+- **`optimality.lower_bound` and the gap** under the `default` and `lowest_cost` objectives,
+  computed with exact `BigInt` volumes; `validate` checks them.
+
+### Changed
+
+- **`validate(request, result)` answers without the compiled addon**, with the same issues
+  in the same order.
+- **Attaining the bound sets `optimal`**, and an effort budget names a stop: a run that ends
+  on exactly its budget is `complete`.
+- **A non-boolean `keep_upright`, `stackable`, `must_be_on_floor` or
+  `require_placement_coordinates` throws `InvalidRequestError`** (`wrong_type`), with or
+  without the addon.
+  `validate` throws `MalformedResult` (`contract`) for such a request, with or without the addon,
+  and reads `null` as the default.
+- **The JavaScript fallback reuses measures parsed during request checking** in the bound
+  and starts, including made-to-measure machine settings. Hull and fixed-position measures
+  retain their separate admission paths. The measured macOS / Node 26 warm small-request
+  paired wall-time median improved about 4%; retained results agree after removing timing.
+- **Axle-limited solves up to 2x faster, `validate` up to 2.4x faster on nested results**, loading
+  and removal sequences up to 15% faster; answers are identical.
+
+### Fixed
+
+- **`solvers: ["homogeneous_blocks"]` packs under `fast` and `balanced`**; without the addon
+  it placed nothing and reported `complete`.
+- **`validate` reads `units: null` and `units.length: null` as millimetres**, as the engines do,
+  and refuses a `units` that is not an object, or an unknown `units.length`, as a `contract`
+  `MalformedResult` naming the field. `units.weight` is not a field and is ignored: put the unit
+  on each weight.
+
+### Deprecated
+
+- **`ValidatorUnavailableError`.** Still exported; nothing throws it.
+
 ## [1.7.0]
 
 A validator and a scene converter join the package, `quality` looks ahead in its block solver,

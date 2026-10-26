@@ -114,6 +114,10 @@ Items the search never reached are listed in `unpacked_items` with reason `effor
 `time_limit`, not as items that do not fit. [`examples/reproducibility.mjs`](examples/reproducibility.mjs)
 shows both.
 
+`effort_limit` means the budget stopped work the search still had: a search that finishes on
+exactly its budget reads `complete`, and `termination.any_start_truncated` says whether the
+budget cut a start that might have won.
+
 ## Errors
 
 A request that no engine may answer throws `InvalidRequestError`, a `RangeError`, before anything
@@ -162,18 +166,15 @@ case above.
 geometry, support and load, accounting, the result's facts and its score. It is the same
 reference validator every Packvium package exports, so it returns the same list.
 
-The validator runs only in the compiled native addon, and the published package does not ship
-one yet, so after a plain `npm install` `validate` throws `ValidatorUnavailableError` (code
-`validator_unavailable`) instead of answering. The JavaScript fallback's validator is planned
-for 1.8. Check `backend()` first:
+It answers on every backend: through the compiled addon when one is loaded, and otherwise
+through the package's own JavaScript port of the same validator, so a plain `npm install` checks
+results too (since 1.8.0; before that it threw `ValidatorUnavailableError` without the addon).
 
 ```js
-import { MalformedResult, backend, pack, validate } from '@packvium/engine';
+import { MalformedResult, pack, validate } from '@packvium/engine';
 
-if (backend() === 'rust') {
-  const issues = validate(request, pack(request)); // [] -- valid
-  // [{ code: 'collision', detail: 'cube#1 with cube#2 in box#1' }] for two boxes in one place
-}
+const issues = validate(request, pack(request)); // [] -- valid
+// [{ code: 'collision', detail: 'cube#1 with cube#2 in box#1' }] for two boxes in one place
 ```
 
 It judges any engine's result, not only this package's. A result without the documented shape
@@ -281,6 +282,11 @@ step's placement the way its scene item is named, to match one to the other.
 - Exact, deterministic placement with no floating-point geometry decisions.
 - Rotation, payload, stackability, support, clearance, obstacle and tag constraints.
 - Multiple container types and clear explanations for unpacked items.
+- A proof, or the distance to one: under the `default` and `lowest_cost` objectives every result
+  states `optimality.lower_bound`; a complete result that attains it reports `optimal`, and any
+  other carries the gap to the bound.
+- `validate(request, result)`, the reference validator, on every backend: a plain `npm install`
+  checks results without the compiled addon.
 - JSON input/output through `pack()` or `packJson()`.
 - Optional payload rebalancing with `rebalanceWeight()`.
 - Loading and removal sequence helpers for already placed boxes.
@@ -313,7 +319,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.7"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.8"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -344,7 +350,7 @@ CodeMeta form.
 @software{packvium_node,
   author  = {{Packvium contributors}},
   title   = {Packvium for Node.js},
-  version = {1.7.0},
+  version = {1.8.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

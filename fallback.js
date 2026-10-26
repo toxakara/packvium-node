@@ -91,11 +91,11 @@ function parseRateTable(raw){
   return {brackets,prices,minimum,fuel}
 }
 // A made-to-measure container's machine in ticks, or null for a stock container.
-function parseMachine(raw,unit){
+function parseMachine(raw,unit,measures){
   if(raw==null)return null;
-  const sides=value=>value==null?[0,0,0]:dims(value,unit);
+  const sides=value=>value==null?[0,0,0]:measures.sides(value,unit);
   return {minimum:sides(raw.minimum),increment:sides(raw.increment),price:raw.cost_per_square_metre_minor??0,
-    tarePerSquareMetre:raw.tare_per_square_metre==null?0:scalar(raw.tare_per_square_metre,'g',WT),allowance:sides(raw.outer_allowance)}
+    tarePerSquareMetre:raw.tare_per_square_metre==null?0:measures.weight(raw.tare_per_square_metre),allowance:sides(raw.outer_allowance)}
 }
 // Billed weight in whole grams, rounded up -- how a carrier reads a scale. A shipment
 // fractionally over a bracket is in the next bracket; rounding down would price it
@@ -369,6 +369,29 @@ function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v
 // output code ("Inches" is `in`); a unit no output code names, the internal tick, gives `mm`.
 function outputLengthUnit(unit){const multiplier=LEN[unit.trim().toLowerCase()];return ['mm','cm','m','in','ft'].find(code=>LEN[code]===multiplier)??'mm'}
 function dims(v,u){return [scalar(v.length,u,LEN),scalar(v.width,u,LEN),scalar(v.height,u,LEN)]}
+/**
+ * The ticks of every measure one request spells, parsed once. The request check parses
+ * each stated measure to refuse a bad one, through `checker`; `close` ends the filling before the
+ * bound and the first start read it, so every start reads the same values and none writes what
+ * another reads. A spelling the check did not parse is parsed on the spot and not kept; a literal
+ * 0 is 0 ticks in any unit the check has accepted. `O(1)` per read, `O(distinct spellings)`
+ * memory, for one request only.
+ */
+function requestMeasures(){
+  const tables=new Map([[LEN,new Map()],[WT,new Map()]]);let open=true;
+  const read=(table,value,unit)=>{
+    if(value===0)return 0;
+    const byUnit=tables.get(table),known=byUnit.get(unit)?.get(value);
+    if(known!==undefined)return known;
+    const ticks=scalar(value,unit,table);
+    if(open){if(!byUnit.has(unit))byUnit.set(unit,new Map());byUnit.get(unit).set(value,ticks)}
+    return ticks};
+  const length=(value,unit)=>read(LEN,value,unit),weight=value=>read(WT,value,'g');
+  const sides=(value,unit)=>[length(value.length,unit),length(value.width,unit),length(value.height,unit)];
+  return {
+    checker:Object.freeze({length:{units:LEN,parse:length},weight:{units:WT,parse:(value,unit)=>read(WT,value,unit)}}),
+    close(){open=false;return Object.freeze({length,weight,sides})}};
+}
 // Three-element literals, not `Array.prototype.map`: an inlined `map` in optimised code builds
 // a holey array where the baseline tiers build a packed one, so every consumer of a box's
 // sides met two array maps and deoptimised on the second -- the hot candidate sweep included,
@@ -624,32 +647,50 @@ function occupiesLessThanItsBox(item){
   return item.shapeType==='convex_hull'||item.shapeType==='compressible';
 }
 const boundCeilDiv=(a,b)=>(a+b-1n)/b;
-/** The largest n such that the n smallest values sum to at most the capacity. Smallest first
- *  is the whole soundness argument: the cheapest units maximise how many fit, so this
- *  over-estimates what any real packing achieves and the bound under-estimates. */
-function boundFit(ascending,capacity){
-  if(capacity===null)return ascending.length;
-  let used=0n;
-  for(let taken=0;taken<ascending.length;taken++){
-    used+=ascending[taken];
-    if(used>capacity)return taken;
-  }
-  return ascending.length;
+const bigAscending=(a,b)=>a<b?-1:a>b?1:0;
+/** Values sorted ascending, each with how many instances carry it, as `[value, count]` BigInt
+ *  pairs. Formed per item type from a request, so a quantity of a million is one entry. */
+function boundRuns(pairs){
+  return pairs.filter(([,count])=>count>0n).sort((a,b)=>bigAscending(a[0],b[0])||bigAscending(a[1],b[1]));
 }
-/** Sum of limit*quantity, or null when any limit or inventory is undeclared. `zeroIsHarmless`
- *  is the volume rule: a container with no usable volume adds nothing however many there
- *  are, so an unlimited quantity only unbounds the total when the type holds something. */
-function boundCapacity(values,quantities,zeroIsHarmless){
+const runCount=runs=>runs.reduce((total,[,count])=>total+count,0n);
+/** The sum of the `count` values a walk over the runs meets first. */
+function runTake(runs,count){
   let total=0n;
-  for(let i=0;i<values.length;i++){
-    if(values[i]===null)return null;
-    if(quantities[i]===null){
-      if(zeroIsHarmless&&values[i]<=0n)continue;
-      return null;
-    }
-    total=boundGuard(total+values[i]*quantities[i],'container capacity');
+  for(const [value,available] of runs){
+    if(count<=0n)break;
+    const taken=available<count?available:count;
+    total+=value*taken;count-=taken;
   }
   return total;
+}
+const runSmallest=(runs,count)=>runTake(runs,count);
+const runLargest=(runs,count)=>runTake([...runs].reverse(),count);
+/** The largest n such that the n smallest values sum to at most the capacity; all of them
+ *  when it is unbounded. Smallest first is the whole soundness argument: the cheapest units
+ *  maximise how many fit, so this over-estimates what any real packing achieves and the
+ *  bound under-estimates. */
+function boundFit(ascending,capacity){
+  if(capacity===null)return runCount(ascending);
+  let taken=0n,used=0n;
+  for(const [value,count] of ascending){
+    let room=count;
+    if(value!==0n){const fits=capacity>used?(capacity-used)/value:0n;if(fits<room)room=fits}
+    taken+=room;used+=value*room;
+    if(room<count)break;
+  }
+  return taken;
+}
+/** `Σ limit·quantity`, guarded, or null when the total is unbounded: some type declares no
+ *  limit, or an unlimited quantity of a type whose limit is positive. A type that holds
+ *  nothing adds nothing however many of it there are. Unboundedness is decided before
+ *  anything is summed, so whether a request is refused never depends on type order, and an
+ *  unbounded total is never guarded because no formula forms it (finding F4). */
+function boundCapacity(containers,limit){
+  if(containers.some(c=>limit(c)===null||(c.quantity===null&&limit(c)>0n)))return null;
+  let total=0n;
+  for(const c of containers)if(c.quantity!==null)total+=limit(c)*c.quantity;
+  return boundGuard(total,'container capacity');
 }
 /** The largest declared limit, or null if any type declares none: one unlimited type makes
  *  the maximum unbounded and every term conditioned on it vacuous. */
@@ -661,91 +702,155 @@ function boundFiniteMax(values){
   }
   return best;
 }
-/** Every bound, from the numbers the formulas consume -- the shape the shared scene records,
- *  so this port is checked without reimplementing a request parser. `shrinks` is taken as
- *  given; whether this engine decides it correctly is asserted separately. */
-function objectiveBounds(instances,containers){
-  const volumes=instances.map(i=>i.volume).sort((a,b)=>a<b?-1:a>b?1:0);
-  const weights=instances.map(i=>i.weight).sort((a,b)=>a<b?-1:a>b?1:0);
-  const shrinks=instances.some(i=>i.shrinks);
-  const count=instances.length;
-  const usable=containers.map(c=>c.usable),inner=containers.map(c=>c.inner);
-  const quantities=containers.map(c=>c.quantity);
+const bigMax=values=>values.reduce((a,b)=>b>a?b:a,0n);
+/** Every bound, in the default objective's order, from the numbers the formulas consume.
+ *
+ *  The one refusal predicate of docs/OPTIMALITY-CERTIFICATES.md first: the instance volumes,
+ *  the instance weights and each finite capacity total past MAX_BOUND_SUM, or any bound past
+ *  MAX_BOUND_VALUE, refuse. Every later product is bounded by those totals times PPM, which
+ *  `BigInt` carries exactly. Key 2 sorts the types by cost once and takes quantities
+ *  greedily, the sum of the L1 cheapest per-unit costs without building that multiset (F6). */
+function objectiveBoundsFromRuns(volumes,weights,shrinks,containers){
+  boundGuard(volumes.reduce((total,[value,count])=>total+value*count,0n),'instance volume');
+  boundGuard(weights.reduce((total,[value,count])=>total+value*count,0n),'instance weight');
+  const volumeCapacity=boundCapacity(containers,c=>c.usable);
+  const payloadCapacity=boundCapacity(containers,c=>c.payload);
+  const slotCapacity=boundCapacity(containers,c=>c.maxItems);
+  const count=runCount(volumes);
 
-  // The a-priori check, once, on the way in. Every later product is bounded by these totals
-  // times PPM, so guarding them here is what makes the rest safe by derivation.
-  boundGuard(volumes.reduce((a,b)=>a+b,0n),'instance volume');
-  boundGuard(weights.reduce((a,b)=>a+b,0n),'instance weight');
-  for(const container of containers){
-    boundGuard(container.usable,'container capacity');
-    boundGuard(container.costMinor,'opening cost');
-  }
+  let placed=count;
+  const atMost=limit=>{if(limit<placed)placed=limit};
+  if(!shrinks)atMost(boundFit(volumes,volumeCapacity));
+  atMost(boundFit(weights,payloadCapacity));
+  if(slotCapacity!==null)atMost(slotCapacity);
+  const unpacked=count-placed;
 
-  let placeable=count;
-  if(!shrinks)placeable=Math.min(placeable,boundFit(volumes,boundCapacity(usable,quantities,true)));
-  placeable=Math.min(placeable,boundFit(weights,boundCapacity(containers.map(c=>c.payload),quantities,false)));
-  const slotCapacity=boundCapacity(containers.map(c=>c.maxItems),quantities,false);
-  if(slotCapacity!==null)placeable=Math.min(placeable,Number(slotCapacity));
-  const unpacked=count-placeable,placed=placeable;
-
-  let opened=0;
-  if(placed>0&&containers.length){
-    opened=1;
+  let opened=0n;
+  if(placed>0n&&containers.length){
+    opened=1n;
+    const atLeast=limit=>{if(limit>opened)opened=limit};
     if(!shrinks){
-      const largest=usable.reduce((a,b)=>b>a?b:a,0n);
-      if(largest>0n)opened=Math.max(opened,Number(boundCeilDiv(volumes.slice(0,placed).reduce((a,b)=>a+b,0n),largest)));
+      const largest=bigMax(containers.map(c=>c.usable));
+      if(largest>0n)atLeast(boundCeilDiv(runSmallest(volumes,placed),largest));
     }
     const payload=boundFiniteMax(containers.map(c=>c.payload));
-    if(payload!==null&&payload>0n)opened=Math.max(opened,Number(boundCeilDiv(weights.slice(0,placed).reduce((a,b)=>a+b,0n),payload)));
+    if(payload!==null&&payload>0n)atLeast(boundCeilDiv(runSmallest(weights,placed),payload));
     const slots=boundFiniteMax(containers.map(c=>c.maxItems));
-    if(slots!==null&&slots>0n)opened=Math.max(opened,Number(boundCeilDiv(BigInt(placed),slots)));
+    if(slots!==null&&slots>0n)atLeast(boundCeilDiv(placed,slots));
   }
 
-  let cost=0n;
-  if(opened>0){
-    const available=[];
-    for(const c of containers){
-      const repeat=c.quantity===null?opened:Math.min(Number(c.quantity),opened);
-      for(let taken=0;taken<repeat;taken++)available.push(c.costMinor);
-    }
-    available.sort((a,b)=>a<b?-1:a>b?1:0);
-    cost=available.slice(0,opened).reduce((a,b)=>a+b,0n);
+  let cost=0n,needed=opened;
+  for(const c of [...containers].sort((a,b)=>bigAscending(a.costMinor,b.costMinor))){
+    if(needed<=0n)break;
+    const taken=c.quantity===null||c.quantity>needed?needed:c.quantity;
+    cost+=c.costMinor*taken;needed-=taken;
   }
 
   let unused=0n;
-  if(!shrinks&&opened>0&&containers.length){
-    const smallest=inner.reduce((a,b)=>b<a?b:a,inner[0]);
+  if(!shrinks&&opened>0n&&containers.length){
+    const smallest=containers.map(c=>c.inner).reduce((a,b)=>b<a?b:a);
     if(smallest>0n){
-      const largestPlaced=placed>0?volumes.slice(volumes.length-placed).reduce((a,b)=>a+b,0n):0n;
-      // In BigInt until it is clamped: `largestPlaced * PPM` can reach 10^36, which a
+      // In BigInt until it is clamped: the placed volume times PPM can reach 10^36, which a
       // `Number` would round rather than carry.
-      const filled=boundCeilDiv(largestPlaced*BOUND_PPM,smallest);
-      const raw=BigInt(opened)*BOUND_PPM-filled-BigInt(opened-1);
+      const raw=opened*BOUND_PPM-boundCeilDiv(runLargest(volumes,placed)*BOUND_PPM,smallest)-(opened-1n);
       unused=raw>0n?raw:0n;
     }
   }
 
   let height=0n;
-  if(!shrinks&&opened>0&&containers.length){
-    const widest=containers.map(c=>c.baseArea).reduce((a,b)=>b>a?b:a,0n);
-    const tallest=containers.map(c=>c.height).reduce((a,b)=>b>a?b:a,0n);
+  if(!shrinks&&opened>0n&&containers.length){
+    const widest=bigMax(containers.map(c=>c.baseArea)),tallest=bigMax(containers.map(c=>c.height));
     if(widest>0n&&tallest>0n){
-      const required=placed>0?boundCeilDiv(volumes.slice(0,placed).reduce((a,b)=>a+b,0n),widest):0n;
-      const raw=required*BOUND_PPM/tallest-BigInt(opened-1);
+      const raw=boundCeilDiv(runSmallest(volumes,placed),widest)*BOUND_PPM/tallest-(opened-1n);
       height=raw>0n?raw:0n;
     }
   }
   return [
-    boundOutput(BigInt(unpacked),'unpacked count'),
-    boundOutput(BigInt(opened),'container count'),
+    boundOutput(unpacked,'unpacked count'),
+    boundOutput(opened,'container count'),
     boundOutput(boundGuard(cost,'opening cost'),'opening cost'),
     boundOutput(unused,'unused volume'),
     boundOutput(height,'stack height'),
   ];
 }
-/** Exposed for the cross-language scene test only, like `__inspectHullShapeForTests`: the
- *  bounds are internal until a contract freeze decides whether a caller ever sees a gap. */
+/** Every bound from reduced instances -- the shape the shared scene records, so this port is
+ *  checked without reimplementing a request parser. `shrinks` is taken as given; whether this
+ *  engine decides it correctly is asserted separately. */
+function objectiveBounds(instances,containers){
+  return objectiveBoundsFromRuns(boundRuns(instances.map(i=>[i.volume,1n])),
+    boundRuns(instances.map(i=>[i.weight,1n])),instances.some(i=>i.shrinks),containers);
+}
+/** Where each covered objective reads the five bounds: the position in the default-order
+ *  vector of each of the objective's own score keys. Any other objective has no bound. */
+const BOUND_ORDERS=new Map([['default',[0,1,2,3,4]],['lowest_cost',[0,2,1,3,4]]]);
+/** The request's bound in its objective's own score order, or null where none is stated.
+ *
+ *  Read from the request itself, as every engine reads it: every item type with its whole
+ *  quantity (fixed placements are part of it), every container type, lengths in
+ *  ticks and volumes formed in `BigInt` from them, never as a `Number` product converted
+ *  afterwards (F3). Null for an objective with no bound, for a request with a made-to-measure
+ *  container (D13), and for a request past a declared ceiling, which withholds the
+ *  bound and nothing else (OPTIMALITY-GAP.md § 1.5). `O(t log t + c log c)` for `t` item
+ *  types and `c` container types. */
+function requestBound(req,measures){
+  const order=BOUND_ORDERS.get(req.configuration?.objective??'default');
+  if(order===undefined)return null;
+  const rawContainers=req.containers??[];
+  if(rawContainers.some(c=>c.made_to_measure!=null))return null;
+  const unit=req.units?.length??'mm';
+  const items=(req.items??[]).map(raw=>({raw,count:BigInt(raw.quantity??1)})).filter(item=>item.count>0n);
+  const volumes=boundRuns(items.map(({raw,count})=>[volume(measures.sides(raw.dimensions,unit)),count]));
+  const weights=boundRuns(items.map(({raw,count})=>[BigInt(measures.weight(raw.weight??0)),count]));
+  const shrinks=items.some(({raw})=>occupiesLessThanItsBox({nestingHeight:raw.nesting_height??null,shapeType:raw.shape_type??'rigid_cuboid'}));
+  const containers=rawContainers.map(raw=>{
+    const d=measures.sides(raw.inner_dimensions,unit),inner=volume(d);
+    return {usable:inner-inner*BigInt(scaledRatio(raw.void_fill_reserve_ratio??0))/BigInt(SUPPORT_SCALE),inner,
+      baseArea:BigInt(d[0])*BigInt(d[1]),height:BigInt(d[2]),
+      payload:raw.max_payload==null?null:BigInt(measures.weight(raw.max_payload)),
+      maxItems:raw.max_items==null?null:BigInt(raw.max_items),
+      quantity:raw.quantity==null?null:BigInt(raw.quantity),costMinor:BigInt(raw.cost_minor??0)};
+  });
+  let vector;
+  try{vector=objectiveBoundsFromRuns(volumes,weights,shrinks,containers)}
+  catch(error){if(error instanceof BoundOverflowError)return null;throw error}
+  return order.map(position=>vector[position]);
+}
+/** What one score states against `bound`, both in the result's own score order
+ *  (OPTIMALITY-GAP.md § 1.1): the bound through the first missed position with the gap
+ *  there, or the whole bound when nothing is missed -- the attained case, which carries no
+ *  gap rather than a zero one. Null for a score below its bound, which shows the bound
+ *  wrong: an engine must not publish a claim it has just refuted. At most five comparisons. */
+function boundStatement(score,bound){
+  for(let index=0;index<bound.length;index++){
+    const achieved=score[index],least=bound[index];
+    if(achieved<least)return null;
+    if(achieved>least){
+      const difference=BigInt(achieved)-BigInt(least);
+      if(difference>MAX_BOUND_VALUE)return null;
+      const absolute=Number(difference),fields={lower_bound:bound.slice(0,index+1),gap_key:index,absolute_gap:absolute};
+      // Unreduced, so the pair reads as (score - bound, bound) by eye.
+      if(least>0)fields.relative_gap={numerator:absolute,denominator:least};
+      return fields;
+    }
+  }
+  return {lower_bound:[...bound]};
+}
+/** States the request's bound on a result and, by the same rule, on each alternative
+ *  (OPTIMALITY-GAP.md § 1.3). Attainment is the only route to `optimal`: a complete result
+ *  whose score meets the bound on every position is proven, and nothing else is. A result the
+ *  bound does not speak for (§ 1.5) keeps the fact its status gave it. */
+function stateOptimality(result,bound){
+  for(const alternative of result.alternatives??[])stateOptimality(alternative,bound);
+  if(bound===null||result.status==='infeasible'||result.status==='invalid_result')return;
+  const fields=boundStatement(result.score,bound);
+  if(fields===null)return;
+  const attained=!('gap_key' in fields);
+  if(result.complete&&attained)result.status='optimal';
+  result.optimality={code:result.status==='optimal'?'proven_optimal':result.complete?'not_proven':'best_found',...fields};
+}
+/** Exposed for the cross-language scene test only, like `__inspectHullShapeForTests`. */
 export function __objectiveBoundsForTests(instances,containers){return objectiveBounds(instances,containers);}
+export function __requestBoundForTests(req){return requestBound(req,requestMeasures().close());}
 export function __occupiesLessThanItsBoxForTests(item){return occupiesLessThanItsBox(item);}
 function boxShape(dx,dy,dz){
   const v=[];
@@ -1065,6 +1170,14 @@ function axleOverloaded(container,placements,extra=null){const reaction=axleReac
   const [front,rear]=container.axleSpec;
   return (front.max!=null&&reaction.front>BigInt(front.max)*reaction.denominator)
     ||(rear.max!=null&&reaction.rear>BigInt(rear.max)*reaction.denominator)}
+// On the measured Linux/Node 22 workloads, keeping the null guard inside this call avoided
+// the larger TurboFan inlining graph observed with a call-site guard.
+function axleOverloadedWithBase(container,baseLoad,extra){
+  if(baseLoad===null)return false;
+  const [front,rear]=container.axleSpec,w=BigInt(extra.item.w),total=baseLoad.total+w,weighted=baseLoad.moment+w*BigInt(2*extra.x+extra.ed[0]);
+  const denominator=2n*BigInt(rear.position-front.position);
+  const frontLoad=2n*total*BigInt(rear.position)-weighted,rearLoad=weighted-2n*total*BigInt(front.position);
+  return (front.max!=null&&frontLoad>BigInt(front.max)*denominator)||(rear.max!=null&&rearLoad>BigInt(rear.max)*denominator)}
 // Whether one item, alone in an empty container, has an x-origin that overloads
 // neither axle. Each limit is linear in the item's doubled centre, so the feasible origins
 // form one interval whose ends are exact BigInt quotients; O(1). Not a proof: a
@@ -1730,10 +1843,10 @@ function lessThan(left,right){
  * and the compact lattice path admit exactly the same requests. Keeping this inside the
  * general path's own item-building loop is what let the two disagree.
  */
-function admitItem(raw,u){
+function admitItem(raw,u,measures){
   if(!Number.isSafeInteger(raw.quantity??1)||(raw.quantity??1)<1)throw new RangeError('item quantity must be positive');
   if(!isUnitRatio(raw.minimum_support_ratio??0))throw new RangeError('minimum_support_ratio must be between 0 and 1');
-  const d=dims(raw.dimensions,u),nesting=raw.nesting_height==null?null:scalar(raw.nesting_height,u,LEN);
+  const d=measures.sides(raw.dimensions,u),nesting=raw.nesting_height==null?null:measures.length(raw.nesting_height,u);
   if(nesting!=null&&(nesting<0||nesting>=d[2]))throw new RangeError("nesting_height must be at least zero and strictly less than the item's own height");
   if(raw.max_stacked_items!=null&&(!Number.isSafeInteger(raw.max_stacked_items)||raw.max_stacked_items<1))throw new RangeError('max_stacked_items must be a positive safe integer');
   if(raw.stop_index!=null&&(!Number.isSafeInteger(raw.stop_index)||raw.stop_index<0))throw new RangeError('stop_index must be a non-negative safe integer');
@@ -1803,7 +1916,7 @@ function latticePlacements({best,count,firstIndex,raw,weight,clear,ou,ow}){
 // Any `fixed_placements` but an empty list stands the closed-form path down; a malformed one
 // goes on to admission, which refuses it, rather than being answered as if it were absent.
 const hasFixedPlacements=req=>Array.isArray(req.fixed_placements)?req.fixed_placements.length>0:req.fixed_placements!=null;
-function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solverAlias,metrics,effortExceeded,effortRemaining,deadline}){
+function compactGridResult(req,{measures,u,ou,ow,clear,objective,dimensionalWeight,solverAlias,metrics,effortStops,effortStopped,effortRemaining,deadline}){
   // Keep this path opt-in until its capacity-first container choice is
   // proven objective-equivalent to the general path. Admission, effort accounting,
   // injected deadlines and metrics now have direct parity tests; objective quality is
@@ -1824,7 +1937,7 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
     // search checks both per candidate.
     ||(raw.shape_type!=null&&raw.shape_type!=='rigid_cuboid')
     ||!['free',null,undefined].includes(raw.ground_contact_rule))return null;
-  const itemDimensions=dims(raw.dimensions,u),weight=scalar(raw.weight??0,'g',WT);
+  const itemDimensions=measures.sides(raw.dimensions,u),weight=measures.weight(raw.weight??0);
   const rotations=raw.allowed_rotations??(raw.keep_upright?['LWH','WLH']:Object.keys(ROT));
   if(!Array.isArray(rotations)||rotations.some(rotation=>ROT[rotation]===undefined))return null;
   const templates=[];
@@ -1836,9 +1949,9 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
       ||container.deformable_boundary!=null
       // A lattice sized against the machine maximum describes no box cut to measure (D12).
       ||container.made_to_measure!=null)return null;
-    const inner=dims(container.inner_dimensions,u),outer=container.outer_dimensions?dims(container.outer_dimensions,u):inner;
-    templates.push({...container,d:inner,outerD:outer,max:container.max_payload==null?null:scalar(container.max_payload,'g',WT),
-      tare:scalar(container.tare_weight??0,'g',WT),rate:parseRateTable(container.rate_table)})
+    const inner=measures.sides(container.inner_dimensions,u),outer=container.outer_dimensions?measures.sides(container.outer_dimensions,u):inner;
+    templates.push({...container,d:inner,outerD:outer,max:container.max_payload==null?null:measures.weight(container.max_payload),
+      tare:measures.weight(container.tare_weight??0),rate:parseRateTable(container.rate_table)})
   }
   // `lowest_landed_cost` never reaches this path: packFallback forces `compact=null`
   // for that objective (see the exclusion beside the policy-rule gate), because this
@@ -1874,7 +1987,7 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
       // holds for the whole lattice exactly when the type carries itself.
       if(raw.must_be_on_floor||!carriesItself(raw))nz=Math.min(nz,1);
       if(raw.max_top_load!=null&&weight>0){
-        const safeLayers=BigInt(scalar(raw.max_top_load,'g',WT))/BigInt(weight)+1n;
+        const safeLayers=BigInt(measures.weight(raw.max_top_load))/BigInt(weight)+1n;
         if(safeLayers<BigInt(nz))nz=Number(safeLayers)
       }
       let capacity=Math.min(Number.MAX_SAFE_INTEGER,nx*ny*nz);
@@ -1919,7 +2032,7 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
   // clock must produce a time_limit answer rather than a complete one, and a caller
   // cannot tell which path served the request.
   let timeLimitReached=deadline!=null&&deadline.expired();
-  while(remaining>0&&containers.length<maxContainers&&!effortExceeded()&&!timeLimitReached){
+  while(remaining>0&&containers.length<maxContainers&&!timeLimitReached){
     // Rank templates by what the objective actually rewards, not by raw
     // capacity. Capacity-first reads as "the biggest container wins", which minimises
     // container count and then stops caring -- on regression-many-container-types it
@@ -1951,15 +2064,19 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
       .sort((a,b)=>{for(let i=0;i<a.key.length;i++)if(a.key[i]!==b.key[i])return a.key[i]-b.key[i];return 0})
       .map(entry=>entry.p)[0];
     if(plan==null)break;
+    // Asked only once another batch would be counted, so a budget used exactly is not a stop.
+    if(effortStops())break;
     plan.opened++;
-    const template=plan.template,best=plan.best;
+    const template=plan.template,best=plan.best;let cut=false;
     {
       // A compact result represents each placement without iterating over it, but each
       // placement still consumes the same three public effort counters as the general
       // path. Bound the closed-form batch by the smallest remaining allowance so this
-      // optimisation cannot jump across a caller's exact deterministic limit.
-      const count=Math.min(best.capacity,remaining,effortRemaining());
+      // optimisation cannot jump across a caller's exact deterministic limit. A batch the
+      // budget cuts short is a stop: what it has room for is placed, and the search ends.
+      const wanted=Math.min(best.capacity,remaining),count=Math.min(wanted,effortRemaining());
       if(count<=0)break;
+      cut=count<wanted;
       const layers=Math.ceil(count/(best.nx*best.ny));
       const summary={...best,count,weight,clearance:clear};
       const used=volume(best.physical)*BigInt(count),payload=weight*count;
@@ -1994,13 +2111,14 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
       }
     }
     if(deadline!=null&&deadline.expired())timeLimitReached=true;
+    if(cut){effortStops();break}
     if(remaining===0||containers.length>=maxContainers)break
   }
   // Same reason vocabulary and precedence the general path uses: an item left behind
   // because the clock or the effort budget ran out did not fail to fit, and reporting it
   // as exhausted inventory would send a caller looking for a container that was never
-  // the problem.
-  const effortLimitReached=effortExceeded();
+  // the problem. Only a batch the budget refused counts, not a budget used exactly.
+  const effortLimitReached=effortStopped();
   // An item no template can hold under any permitted rotation did not run out of
   // inventory -- there was never a container for it. `plans` drops every zero-capacity
   // template before the loop starts, so an empty `plans` with nothing opened is exactly
@@ -2064,7 +2182,9 @@ function compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solver
 const ORDER_INSENSITIVE_SOLVERS=new Set(['grid','layer','homogeneous_blocks']);
 function seededOrder(items,seed,startIndex){
   const ordered=items.slice();
-  let state=(seed^(startIndex*0x9e3779b1))>>>0||0x9e3779b1;
+  // Like every engine, interpret the caller's seed by its nonnegative residue.
+  const residue=((seed%0x80000000)+0x80000000)%0x80000000;
+  let state=(residue^(startIndex*0x9e3779b1))>>>0||0x9e3779b1;
   const next=()=>{state^=state<<13;state>>>=0;state^=state>>>17;state^=state<<5;state>>>=0;return state};
   for(let i=ordered.length-1;i>0;i--){const j=next()%(i+1);[ordered[i],ordered[j]]=[ordered[j],ordered[i]]}
   return ordered
@@ -2072,7 +2192,7 @@ function seededOrder(items,seed,startIndex){
 // A portfolio's reported effort is what the whole portfolio spent, not what its winner
 // spent. Each run here is a separate `packFallback` call with its own metrics closure, so
 // without this the record understates the work by the number of runs.
-// The counters each effort limit caps, as `effortExceeded` reads them.
+// The counters each effort limit caps, as a frame's effort ceilings read them.
 const EFFORT_COUNTERS=[['max_search_nodes','search_nodes_expanded'],['max_candidates_evaluated','feasible_candidates'],['max_placement_attempts','orientations_considered']];
 /** What the request's effort budget leaves after `runs`; a spent limit is 0.
  *
@@ -2135,9 +2255,9 @@ function portfolioStarts(runs,winnerIndex,globalDeadlineReached){
     global_deadline_reached:start.global_deadline_reached||globalDeadlineReached,
   })))
 }
-// Lattice nodes the block start added to `fast` and `balanced` may enumerate per mode --
-// the bound `quality` gives the same solver through `container_plan_node_limit`, which
-// those two profiles leave at one: too few for the enumeration to reach its first block.
+// Lattice nodes the block solver may enumerate per mode under every profile but `quality`
+// -- the bound `quality` gives it through `container_plan_node_limit`, which the others
+// leave at one: too few for the enumeration to reach its first block.
 const BLOCK_START_NODE_LIMIT=100000;
 // Lattice nodes between two clock reads of the block enumeration.
 const BLOCK_CLOCK_PERIOD=64;
@@ -2298,9 +2418,16 @@ const MEASURES=Object.freeze({length:{units:LEN,parse:(value,unit)=>scalar(value
 export function packFallback(req,clock=monotonicNow,solverAlias=null,startIndex=null,sharedDeadline=null){
   if(!isObject(req))throw new InvalidRequestError('wrong_type','','must be an object');
   rejectUnsupported(req);
-  checkRequest(req,MEASURES);
-  const result=solveChecked(req,clock,solverAlias,startIndex,sharedDeadline);
+  const filling=requestMeasures();
+  checkRequest(req,filling.checker);
+  const measures=filling.close();
+  // Once per pack, from the request alone and before the first solver runs, so computing
+  // the bound never depends on which start won or how much of the deadline was left
+  // (OPTIMALITY-GAP.md F3).
+  const bound=requestBound(req,measures);
+  const result=solveChecked(req,clock,solverAlias,startIndex,sharedDeadline,measures);
   warnUnsupportedPlacements(result,req.configuration?.minimum_support_ratio??0);
+  stateOptimality(result,bound);
   return result;
 }
 // The default minimum_support_ratio of 0 is kept so that no packing answer changes,
@@ -2327,9 +2454,9 @@ export function checkRequestShape(req){
   if(!isObject(req))throw new InvalidRequestError('wrong_type','','must be an object');
   checkRequest(req,MEASURES);
 }
-function solveChecked(req,clock,solverAlias,startIndex,sharedDeadline){
+function solveChecked(req,clock,solverAlias,startIndex,sharedDeadline,measures){
   const phase={solving:false};
-  try{return solveFrame(req,clock,solverAlias,startIndex,sharedDeadline,phase)}
+  try{return solveFrame(req,clock,solverAlias,startIndex,sharedDeadline,measures,phase)}
   catch(error){throw phase.solving?error:asRequestError(error)}
 }
 function asRequestError(error){
@@ -2344,7 +2471,7 @@ function asRequestError(error){
 // is a multi-start run's say over one start's ordering: with `seen`, the start answers null
 // for an item-type sequence already in it and otherwise reports its own; with `swapAt`, the
 // start runs its ordering with that item and the next swapped.
-function solveFrame(req,clock,solverAlias,startIndex,sharedDeadline,phase,addedBlockStart=false,startOrder=null){
+function solveFrame(req,clock,solverAlias,startIndex,sharedDeadline,measures,phase,addedBlockStart=false,startOrder=null){
 // Admit the doors here, beside the other request-admission checks, and not
 // where they are canonicalised. The container template is built after the
 // uniform-lattice fast path has already returned, so validating there let a request
@@ -2394,7 +2521,7 @@ const addsBlockStart=solverAlias===null&&startIndex===null&&requestedSolvers.len
 // the deadline left no time for is recorded as never started, like any other restart.
 const withAddedBlockStart=own=>{
   const late=deadline.expired(),left=effort==null?null:remainingEffort(effort,[own]);
-  const blocks=solveFrame(withEffort({...req,configuration:{...(req.configuration??{}),multi_start_orders:1}},left),clock,'homogeneous_blocks',null,deadline,phase,true);
+  const blocks=solveFrame(withEffort({...req,configuration:{...(req.configuration??{}),multi_start_orders:1}},left),clock,'homogeneous_blocks',null,deadline,measures,phase,true);
   if(blocks===null)return own;
   const runs=late?[own]:[own,blocks],winnerIndex=!late&&compareScore(blocks.score,own.score)<0?1:0,winner=runs[winnerIndex],globalDeadlineReached=deadline.expired();
   const starts=portfolioStarts(runs,winnerIndex,globalDeadlineReached);if(late)starts.push(unstartedRecord('homogeneous_blocks',0,globalDeadlineReached));
@@ -2417,7 +2544,7 @@ const finalizeOutermost=answer=>{
 };
 if(solverAlias===null&&requestedSolvers.length===0&&profile==='quality'){
   const child={...req,configuration:{...(req.configuration??{}),solvers:['homogeneous_blocks','extreme_points','maximal_spaces','layer']}};
-  return solveFrame(child,clock,null,null,deadline,phase)
+  return solveFrame(child,clock,null,null,deadline,measures,phase)
 }
 if(solverAlias===null&&requestedSolvers.length){
   let remainingStarts=restartLimit;
@@ -2434,7 +2561,7 @@ if(solverAlias===null&&requestedSolvers.length){
     if(runs.length&&deadline.expired())break;
     const left=effort==null?null:remainingEffort(effort,runs);
     const childRequest=withEffort({...req,configuration:{...(req.configuration??{}),solvers:[],multi_start_orders:plan.count}},left);
-    runs.push(solveFrame(childRequest,clock,plan.name,null,deadline,phase));
+    runs.push(solveFrame(childRequest,clock,plan.name,null,deadline,measures,phase));
   }
   let winnerIndex=0;for(let index=1;index<runs.length;index++)if(compareScore(runs[index].score,runs[winnerIndex].score)<0)winnerIndex=index;
   const winner=runs[winnerIndex],globalDeadlineReached=deadline.expired();
@@ -2459,7 +2586,7 @@ if(startIndex===null&&multiStartOrders>1){
   const child=stagedPlanSearch?{...req,configuration:{...(req.configuration??{}),max_candidates_per_item:1,container_plan_beam_width:1,container_plan_node_limit:1}}:req;
   const runStart=(request,index,startOrder,label)=>{
     const left=effort==null?null:remainingEffort(effort,runs);
-    const run=solveFrame(withEffort(request,left),clock,solverAlias,index,deadline,phase,false,startOrder);
+    const run=solveFrame(withEffort(request,left),clock,solverAlias,index,deadline,measures,phase,false,startOrder);
     if(run!==null){runs.push(run);labels.push(label)}
     return run!==null};
   // Instances of one item are interchangeable, so a start whose item-type sequence an earlier
@@ -2499,7 +2626,7 @@ if(startIndex===null&&multiStartOrders>1){
   if(suffix)winner.algorithm={...winner.algorithm,solver:`${winner.algorithm.solver}${suffix}`};
   return finalizeOutermost(winner);
 }
-const u=req.units?.length??'mm',ou=req.output?.length_unit??outputLengthUnit(u),ow=req.output?.weight_unit??'g',clear=scalar(req.configuration?.clearance??0,u,LEN);
+const u=req.units?.length??'mm',ou=req.output?.length_unit??outputLengthUnit(u),ow=req.output?.weight_unit??'g',clear=measures.length(req.configuration?.clearance??0,u);
 const objective=req.configuration?.objective??'default';if(!['default','lowest_cost','shipping_cost','lowest_landed_cost','open_dimension_height','maximum_value','maximum_volume'].includes(objective))throw new RangeError(`unknown objective ${JSON.stringify(objective)}`);
 // `maximum_volume` fills space before it counts pieces, so every comparison below that
 // leads with a piece count leads with placed volume instead when this is set.
@@ -2538,22 +2665,29 @@ let timeLimitReached=false;
 // one, and only where a wall-clock stop lands can move.
 let candidateClockTick=0;
 const metrics={candidate_points_considered:0,orientations_considered:0,feasible_candidates:0,collision_checks:0,support_checks:0,space_partitions:0,search_nodes_expanded:0};
-const candidateEffortExceeded=()=>effort!=null&&(
-  (effort.max_candidates_evaluated!=null&&metrics.feasible_candidates>=effort.max_candidates_evaluated)
-  ||(effort.max_placement_attempts!=null&&metrics.orientations_considered>=effort.max_placement_attempts)),
-  effortExceeded=()=>candidateEffortExceeded()||(effort!=null&&effort.max_search_nodes!=null&&metrics.search_nodes_expanded>=effort.max_search_nodes);
-const effortRemaining=()=>effort==null?Number.MAX_SAFE_INTEGER:Math.min(
-  effort.max_candidates_evaluated==null?Number.MAX_SAFE_INTEGER:effort.max_candidates_evaluated-metrics.feasible_candidates,
-  effort.max_placement_attempts==null?Number.MAX_SAFE_INTEGER:effort.max_placement_attempts-metrics.orientations_considered,
-  effort.max_search_nodes==null?Number.MAX_SAFE_INTEGER:effort.max_search_nodes-metrics.search_nodes_expanded,
-);
+// The value of each budgeted counter at which the effort budget stops this frame's search;
+// Infinity for a limit the request leaves out. `let`: the support replay lifts them, as
+// Python runs that diagnosis outside the caller's budget.
+let attemptCeiling=effort?.max_placement_attempts??Infinity,candidateCeiling=effort?.max_candidates_evaluated??Infinity,nodeCeiling=effort?.max_search_nodes??Infinity;
+// Set when a guard found its counter at its ceiling just before counting a step, and
+// refused it. The effort flag reads this, not the counters afterwards, so a start that
+// finishes on exactly its budget is not truncated. Each counter is guarded where it moves --
+// a node before it is expanded, an attempt before it is tried, a candidate before it is
+// counted -- so none passes its limit and none stops work another counter would count. Once
+// set, every guard refuses, and the code between searches reads only this.
+let effortStopped=false;
+// The guard before a search node is counted.
+const nodeStops=()=>effortStopped||(metrics.search_nodes_expanded>=nodeCeiling&&(effortStopped=true));
+// The guard before a step that moves all three counters at once, as a lattice batch does.
+const effortStops=()=>effortStopped||((metrics.orientations_considered>=attemptCeiling||metrics.feasible_candidates>=candidateCeiling||metrics.search_nodes_expanded>=nodeCeiling)&&(effortStopped=true));
+const effortRemaining=()=>Math.min(candidateCeiling-metrics.feasible_candidates,attemptCeiling-metrics.orientations_considered,nodeCeiling-metrics.search_nodes_expanded);
 // Admission runs before either solver path, not inside the general one.
 // These checks used to live in the item-building loop below, which the compact lattice
 // path returns before -- so a request that reached that path was admitted under weaker
 // rules than every other request. A negative `Item.value` was accepted and ignored
 // whenever a caller set `require_placement_coordinates: false`, which the acceptance
 // rules forbid in as many words.
-for(const raw of req.items??[])admitItem(raw,u);
+for(const raw of req.items??[])admitItem(raw,u,measures);
 // Admission for the rule set too, and for the same reason: a malformed rule reaching a
 // solver path would be dropped there, and a request that packs in a way its own policy
 // forbids is exactly what the contract exists to prevent.
@@ -2570,14 +2704,15 @@ const policyRules=parsePolicy(req.policy);
 // price, so this path can settle on an unpriceable container over a priced one before
 // pricing ever entered the decision -- the same reason it already stands down for a
 // registered policy rule.
-const compact=(policyRules.length||objective==='lowest_landed_cost')?null:compactGridResult(req,{u,ou,ow,clear,objective,dimensionalWeight,solverAlias,metrics,effortExceeded,effortRemaining,deadline});
+const compact=(policyRules.length||objective==='lowest_landed_cost')?null:compactGridResult(req,{measures,u,ou,ow,clear,objective,dimensionalWeight,solverAlias,metrics,effortStops,effortStopped:()=>effortStopped,effortRemaining,deadline});
 if(compact!==null)return compact;
-const items=[];for(const raw of req.items){const d=dims(raw.dimensions,u),w=scalar(raw.weight??0,'g',WT),rots=raw.allowed_rotations??(raw.keep_upright?['LWH','WLH']:Object.keys(ROT)),nesting=raw.nesting_height==null?null:scalar(raw.nesting_height,u,LEN),accepts=acceptedStackingGroups(raw);
+const items=[];for(const raw of req.items){const d=measures.sides(raw.dimensions,u),w=measures.weight(raw.weight??0),rots=raw.allowed_rotations??(raw.keep_upright?['LWH','WLH']:Object.keys(ROT)),nesting=raw.nesting_height==null?null:measures.length(raw.nesting_height,u),accepts=acceptedStackingGroups(raw);
+  const maxTop=raw.max_top_load==null?null:measures.weight(raw.max_top_load);
   // The ordering keys below are functions of the item alone, computed once per type here
   // rather than as fresh BigInts on both sides of every comparison the sort makes.
   const vol=volume(d),longest=Math.max(...d),base=BigInt(d[0])*BigInt(d[1]);
   for(let i=1;i<=(raw.quantity??1);i++)items.push({raw,d,w,rots,vol,longest,base,id:`${raw.id}#${i}`,
-    stackable:raw.stackable!==false,maxTop:raw.max_top_load==null?null:scalar(raw.max_top_load,'g',WT),
+    stackable:raw.stackable!==false,maxTop,
     supportPpm:supportPpm(raw.minimum_support_ratio??0),priority:raw.priority??0,
     tags:raw.tags??[],incompatible:raw.incompatible_tags??[],group:raw.group??null,
     nesting,maxStacked:raw.max_stacked_items??null,groundRule:raw.ground_contact_rule??null,
@@ -2648,12 +2783,12 @@ if(startOrder?.seen!=null){const typeOf=new Map(req.items.map((raw,index)=>[raw,
   if(startOrder.seen.has(key))return null;
   startOrder.seen.add(key);startOrder.sequence=sequence;
   for(let at=0;at+1<items.length;at++)if(sequence[at]!==sequence[at+1]&&leadOrder(items[at],items[at+1])===0)startOrder.swappable.push(at)}
-const templates=req.containers.map(c=>{const d=dims(c.inner_dimensions,u),axleSpec=c.axles==null?null:c.axles.map(a=>({position:scalar(a.position,u,LEN),max:a.max_load==null?null:scalar(a.max_load,'g',WT)}));
+const templates=req.containers.map(c=>{const d=measures.sides(c.inner_dimensions,u),axleSpec=c.axles==null?null:c.axles.map(a=>({position:measures.length(a.position,u),max:a.max_load==null?null:measures.weight(a.max_load)}));
   if(axleSpec&&(axleSpec.length!==2||axleSpec[0].position>=axleSpec[1].position||axleSpec[0].position<0||axleSpec[1].position>d[0]))throw new RangeError('axles must be [front, rear] inside the container');
   const reservePpm=scaledRatio(c.void_fill_reserve_ratio??0);
   if(c.tag_limits!=null&&(typeof c.tag_limits!=='object'||Array.isArray(c.tag_limits)||Object.values(c.tag_limits).some(limit=>!Number.isSafeInteger(limit)||limit<1)))throw new RangeError('tag_limits must map strings to positive safe integers');
-  const maxStackDensity=c.max_stack_density==null?null:scalar(c.max_stack_density,'g',WT);if(maxStackDensity!=null&&maxStackDensity<0)throw new RangeError('max_stack_density must be non-negative');
-  const outerD=c.outer_dimensions?dims(c.outer_dimensions,u):d;
+  const maxStackDensity=c.max_stack_density==null?null:measures.weight(c.max_stack_density);if(maxStackDensity!=null&&maxStackDensity<0)throw new RangeError('max_stack_density must be non-negative');
+  const outerD=c.outer_dimensions?measures.sides(c.outer_dimensions,u):d;
   // innerVolume/reserve are pure functions of the immutable template, hoisted out of
   // candidatesFor's innermost (point x rotation) loop where they were recomputed as
   // fresh BigInts per orientation.
@@ -2663,10 +2798,10 @@ const templates=req.containers.map(c=>{const d=dims(c.inner_dimensions,u),axleSp
   // Python, PHP and Rust decoders apply, and the reason all four agree on the answer.
   validateDirections(c.access_directions??[]);
   const doors=Object.freeze(ALL_DIRECTIONS.filter(d=>(c.access_directions??[]).includes(d)));
-  return {...c,d,outerD,doors,bag:c.deformable_boundary!=null,machine:parseMachine(c.made_to_measure,u),max:c.max_payload==null?null:scalar(c.max_payload,'g',WT),tare:scalar(c.tare_weight??0,'g',WT),axleSpec,reservePpm,
+  return {...c,d,outerD,doors,bag:c.deformable_boundary!=null,machine:parseMachine(c.made_to_measure,u,measures),max:c.max_payload==null?null:measures.weight(c.max_payload),tare:measures.weight(c.tare_weight??0),axleSpec,reservePpm,
     innerVolume:volume(d),reserve:volume(d)*BigInt(reservePpm)/BigInt(SUPPORT_SCALE),
     rate:parseRateTable(c.rate_table),tagLimits:c.tag_limits??{},maxStackDensity,
-    obs:(c.obstacles??[]).flatMap(o=>[o,...(o.additional_boxes??[])]).map(o=>({x:scalar(o.origin?.x??0,u,LEN),y:scalar(o.origin?.y??0,u,LEN),z:scalar(o.origin?.z??0,u,LEN),d:dims(o.dimensions,u)}))}}).sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'?(dimensionalWeight(a.outerD)-dimensionalWeight(b.outerD)||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))):((a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))));
+    obs:(c.obstacles??[]).flatMap(o=>[o,...(o.additional_boxes??[])]).map(o=>({x:measures.length(o.origin?.x??0,u),y:measures.length(o.origin?.y??0,u),z:measures.length(o.origin?.z??0,u),d:measures.sides(o.dimensions,u)}))}}).sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'?(dimensionalWeight(a.outerD)-dimensionalWeight(b.outerD)||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))):((a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))));
 // Admission of fixed placements, before any search: the containers they name, each holding
 // only its fixed items, in opening order. Their instances leave the free list.
 const fixedGroups=admitFixedPlacements(req,{items,templates,u,clear});
@@ -2780,8 +2915,9 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
   //: O(p) once per sweep, O(1) per candidate, and a verdict never flips later.
   // Read as scalars, not destructured, so a rigid container pays nothing for the rule.
   const bag=Boolean(tmpl.bag),bagExtents=bag?bagExtent(placements):null,bagX=bag?bagExtents[0]:0,bagY=bag?bagExtents[1]:0,bagZ=bag?bagExtents[2]:0;
-  candidatePoints:for(let pointIndex=0;pointIndex<candidates.length;pointIndex++){const pt=candidates[pointIndex];if(candidateEffortExceeded())break;metrics.candidate_points_considered++;const x=pt[0],y=pt[1],z=pt[2];
-    for(let orientationIndex=0;orientationIndex<orientations.length;orientationIndex++){const orientation=orientations[orientationIndex];if(candidateEffortExceeded())break candidatePoints;metrics.orientations_considered++;if((candidateClockTick++&63)===0&&deadline.expired()){timeLimitReached=true;break candidatePoints}
+  const baseAxle=tmpl.axleSpec==null?null:axleLoad(tmpl,placements);
+  candidatePoints:for(let pointIndex=0;pointIndex<candidates.length;pointIndex++){const pt=candidates[pointIndex];if(effortStopped||metrics.orientations_considered>=attemptCeiling){effortStopped=true;break}metrics.candidate_points_considered++;const x=pt[0],y=pt[1],z=pt[2];
+    for(let orientationIndex=0;orientationIndex<orientations.length;orientationIndex++){const orientation=orientations[orientationIndex];if(effortStopped||metrics.orientations_considered>=attemptCeiling){effortStopped=true;break candidatePoints}metrics.orientations_considered++;if((candidateClockTick++&63)===0&&deadline.expired()){timeLimitReached=true;break candidatePoints}
     const {r,pd,ed}=orientation,x2=x+ed[0],y2=y+ed[1],z2=z+ed[2];
     if(x2>innerX||y2>innerY||z2>innerZ)continue;
     if(bag&&(Math.max(x2,bagX)+Math.max(z2,bagZ)>innerX||Math.max(y2,bagY)+Math.max(z2,bagZ)>innerY))continue;
@@ -2823,7 +2959,7 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
     }
     if(collision)continue;
     if(candidate===null)candidate={x,y,z,pd,ed,r,item};
-    if(axleOverloaded(tmpl,placements,candidate))continue;
+    if(axleOverloadedWithBase(tmpl,baseAxle,candidate))continue;
     if(!allowed(candidate,placements,tmpl,supportRatioPpm,metrics,loadBase,accessBase,sweep))continue;
     // With zero load the candidate is at its largest, and appending it can only shrink
     // existing compressible supports. If that upper bound fits, the exact support-graph
@@ -2832,6 +2968,9 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
     if(compressionSensitive){const upperBound=used+occupiedVolume(candidate);
       if(upperBound+tmpl.reserve>tmpl.innerVolume
         &&usedVolume([...placements,candidate])+tmpl.reserve>tmpl.innerVolume)continue}
+    // Each counter is guarded where it moves: a spent candidate budget refuses this candidate,
+    // not the attempts before it that find nothing feasible.
+    if(metrics.feasible_candidates>=candidateCeiling){effortStopped=true;break candidatePoints}
     metrics.feasible_candidates++;
     const score=farCornerRanked?0:solverAlias==='grid'
       ?z*1e12+y*1e6+x
@@ -2860,7 +2999,7 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
 // already run.
 const candidatesFor=(tmpl,item,state,points,index,used,width,supportRatioPpm)=>{
   const found=sweepCandidates(tmpl,item,state,points.length>maxCandidatePoints?points.slice(0,maxCandidatePoints):points,index,used,width,supportRatioPpm);
-  if(tmpl.axleSpec==null||item.w<=0||found.length||timeLimitReached||candidateEffortExceeded())return found;
+  if(tmpl.axleSpec==null||item.w<=0||found.length||timeLimitReached)return found;
   return sweepCandidates(tmpl,item,state,axleBalancedPoints(tmpl,state.placements,points,item,clear),index,used,width,supportRatioPpm)};
 const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const seeded=seedState(tmpl),state=seeded.state;const next=[];
   // Running `usedVolume` of `state.placements`, maintained incrementally rather than
@@ -2876,7 +3015,7 @@ const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const seeded=seedState(tmpl),s
     const snapshotPoints=batch.length>1?points.slice():null,snapshotIndex=batch.length>1?copyIndex(index):null;let ok=true;
     for(const item of batch){
       if(deadline.expired()){timeLimitReached=true;ok=false;break}
-      if(effortExceeded()){ok=false;break}
+      if(nodeStops()){ok=false;break}
       metrics.search_nodes_expanded++;
       const best=candidatesFor(tmpl,item,state,points,index,used,1,globalSupportPpm)[0];
       if(!best){ok=false;break}
@@ -2976,7 +3115,7 @@ const packBeamIntoTemplate=(tmpl,itemsRemaining)=>{
   let pendingFrom=null;
   for(let position=0;position<batches.length;position++){
     const batch=batches[position],future=batches.slice(position+1).flat(),expansions=[];let exhausted=false;
-    for(const node of beam){if(nodes>=containerPlanNodeLimit||deadline.expired()||effortExceeded()){exhausted=true;break}nodes++;metrics.search_nodes_expanded++;
+    for(const node of beam){if(nodes>=containerPlanNodeLimit||deadline.expired()||nodeStops()){exhausted=true;break}nodes++;metrics.search_nodes_expanded++;
       const children=[];
       if(batch.length===1){for(const candidate of candidatesFor(tmpl,batch[0],node.state,node.points,node.index,node.used,maxCandidatesPerItem,globalSupportPpm))
         children.push(lazyChild(node,candidate))}else{
@@ -3128,7 +3267,7 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
   const completeLowerBound=optimisticCompletionScore(freshWork(),suffixItems[0]);
   const dfs=(depth,work,reachable)=>{
     if(deadline.expired()){timeLimitReached=true;return}
-    if(effortExceeded())return;
+    if(nodeStops())return;
     metrics.search_nodes_expanded++;
     const unpackedHere=itemsRemaining.length-(work.state.placements.length-fixedCount);
     // Both count gates -- this one and the reachable-count cut below -- assume the vector
@@ -3144,7 +3283,7 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
       dfs(depth+1,child,rest);
       if(compareScore(bestRank,completeLowerBound)===0)return;
       if(deadline.expired()){timeLimitReached=true;return}
-      if(effortExceeded())return}
+      if(effortStopped)return}
     dfs(depth+1,work,rest)};
   dfs(0,freshWork(),itemsRemaining.length);
   const placed=new Set(best.state.placements.map(p=>p.item.id));
@@ -3152,10 +3291,11 @@ const packExactIntoTemplate=(tmpl,itemsRemaining)=>{
 };
 // Deterministic solid single-type block search. Candidate enumeration is
 // O(B*S*T*R*X*Y) time and O(S+n) space; the shared deadline/effort counters and
-// containerPlanNodeLimit bound it exactly as in Python, PHP and Rust. The start added to
-// `fast` and `balanced` carries its own node bound, and `fast`, being latency-bound, runs
-// only the one enumeration its objective ranks by.
-const blockNodeLimit=addedBlockStart?BLOCK_START_NODE_LIMIT:containerPlanNodeLimit;
+// containerPlanNodeLimit bound it exactly as in Python, PHP and Rust. Outside `quality`,
+// whether named in `solvers` or added to `fast` and `balanced`, it carries its own node
+// bound, and `fast`'s added start, being latency-bound, runs only the one
+// enumeration its objective ranks by.
+const blockNodeLimit=qualityProfile?containerPlanNodeLimit:BLOCK_START_NODE_LIMIT;
 const blockModes=addedBlockStart&&profile==='fast'?[byVolume]:[false,true];
 // A block set on a smaller one overhangs it, so a request that asks for support is left
 // to the per-item search.
@@ -3185,11 +3325,11 @@ const blockFinish=(round,reached)=>({state:round.state,next:round.itemIds.flatMa
 // One round's `leaders` leading blocks, best first, under `nodeLimit` and the effort budget,
 // and whether a limit stopped the round (which then commits nothing). `counter.nodes` is the
 // mode's node count so far.
-const blockLeading=(round,volumeFirst,leaders,nodeLimit,counter)=>{const {state,spaces,byType,itemIds,lattices}=round,tmpl=state.tmpl,nodes=counter.nodes;
-  // The counted limits cannot move during one round's enumeration: the candidate counters
-  // change only when a block is placed, and the search-node counter moves with `nodes`.
-  const stopAt=candidateEffortExceeded()?nodes:Math.min(nodeLimit,
-    effort?.max_search_nodes==null?Infinity:nodes+Math.max(0,effort.max_search_nodes-metrics.search_nodes_expanded));
+const blockLeading=(round,volumeFirst,leaders,nodeLimit,counter)=>{if(effortStopped)return {leading:[],reached:true};
+  const {state,spaces,byType,itemIds,lattices}=round,tmpl=state.tmpl,nodes=counter.nodes;
+  // Only the search-node counter moves during one round's enumeration; the candidate
+  // counters move when a block is placed, and `blockCommit` guards them there.
+  const budgetStopAt=nodes+Math.max(0,nodeCeiling-metrics.search_nodes_expanded),stopAt=Math.min(nodeLimit,budgetStopAt);
   // A type's capacity and lattices do not depend on the space they are tried in.
   const types=[];
   for(let slot=0;slot<itemIds.length;slot++){const itemId=itemIds[slot];
@@ -3216,20 +3356,30 @@ const blockLeading=(round,volumeFirst,leaders,nodeLimit,counter)=>{const {state,
   // stopped round places nothing, so its incumbent and the nodes past the stop never count.
   const stop=blockStopNode(nodes,scan.nodes-nodes,stopAt,deadline),end=stop>=0?stop:scan.nodes;
   metrics.search_nodes_expanded+=end-nodes;counter.nodes=end;
-  if(stop>=0)return {leading:[],reached:true};
+  // A clock stop lands before `stopAt`; one on it is the node budget's only where the solver's
+  // own node limit would not have stopped there anyway.
+  if(stop>=0){if(stop===budgetStopAt&&budgetStopAt<nodeLimit)effortStopped=true;return {leading:[],reached:true}}
   return {leading:leaders>1?scan.leading:scan.best==null?[]:[scan.best],reached:false}};
-// Place every member of `best`, bottom layer first, and carve it from the free spaces.
-const blockCommit=(round,best)=>{const chosen=round.byType.get(best.itemId).splice(0,best.count),state=round.state;let index=0;
-  for(let z=0;z<best.nz;z++)for(let y=0;y<best.ny;y++)for(let x=0;x<best.nx;x++){
-    const placement={x:best.space.x+x*best.ed[0],y:best.space.y+y*best.ed[1],z:best.space.z+z*best.ed[2],pd:best.pd,ed:best.ed,r:best.rotation,item:chosen[index++]};
+// Place every member of `best`, x fastest, then y, then z, and carve it from the free spaces.
+// Each member is one placement attempt and one candidate, so a block the effort budget has no
+// room for places only the members it has room for -- a member above the bottom layer still
+// rests on the one beneath it -- records the stop and answers false: the search ends there,
+// and no counter passes its limit. O(count) time.
+const blockCommit=(round,best)=>{const state=round.state,perLayer=best.nx*best.ny;
+  const members=Math.max(0,Math.min(best.count,attemptCeiling-metrics.orientations_considered,candidateCeiling-metrics.feasible_candidates));
+  const chosen=round.byType.get(best.itemId).splice(0,members);
+  for(let index=0;index<members;index++){const x=index%best.nx,y=Math.floor(index/best.nx)%best.ny,z=Math.floor(index/perLayer);
+    const placement={x:best.space.x+x*best.ed[0],y:best.space.y+y*best.ed[1],z:best.space.z+z*best.ed[2],pd:best.pd,ed:best.ed,r:best.rotation,item:chosen[index]};
     state.placements.push(placement);state.payload+=placement.item.w;metrics.feasible_candidates++;metrics.orientations_considered++}
-  round.spaces=subtractBlock(round.spaces,{x:best.space.x,y:best.space.y,z:best.space.z,d:[best.nx*best.ed[0],best.ny*best.ed[1],best.nz*best.ed[2]]},metrics)};
+  if(members<best.count){effortStopped=true;return false}
+  round.spaces=subtractBlock(round.spaces,{x:best.space.x,y:best.space.y,z:best.space.z,d:[best.nx*best.ed[0],best.ny*best.ed[1],best.nz*best.ed[2]]},metrics);
+  return true};
 // Commit each round's leading block until nothing more fits.
 const blockComplete=(round,volumeFirst,nodeLimit,counter)=>{let reached=false;
   while(blockOpen(round)){const step=blockLeading(round,volumeFirst,1,nodeLimit,counter);
     if(step.reached){reached=true;break}
     if(!step.leading.length)break;
-    blockCommit(round,step.leading[0])}
+    if(!blockCommit(round,step.leading[0])){reached=true;break}}
   return blockFinish(round,reached)};
 const blockMode=(tmpl,itemsRemaining,volumeFirst)=>blockComplete(blockStart(tmpl,itemsRemaining),volumeFirst,blockNodeLimit,{nodes:0});
 const blockModeKey=candidate=>{const placements=candidate.state.placements,used=usedVolume(placements),top=placements.reduce((z,p)=>Math.max(z,p.z+p.ed[2]),0);
@@ -3251,13 +3401,15 @@ const blockLookahead=(tmpl,itemsRemaining,volumeFirst,greedy)=>{const round=bloc
   while(blockOpen(round)){const step=blockLeading(round,volumeFirst,BLOCK_LOOKAHEAD_WIDTH,nodeLimit,counter);
     if(step.reached||!step.leading.length)break;
     let chosen=known,chosenBlock=step.leading[0],reached=false;
-    for(let index=known==null?0:1;index<step.leading.length;index++){const trial=blockCopy(round);blockCommit(trial,step.leading[index]);
+    for(let index=known==null?0:1;index<step.leading.length;index++){const trial=blockCopy(round);
+      if(!blockCommit(trial,step.leading[index])){reached=true;break}
       const answer=blockComplete(trial,volumeFirst,nodeLimit,counter);
       if(answer.reached){reached=true;break}
       if(chosen==null||blockAnswerOrder(answer,chosen)<0){chosen=answer;chosenBlock=step.leading[index]}}
     if(reached||chosen==null)break;
     if(blockAnswerOrder(chosen,best)<0)best=chosen;
-    blockCommit(round,chosenBlock);known=chosen}
+    if(!blockCommit(round,chosenBlock))break;
+    known=chosen}
   return {...best,reached:best.reached||deadline.expired()}};
 const packBlocksIntoTemplate=(tmpl,itemsRemaining)=>{if(!homogeneousBlocksSupported()||tmpl.fixed)return tryPackIntoTemplate(tmpl,itemsRemaining);
   // Modes are ranked by (lead, top, placement signature). A single mode is never ranked, and
@@ -3325,11 +3477,12 @@ const madeToMeasureTrial=(tmpl,itemsRemaining)=>{
   const rungs=solvingEnvelopes(tmpl.machine,tmpl.d,itemsRemaining.map(item=>item.d.map(edge=>edge+2*clear)));
   let best=null,bestScore=null,last=null,trials=0;
   for(const rung of rungs){
+    // Before a further rung, never after the last one; a rung's own guards refuse a spent budget.
+    if(trials>0&&effortStopped)break;
     const trial=packIntoTemplate({...tmpl,d:rung,innerVolume:volume(rung),reserve:0n},itemsRemaining);trials++;last=trial;
     if(trial.state.placements.length){const cut=fabricatedTrial(tmpl,trial);if(!trial.next.length)return {trial:cut,trials};
       const score=roundScore(cut,itemsRemaining);if(bestScore==null||compareRound(score,bestScore)<0){best=cut;bestScore=score}}
-    if(deadline.expired()){timeLimitReached=true;break}
-    if(effortExceeded())break}
+    if(deadline.expired()){timeLimitReached=true;break}}
   return {trial:best??last,trials}};
 // A rung trial as the box cut for it: the achieved extent of its placements, envelope far faces
 // with clearance, rounded up onto the machine grid (D14). O(p).
@@ -3342,7 +3495,7 @@ const fabricatedTrial=(tmpl,trial)=>{const box=fabricate(tmpl.machine,tmpl.d,bag
 let fixedReached=false;
 for(const group of fixedGroups){const seeded={...group.tmpl,fixed:group.placements};let trial=null;
   if(deadline.expired())timeLimitReached=true;else if(!fixedReached)trial=packIntoTemplate(seeded,remaining);
-  if(trial===null||timeLimitReached||effortExceeded())fixedReached=true;
+  if(trial===null||timeLimitReached||effortStopped)fixedReached=true;
   inventory.set(seeded.id,inventory.get(seeded.id)-1);seq++;
   packed.push({...(trial===null?seedState(seeded).state:trial.state),seq});
   if(trial!==null)remaining.splice(0,remaining.length,...trial.next)}
@@ -3350,7 +3503,7 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
   const initial={packed:packed.slice(),remaining:remaining.slice(),inventory:new Map(inventory),seq};let beam=fixedReached?[]:[initial],incumbent=initial,planNodes=0;
   while(beam.length&&planNodes<containerPlanNodeLimit){const expansions=[];let exhausted=false;
     for(const plan of beam){if(!plan.remaining.length||plan.packed.length>=maxContainers){if(compareScore(planScore(plan),planScore(incumbent))<0)incumbent=plan;continue}
-      for(const tmpl of templates){if(planNodes>=containerPlanNodeLimit)break;if(deadline.expired()||effortExceeded()){exhausted=true;break}if(plan.inventory.get(tmpl.id)<=0)continue;
+      for(const tmpl of templates){if(planNodes>=containerPlanNodeLimit)break;if(deadline.expired()||effortStopped){exhausted=true;break}if(plan.inventory.get(tmpl.id)<=0)continue;
         // Each rung is one single-container solve, so the node limit keeps bounding the work
         // of a made-to-measure chain.
         const {trial,trials}=trialFor(tmpl,plan.remaining);planNodes+=trials;if(!trial.state.placements.length)continue;const nextInventory=new Map(plan.inventory);nextInventory.set(tmpl.id,nextInventory.get(tmpl.id)-1);
@@ -3363,7 +3516,7 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
   packed.splice(0,packed.length,...incumbent.packed);remaining.splice(0,remaining.length,...incumbent.remaining);seq=incumbent.seq;
 }else while(remaining.length&&packed.length<maxContainers&&!fixedReached){
   if(deadline.expired()){timeLimitReached=true;break}
-  if(effortExceeded())break;
+  if(effortStopped)break;
   const eligible=templates.filter(c=>inventory.get(c.id)>0&&remaining.some(i=>(!i.eligibleTags.length||i.eligibleTags.some(tag=>(c.tags??[]).includes(tag)))&&i.rots.some(r=>{const d=rotate(i.d,r).map(x=>x+2*clear);return d.every((x,k)=>x<=c.d[k])})));
   if(!eligible.length)break;
   // Evaluate every eligible template against the same `remaining` items
@@ -3405,8 +3558,12 @@ const supportIsTheBlocker=i=>{
   if(supportVerdicts.has(i.raw.id))return supportVerdicts.get(i.raw.id);
   if(finishedScenes==null)finishedScenes=packed.map(c=>{const tmpl={...c.tmpl,fixed:c.placements};return {tmpl,...seedState(tmpl)}});
   const unsupported={...i,supportPpm:0,groundRule:null},counters={...metrics},reached=timeLimitReached,tick=candidateClockTick;
+  // The replay diagnoses a finished search, so the effort budget neither bounds it nor can be
+  // stopped by it: a verdict must not depend on how close the search came to its limit.
+  const ceilings=[attemptCeiling,candidateCeiling,nodeCeiling];attemptCeiling=candidateCeiling=nodeCeiling=Infinity;
   const fits=(scene,item,ratio)=>candidatesFor(scene.tmpl,item,scene.state,scene.points,scene.index,scene.used,1,ratio).length>0;
   const blocked=finishedScenes.some(scene=>fits(scene,unsupported,0)&&!fits(scene,i,globalSupportPpm));
+  [attemptCeiling,candidateCeiling,nodeCeiling]=ceilings;
   Object.assign(metrics,counters);timeLimitReached=reached;candidateClockTick=tick;
   supportVerdicts.set(i.raw.id,blocked);return blocked};
 const unpacked=remaining.map(i=>{
@@ -3420,7 +3577,7 @@ const unpacked=remaining.map(i=>{
   // whatever a policy says, and naming the policy first would send a caller to change the
   // wrong thing.
   const cited=policyRules.length?provesUnplaceable(policyRules,i.tags,templates):null;
-  const reason=!fitsAnyRotation?'no_compatible_container_dimensions':!dimensionFit?'rotation_restricted':!weightFit?'payload_exceeded':!eligibleFit?'no_eligible_container':cited!==null?'policy_rule':timeLimitReached?'time_limit':effortExceeded()?'effort_limit':i.group!==null?'group_cannot_fit_together':supportIsTheBlocker(i)?'insufficient_support':limitReason(i,templates,openedByType,maxContainers,clear)??'search_exhausted',details=reason==='policy_rule'?[cited]:[];
+  const reason=!fitsAnyRotation?'no_compatible_container_dimensions':!dimensionFit?'rotation_restricted':!weightFit?'payload_exceeded':!eligibleFit?'no_eligible_container':cited!==null?'policy_rule':timeLimitReached?'time_limit':effortStopped?'effort_limit':i.group!==null?'group_cannot_fit_together':supportIsTheBlocker(i)?'insufficient_support':limitReason(i,templates,openedByType,maxContainers,clear)??'search_exhausted',details=reason==='policy_rule'?[cited]:[];
   return {item_id:i.id,item_type:i.raw.id,reason,details,proof:proofForReason(reason,details)}
 });
 // Canonical objective vector — see docs/OBJECTIVE.md. Five lexicographic keys,
@@ -3455,7 +3612,7 @@ if(objective==='lowest_landed_cost')for(const c of packed){
   unpriceableDetail={id:c.tmpl.id,grams,bound:table==null?0:table.brackets[table.brackets.length-1]};
   break
 }
-const status=unpacked.length?(timeLimitReached?'time_limit':'best_found'):'feasible',complete=!unpacked.length,effortLimitReached=effortExceeded();
+const status=unpacked.length?(timeLimitReached?'time_limit':'best_found'):'feasible',complete=!unpacked.length,effortLimitReached=effortStopped;
 const solverName=solverAlias?`${solverAlias}:javascript_fallback`:'javascript_fallback';
 const starts=[{id:solverName,started:true,completed:!timeLimitReached&&!effortLimitReached,truncated:timeLimitReached||effortLimitReached,selected:true,global_deadline_reached:timeLimitReached}],termination=aggregateTermination(starts);if(effortLimitReached&&!timeLimitReached)termination.code='effort_limit';
 const scoreValueForgone=remaining.reduce((sum,i)=>sum+(i.value??0),0);
@@ -3714,8 +3871,8 @@ function sequenceInputs(boxes,container){if(!Array.isArray(boxes))throw new Type
 function validateDirections(directions){for(const direction of directions)if(!ALL_DIRECTIONS.includes(direction))throw new InvalidDirectionError(direction)}
 function overlapAreaXY(a,b){return Math.max(0,Math.min(a.x+a.d.length,b.x+b.d.length)-Math.max(a.x,b.x))*Math.max(0,Math.min(a.y+a.d.width,b.y+b.d.width)-Math.max(a.y,b.y))}
 function sequenceIntersects(a,b){return a.x<b.x+b.d.length&&a.x+a.d.length>b.x&&a.y<b.y+b.d.width&&a.y+a.d.width>b.y&&a.z<b.z+b.d.height&&a.z+a.d.height>b.z}
-function loadingDependencies(boxes){return boxes.map((upper,upperIndex)=>boxes.flatMap((lower,lowerIndex)=>
-  lowerIndex!==upperIndex&&lower.z+lower.d.height===upper.z&&overlapAreaXY(lower,upper)>0?[lowerIndex]:[]))}
+function loadingDependencies(boxes){return boxes.map((upper,upperIndex)=>{const supporters=[];for(let lowerIndex=0;lowerIndex<boxes.length;lowerIndex++){const lower=boxes[lowerIndex];
+  if(lowerIndex!==upperIndex&&lower.z+lower.d.height===upper.z&&overlapAreaXY(lower,upper)>0)supporters.push(lowerIndex)}return supporters})}
 function unloadingDependencies(boxes){const loading=loadingDependencies(boxes),result=boxes.map(()=>[]);loading.forEach((supporters,upper)=>supporters.forEach(lower=>result[lower].push(upper)));return result}
 function graphAcyclic(dependsOn){const visiting=new Set(),visited=new Set();function visit(node){if(visited.has(node))return true;if(visiting.has(node)||node<0||node>=dependsOn.length)return false;visiting.add(node);for(const dependency of dependsOn[node])if(!visit(dependency))return false;visiting.delete(node);visited.add(node);return true}return dependsOn.every((_,index)=>visit(index))}
 export class LoadingDependencyGraph{
@@ -3742,7 +3899,7 @@ function blockingIndices(index,boxes,present,container,direction){const [x1,y1,z
   return blocked}
 function validatePermutation(boxes,order){const sorted=[...order].sort((a,b)=>a-b);if(sorted.length!==boxes.length||sorted.some((value,index)=>value!==index))throw new SequenceReplayError(-1,-1,'order is not a permutation of every placement index exactly once')}
 function validateSequenceBox(index,step,boxes,present,container){const box=boxes[index];if(box.x<0||box.y<0||box.z<0||box.x+box.d.length>container.length||box.y+box.d.width>container.width||box.z+box.d.height>container.height)throw new SequenceReplayError(index,step,'placement is outside the container');
-  if([...present].some(other=>other!==index&&sequenceIntersects(box,boxes[other])))throw new SequenceReplayError(index,step,'placement collides with an already present placement')}
+  for(const other of present)if(other!==index&&sequenceIntersects(box,boxes[other]))throw new SequenceReplayError(index,step,'placement collides with an already present placement')}
 function replayRemovalNormalized(boxes,container,order,directions){validatePermutation(boxes,order);const dependencies=unloadingDependencies(boxes),present=new Set(boxes.map((_,index)=>index));
   order.forEach((index,step)=>{validateSequenceBox(index,step,boxes,present,container);if(dependencies[index].some(dependency=>present.has(dependency)))throw new SequenceReplayError(index,step,'something still resting on it has not been removed yet');if(clearDirection(index,boxes,present,container,directions)==null)throw new SequenceReplayError(index,step,'no allowed direction is clear of the remaining placements');present.delete(index)})}
 function replayLoadingNormalized(boxes,container,order,directions){validatePermutation(boxes,order);const dependencies=loadingDependencies(boxes),present=new Set();
