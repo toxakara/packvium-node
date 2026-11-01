@@ -90,6 +90,6 @@ export function fabricate(machine, maximum, achieved, fee, tare) {
     sides,
     outer: sides.map((side, axis) => side + machine.allowance[axis]),
     cost: Number(BigInt(fee) + perSquareMetre(machine.price, area)),
-    tare: Number(BigInt(tare) + perSquareMetre(machine.tarePerSquareMetre, area)),
+    tare: BigInt(tare) + perSquareMetre(machine.tarePerSquareMetre, area),
   };
 }

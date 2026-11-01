@@ -12,7 +12,7 @@ import { abs, ceilDiv, floorDiv, max, pyMod, ratioPpm } from './num.js';
 import { intTuple, list as listRepr, pyRepr, pyStr, strRepr, valueTuple } from './pyfmt.js';
 import { allows, intersectsTags, isRotation, rotated, sortedTags, volumeOf } from './spec.js';
 import {
-  SCORE_SCALE, SQUARE_METRE_TICKS, checkCrush, checkRouteRemovalOrder, checkStackDensity, checkSupportAndLoad,
+  SCORE_SCALE, SQUARE_METRE_TICKS, checkCrush, checkRouteRemovalOrder, checkStackDensity, checkStackTopLoad, checkSupportAndLoad,
   occupiedVolume, placedHull, propagateLoad, supportGraph, validNesting,
 } from './stacking.js';
 
@@ -188,11 +188,12 @@ export function checkContainer(packed, spec, items, clearance, globalSupport, is
   const graph = supportGraph(entries);
   checkSupportAndLoad(entries, graph, globalSupport, issues);
   const loads = propagateLoad(entries, graph);
+  checkStackTopLoad(entries, loads, issues);
   if (spec.maxStackDensity !== null) checkStackDensity(packedId, entries, loads, spec.maxStackDensity, issues);
   checkCrush(packedId, entries, loads, issues);
   checkRouteRemovalOrder(packedId, entries, graph, spec.inner, spec.accessDirections, issues);
   checkLimits(packed, packedId, placements, spec, items, payload, issues);
-  checkVolumes(packed, packedId, placements, spec, items, envelopes, loads, issues);
+  checkVolumes(packed, packedId, placements, spec, items, envelopes, loads, clearance, issues);
   const totalWeight = payloadOf(placements, items);
   checkCentreOfMass(packed, packedId, placements, spec, items, totalWeight, issues);
   checkAxles(packed, packedId, placements, spec, items, totalWeight, issues);
@@ -281,7 +282,7 @@ function checkLimits(packed, packedId, placements, spec, items, payload, issues)
 /** Python's `int(value) != computed` for a reported figure that is present. */
 const differs = (reported, computed) => reported !== null && pyInt(reported, 'a reported volume') !== computed;
 
-function checkVolumes(packed, packedId, placements, spec, items, envelopes, loads, issues) {
+function checkVolumes(packed, packedId, placements, spec, items, envelopes, loads, clearance, issues) {
   const entries = envelopes.items();
   // Every placement counts, through the envelope its item id resolves to -- a repeated id
   // resolves to its last placement, as the reference's dict does.
@@ -293,7 +294,11 @@ function checkVolumes(packed, packedId, placements, spec, items, envelopes, load
     const left = entries[first][1];
     if (left.spec === undefined || left.spec.nestingHeight === null) continue;
     for (let second = first + 1; second < entries.length; second += 1) {
-      if (validNesting(left, entries[second][1])) used -= left.spec.nestingHeight * left.envelope.length * left.envelope.width;
+      if (!validNesting(left, entries[second][1])) continue;
+      // The envelopes sink by the nesting height; the items themselves overlap by twice the
+      // clearance less, over their own footprint.
+      const margin = 2n * clearance, overlap = left.spec.nestingHeight - margin;
+      if (overlap > 0n) used -= overlap * (left.envelope.length - margin) * (left.envelope.width - margin);
     }
   }
   const reportedVolume = getNull(packed, 'used_volume_ticks3');

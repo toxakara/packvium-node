@@ -19,8 +19,10 @@ export {
 export { FixedPlacementError, InvalidRequestError, UnsupportedFeatureError };
 import * as commerceFallback from './commerce.js';
 export { CommerceInputError } from './commerce.js';
+export { parseExact, stringifyExact } from './exact-json.js';
 import { SUITE_VERSION } from './artifacts.js';
 import { validateDocuments } from './result-validation/index.js';
+import { parseExact, stringifyExact } from './exact-json.js';
 const require = createRequire(import.meta.url);
 
 /** The largest `maxMoves` the addon's `u32` parameter holds; napi wraps anything above it. */
@@ -120,11 +122,13 @@ export function packJsonWith(binding, input) {
     checkRequestShape(JSON.parse(input));
     return answered(() => binding.packJson(input));
   }
-  return JSON.stringify(packFallback(JSON.parse(input)));
+  return stringifyExact(packFallback(JSON.parse(input)));
 }
 
+// Through `exact-json`, so a weight's `ticks` past 2^53 - 1 arrives as an exact `BigInt` from
+// either backend, and a result holding one can be passed back in (R19-01).
 export function pack(request) {
-  return JSON.parse(packJson(JSON.stringify(request)));
+  return parseExact(packJson(stringifyExact(request)));
 }
 
 export function rebalanceWeight(request, result, options) {
@@ -143,12 +147,12 @@ export function rebalanceWeightWith(binding, request, result, { maxMoves = 64 } 
     throw new RangeError('maxMoves must be an integer from 0 to 4294967295');
   }
   if (binding?.rebalanceJson) {
-    return JSON.parse(answered(() => binding.rebalanceJson(JSON.stringify(request), JSON.stringify(result), maxMoves)));
+    return parseExact(answered(() => binding.rebalanceJson(stringifyExact(request), stringifyExact(result), maxMoves)));
   }
   return rebalanceFallback(request, result, { maxMoves });
 }
 
-export const version = () => native?.version?.() ?? '1.8.0-js-fallback';
+export const version = () => native?.version?.() ?? '1.9.0-js-fallback';
 
 /**
  * The result is not a document the reference validator can judge (docs/VALIDATION-CONTRACT.md):
@@ -193,7 +197,7 @@ export function validate(request, result) {
 // binding without `validateJson` (or none) is answered by the JavaScript port.
 export function validateWith(binding, request, result) {
   const outcome = binding?.validateJson
-    ? JSON.parse(binding.validateJson(JSON.stringify(request), JSON.stringify(result)))
+    ? JSON.parse(binding.validateJson(stringifyExact(request), stringifyExact(result)))
     : validateDocuments(request, result);
   if (outcome.refusal) {
     throw new MalformedResult(outcome.refusal.message, outcome.refusal.kind);

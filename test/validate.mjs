@@ -37,7 +37,11 @@ function overlaps(one, other) {
     start < other.at[axis] + other.size[axis] && start + one.size[axis] > other.at[axis]);
 }
 
-function validNesting(one, other, itemsById, lengthUnit) {
+/**
+ * Whether two physical boxes are a nesting pair. The envelopes sink by `nesting_height`, so the
+ * boxes themselves sink by twice the clearance less.
+ */
+function validNesting(one, other, itemsById, lengthUnit, clearance = 0) {
   if (one.type !== other.type) return false;
   const nesting = itemsById.get(one.type)?.nesting_height;
   if (nesting == null) return false;
@@ -46,7 +50,7 @@ function validNesting(one, other, itemsById, lengthUnit) {
     || one.at[1] + one.size[1] !== other.at[1] + other.size[1]) return false;
   const [lower, upper] = one.at[2] <= other.at[2] ? [one, other] : [other, one];
   return lower.at[2] !== upper.at[2]
-    && lower.at[2] + lower.size[2] - upper.at[2] === requestLengthTicks(nesting, lengthUnit);
+    && lower.at[2] + lower.size[2] - upper.at[2] === requestLengthTicks(nesting, lengthUnit) - 2 * clearance;
 }
 
 function boxesOf(container, latticeSequences = new Map()) {
@@ -277,6 +281,7 @@ export function validate(request, result) {
   const itemsById = new Map(request.items.map((item) => [item.id, item]));
   const containersById = new Map(request.containers.map((container) => [container.id, container]));
   const lengthUnit = request.units?.length ?? 'mm';
+  const clearance = request.configuration?.clearance == null ? 0 : requestLengthTicks(request.configuration.clearance, lengthUnit);
 
   const seen = new Set();
   const inventory = new Map();
@@ -309,7 +314,8 @@ export function validate(request, result) {
       if (box.at.some((start, axis) => start < 0 || start + box.size[axis] > inner[axis])) {
         issues.push('outside_container');
       }
-      if (item.must_be_on_floor && box.at[2] !== 0) issues.push('must_be_on_floor');
+      // The envelope stands on the floor; the item itself starts one clearance above it.
+      if (item.must_be_on_floor && box.at[2] !== clearance) issues.push('must_be_on_floor');
       if (item.group != null) {
         groupHomes.set(item.group, (groupHomes.get(item.group) ?? new Set()).add(container.id));
       }
@@ -318,7 +324,7 @@ export function validate(request, result) {
         // The axis-aligned test is the broad phase; the exact test refines it only when a hull
         // is one of the two solids, so an ordinary box pair reaches the same verdict it always
         // did.
-        if (overlaps(box, other) && !validNesting(box, other, itemsById, lengthUnit)
+        if (overlaps(box, other) && !validNesting(box, other, itemsById, lengthUnit, clearance)
           && solidsOverlap(solidOf(box, item, lengthUnit),
             solidOf(other, itemsById.get(other.type), lengthUnit))) {
           issues.push('collision');

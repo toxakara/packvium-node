@@ -282,3 +282,59 @@ test('without an output block the result is in the request unit spelt as its cod
     assert.equal(packFallback(request).containers[0].inner_dimensions.length.unit, code, unit);
   }
 });
+
+test('a length or a box past the admission ceiling is refused where it is spelled', () => {
+  const tooLong = 'must be at most 9007199254740991 ticks';
+  assertRefused((r) => { r.items[0].dimensions.length = { value: '9007199254740992', unit: 'ticks' }; },
+    'above_maximum', '/items/0/dimensions/length', tooLong);
+  assertRefused((r) => { r.configuration.clearance = 1e20; }, 'above_maximum', '/configuration/clearance', tooLong);
+  assertRefused((r) => { r.items[0].dimensions.length = -1e20; }, 'negative_measure', '/items/0/dimensions/length',
+    'cannot be negative');
+  const side = { value: '10000000001', unit: 'ticks' };
+  assertRefused((r) => { r.containers[0].inner_dimensions = { length: side, width: side, height: side }; },
+    'above_maximum', '/containers/0/inner_dimensions', 'must enclose at most 10^30 cubic ticks');
+});
+
+test('a side that rounds to zero ticks is refused where it is spelled', () => {
+  assertRefused((r) => { r.items[0].dimensions.width = '0'; }, 'invalid_value', '/items/0/dimensions/width',
+    'must be positive');
+  assertRefused((r) => { r.containers[0].inner_dimensions.length = '0.00001'; }, 'invalid_value',
+    '/containers/0/inner_dimensions/length', 'must be positive');
+});
+
+test('an obstacle and each of its boxes lie inside the container', () => {
+  const pillar = (extra) => ({ id: 'pillar', origin: { x: '150' },
+    dimensions: { length: '10', width: '10', height: '10' }, ...extra });
+  const side = { length: '10', width: '10', height: '10' };
+  assertRefused((r) => { r.containers[0].obstacles = [pillar({ origin: { x: '195' } })]; }, 'invalid_value',
+    '/containers/0/obstacles/0', 'lies outside inner_dimensions');
+  assertRefused((r) => { r.containers[0].obstacles = [pillar({ additional_boxes: [{ origin: { z: '195' }, dimensions: side }] })]; },
+    'invalid_value', '/containers/0/obstacles/0/additional_boxes/0', 'lies outside inner_dimensions');
+  assertRefused((r) => { r.containers[0].obstacles = [pillar({ additional_boxes: [{ dimensions: { ...side, width: '0' } }] })]; },
+    'invalid_value', '/containers/0/obstacles/0/additional_boxes/0/dimensions/width', 'must be positive');
+});
+
+test('a weight past a signed 64-bit integer, or written as an unsafe number, is refused at its pointer (R19-01)', () => {
+  const at = (weight) => (request) => { request.items[0].weight = weight; };
+  assertRefused(at({ value: '9223372036854775808', unit: 'ticks' }), 'above_maximum', '/items/0/weight',
+    'must be at most 9223372036854775807 ticks');
+  assertRefused(at({ value: 2 ** 53 + 2, unit: 'ticks' }), 'invalid_value', '/items/0/weight',
+    'must be written as a string past 9007199254740991');
+  assertRefused(at(2 ** 60), 'invalid_value', '/items/0/weight', 'must be written as a string past 9007199254740991');
+  assertRefused(at({ value: -(2 ** 60), unit: 'ticks' }), 'negative_measure', '/items/0/weight', 'cannot be negative');
+  assertRefused(at({ value: 2 ** 60, unit: 'stone' }), 'invalid_unit', '/items/0/weight', 'has an unknown unit "stone"');
+});
+
+test('every item weight times its quantity and the heaviest tare fit the ceiling (R19-01)', () => {
+  const heavy = (weight, tare) => (request) => {
+    request.items[0].weight = { value: String(weight), unit: 'ticks' };
+    request.containers[0].tare_weight = { value: String(tare), unit: 'ticks' };
+  };
+  assertRefused(heavy(2n ** 62n - 1n, 2n), 'above_maximum', '/items',
+    'must weigh at most 9223372036854775807 ticks in all, with the heaviest tare');
+  const request = base();
+  heavy(2n ** 62n - 1n, 1n)(request);
+  const result = packFallback(request);
+  assert.equal(result.containers.reduce((total, container) => total + BigInt(container.payload_weight.ticks), 0n),
+    2n ** 63n - 2n);
+});

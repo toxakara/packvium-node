@@ -77,7 +77,8 @@ test('a request without fixed placements answers byte for byte as before', () =>
   const data = request();
   delete data.fixed_placements;
   const empty = { ...data, fixed_placements: [] };
-  assert.equal(JSON.stringify(packFallback(empty)), JSON.stringify(packFallback(data)));
+  const withoutDuration = (result) => JSON.stringify(result, (key, value) => (key === 'duration_ms' ? 0 : value));
+  assert.equal(withoutDuration(packFallback(empty)), withoutDuration(packFallback(data)));
   assert.ok(!JSON.stringify(packFallback(data)).includes('"fixed"'));
 });
 

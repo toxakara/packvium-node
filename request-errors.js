@@ -62,6 +62,18 @@ export function pointer(...parts) {
 // ------------------------------------------------------------------------------ primitives
 
 const MAX_EXACT_MAGNITUDE = Number.MAX_SAFE_INTEGER;
+/**
+ * The admission ceiling every engine refuses past: a length is a tick count
+ * every engine holds exactly, this one's `Number` included, and a box encloses no more than the
+ * bound path can sum, so `volume x 10^6` stays inside Rust's `i128`.
+ */
+const MAX_LENGTH_TICKS = MAX_EXACT_MAGNITUDE;
+const MAX_VOLUME_TICKS3 = 10n ** 30n;
+/**
+ * A weight, and every item's weight times its quantity plus the heaviest tare, fit a signed
+ * 64-bit integer, which is how Rust and PHP add a container's payload (R19-01).
+ */
+const MAX_WEIGHT_TICKS = 2n ** 63n - 1n;
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -138,7 +150,7 @@ function requireMeasure(value, field, kind, unit) {
   }
   if (isObject(value)) requireMeasureObject(value, field, kind, unit);
   try {
-    kind.parse(value, unit);
+    return kind.parse(value, unit);
   } catch (error) {
     if (String(error?.message).includes('cannot be negative')) {
       throw new InvalidRequestError('negative_measure', field, 'cannot be negative');
@@ -152,6 +164,52 @@ function requireMeasureObject(value, field, kind, unit) {
   const stated = hasOwn(value, 'unit') ? value.unit : unit;
   if (!knownUnit(stated, kind)) {
     throw new InvalidRequestError('invalid_unit', field, `has an unknown unit ${jsonSpelling(stated)}`);
+  }
+}
+
+/**
+ * A length at most `MAX_LENGTH_TICKS`. The parser rounds its exact `BigInt` ticks to a `Number`,
+ * and every count past 2^53 - 1 rounds to at least 2^53, so the comparison stays exact.
+ */
+function requireLength(ticks, field) {
+  if (ticks > MAX_LENGTH_TICKS) {
+    throw new InvalidRequestError('above_maximum', field, `must be at most ${MAX_LENGTH_TICKS} ticks`);
+  }
+  return ticks;
+}
+
+/**
+ * A weight: a measure past 2^53 - 1 is written as a string, because a JSON number that large
+ * reached this engine already rounded; its exact ticks are at most `MAX_WEIGHT_TICKS`.
+ */
+function requireWeight(value, field, kind) {
+  const amount = isObject(value) ? value.value : value;
+  if (typeof amount === 'number' && Number.isInteger(amount) && !Number.isSafeInteger(amount)
+      && (typeof value === 'number' || (isObject(value) && knownUnit(hasOwn(value, 'unit') ? value.unit : 'g', kind)))) {
+    if (amount < 0) throw new InvalidRequestError('negative_measure', field, 'cannot be negative');
+    throw new InvalidRequestError('invalid_value', field, `must be written as a string past ${MAX_EXACT_MAGNITUDE}`);
+  }
+  const ticks = requireMeasure(value, field, kind, 'g');
+  if (ticks > MAX_WEIGHT_TICKS) {
+    throw new InvalidRequestError('above_maximum', field, `must be at most ${MAX_WEIGHT_TICKS} ticks`);
+  }
+  return ticks;
+}
+
+/**
+ * Every item's weight times its quantity, plus the heaviest tare, against `MAX_WEIGHT_TICKS`:
+ * no container's gross weight can pass it. Each value was admitted above. O(items + containers).
+ */
+function requireTotalWeight(items, containers, weights) {
+  const ticks = (holder, name) => (holder[name] == null ? 0n : BigInt(weights.parse(holder[name], 'g')));
+  const total = items.reduce((sum, item) => sum + ticks(item, 'weight') * BigInt(item.quantity ?? 1),
+    containers.reduce((heaviest, container) => {
+      const tare = ticks(container, 'tare_weight');
+      return tare > heaviest ? tare : heaviest;
+    }, 0n));
+  if (total > MAX_WEIGHT_TICKS) {
+    throw new InvalidRequestError('above_maximum', '/items',
+      `must weigh at most ${MAX_WEIGHT_TICKS} ticks in all, with the heaviest tare`);
   }
 }
 
@@ -186,8 +244,8 @@ export function checkRequest(data, measures) {
   const request = requireObject(data, '');
   const unit = checkUnits(request.units, measures.length);
   checkOutput(request.output);
-  const length = (value, field) => requireMeasure(value, field, measures.length, unit);
-  const weight = (value, field) => requireMeasure(value, field, measures.weight, 'g');
+  const length = (value, field) => requireLength(requireMeasure(value, field, measures.length, unit), field);
+  const weight = (value, field) => requireWeight(value, field, measures.weight);
   checkConfiguration(request.configuration, length);
   const items = requiredList(request, 'items', '');
   const lengthTicks = (value) => measures.length.parse(value, unit);
@@ -196,6 +254,7 @@ export function checkRequest(data, measures) {
   const containers = requiredList(request, 'containers', '');
   containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight, lengthTicks));
   requireUniqueIds(containers, 'containers');
+  requireTotalWeight(items, containers, measures.weight);
 }
 
 function checkUnits(raw, lengths) {
@@ -289,7 +348,8 @@ function checkContainer(raw, where, length, weight, lengthTicks) {
   optional(container, 'access_directions', where, accessDirections);
   optional(container, 'tag_limits', where, tagLimits);
   optional(container, 'rate_table', where, rateTable);
-  optional(container, 'obstacles', where, (v, f) => obstacles(v, f, length));
+  const inner = SIDES.map((side) => lengthTicks(container.inner_dimensions[side]));
+  optional(container, 'obstacles', where, (v, f) => obstacles(v, f, length, inner));
   optional(container, 'deformable_boundary', where, (v, f) => deformableBoundary(container, v, f, where));
   optional(container, 'made_to_measure', where, (v, f) => madeToMeasure(container, v, f, where, { length, weight, lengthTicks }));
 }
@@ -306,7 +366,7 @@ function madeToMeasure(container, raw, field, where, { length, weight, lengthTic
   const machine = requireObject(raw, field);
   requireKnownFields(machine, field, MADE_TO_MEASURE_FIELDS);
   for (const name of ['minimum', 'increment']) required(machine, name, field);
-  for (const name of ['minimum', 'increment', 'outer_allowance']) optional(machine, name, field, (v, f) => dimensions(v, f, length));
+  for (const name of ['minimum', 'increment', 'outer_allowance']) optional(machine, name, field, (v, f) => dimensions(v, f, length, false));
   optional(machine, 'cost_per_square_metre_minor', field, atLeast(0));
   optional(machine, 'tare_per_square_metre', field, weight);
   if (container.outer_dimensions != null) {
@@ -356,9 +416,20 @@ function setBesideABag(name, value) {
 
 const accessDirections = eachOneOf(ACCESS_DIRECTIONS);
 
-function dimensions(raw, where, length) {
+/**
+ * A box's three sides, each a measure; a box that holds or is something has no empty side
+ *, while a made-to-measure step states its own rule for zero.
+ */
+function dimensions(raw, where, length, positive = true) {
   const sides = requireObject(raw, where);
-  for (const side of SIDES) length(required(sides, side, where), where + pointer(side));
+  const volume = SIDES.reduce((product, side) => {
+    const field = where + pointer(side), ticks = length(required(sides, side, where), field);
+    if (positive && ticks === 0) throw new InvalidRequestError('invalid_value', field, 'must be positive');
+    return product * BigInt(ticks);
+  }, 1n);
+  if (volume > MAX_VOLUME_TICKS3) {
+    throw new InvalidRequestError('above_maximum', where, 'must enclose at most 10^30 cubic ticks');
+  }
 }
 
 // Tags in code-point order, as every engine walks them: a JavaScript object lists integer-like
@@ -379,15 +450,40 @@ function rateTable(raw, where) {
   optional(table, 'fuel_surcharge_permille', where, atLeast(0));
 }
 
-function obstacles(raw, where, length) {
+function obstacles(raw, where, length, inner) {
   requireList(raw, where).forEach((entry, index) => {
     const at = where + pointer(index);
     const obstacle = requireObject(entry, at);
-    if (obstacle.origin != null) {
-      const point = requireObject(obstacle.origin, `${at}/origin`);
-      for (const axis of AXES) optional(point, axis, `${at}/origin`, length);
+    placedBox(obstacle, at, length, inner);
+    if (obstacle.additional_boxes != null) {
+      const boxes = `${at}/additional_boxes`;
+      requireList(obstacle.additional_boxes, boxes).forEach((box, position) => {
+        const part = boxes + pointer(position);
+        placedBox(requireObject(box, part), part, length, inner);
+      });
     }
-    dimensions(required(obstacle, 'dimensions', at), `${at}/dimensions`, length);
+  });
+}
+
+/**
+ * An optional `origin` and required `dimensions`: an obstacle, or one more box of it,
+ * whose measures are read in the request's unit like every other length, and which lies inside
+ * the container.
+ */
+function placedBox(box, at, length, inner) {
+  const starts = [0, 0, 0];
+  if (box.origin != null) {
+    const point = requireObject(box.origin, `${at}/origin`);
+    AXES.forEach((axis, index) => {
+      if (point[axis] != null) starts[index] = length(point[axis], `${at}/origin/${axis}`);
+    });
+  }
+  const sides = required(box, 'dimensions', at);
+  dimensions(sides, `${at}/dimensions`, length);
+  SIDES.forEach((side, index) => {
+    if (starts[index] + length(sides[side], `${at}/dimensions/${side}`) > inner[index]) {
+      throw new InvalidRequestError('invalid_value', at, 'lies outside inner_dimensions');
+    }
   });
 }
 

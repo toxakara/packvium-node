@@ -11,6 +11,7 @@ import {
   verifyLoadingPrefixBusinessRules, __ratiosForTests, __planBeamForTests,
 } from '../fallback.js';
 import { objective as recomputeObjective, validate } from './validate.mjs';
+import { parseExact, stringifyExact } from '../exact-json.js';
 
 /**
  * The JavaScript fallback, exercised directly.
@@ -612,7 +613,7 @@ test('effort budget stops at the exact counted boundary without claiming a wall-
   const result = packFallback(request(
     [cube('a', 10, { quantity: 20 })],
     [box('c', 100, 100, 100)],
-    { configuration: { time_limit_ms: 60_000, effort_budget: { max_search_nodes: 5 } } },
+    { configuration: { time_limit_ms: 60_000, multi_start_orders: 1, effort_budget: { max_search_nodes: 5 } } },
   ));
   assert.equal(result.summary.packed_item_count, 5);
   assert.equal(result.algorithm.metrics.search_nodes_expanded, 5);
@@ -891,13 +892,16 @@ test('cumulative top load stays exact beyond the safe-number boundary', () => {
   assert.equal(rejected.summary.packed_item_count, 2);
   assert.deepEqual(rejected.unpacked_items.map(item => item.item_type), ['top']);
 
-  // `ticks` remains a Number for schema compatibility, but the rendered value comes
-  // from the exact BigInt at that one explicit JSON boundary.
+  // Past 2^53 - 1 a weight's `ticks` is the exact BigInt (R19-01), which `JSON.stringify`
+  // refuses; `stringifyExact` writes it as the integer it is and `parseExact` reads it back.
   const reported = packFallback(payload(null));
   const bottom = placements(reported).find(placement => placement.item_type === 'bottom');
-  assert.equal(bottom.top_load.ticks, boundary);
+  assert.equal(bottom.top_load.ticks, BigInt(boundary) + 1n);
   assert.equal(bottom.top_load.value, '1125899906842.624125');
-  assert.doesNotThrow(() => JSON.stringify(reported));
+  assert.throws(() => JSON.stringify(reported), TypeError);
+  const text = stringifyExact(reported);
+  assert.match(text, /"ticks":9007199254740993,/);
+  assert.deepEqual(parseExact(text), reported);
 });
 
 test('incompatible items are separated', () => {
@@ -1166,7 +1170,7 @@ test('the same request produces the same answer', () => {
   // With an adequate deadline and no randomness, reproducibility is total —
   // including the search-effort counters.
   const payload = request([cube('a', 40, { quantity: 6 })], [box('c', 150, 150, 150, { quantity: 2 })]);
-  assert.deepEqual(packFallback(payload), packFallback(payload));
+  assert.equal(withoutDuration(packFallback(payload)), withoutDuration(packFallback(payload)));
 });
 
 test('coordinate compaction keeps a 10,000-item lattice at constant result size', () => {
@@ -1202,7 +1206,7 @@ test('coordinate compaction is opt-in and the default result shape is unchanged'
     ...payload,
     configuration: { require_placement_coordinates: true },
   });
-  assert.deepEqual(implicit, explicit);
+  assert.equal(withoutDuration(implicit), withoutDuration(explicit));
   assert.equal(implicit.containers[0].placements.length, 8);
   assert.equal('lattice_summary' in implicit.containers[0], false);
 });
@@ -1223,6 +1227,7 @@ test('compact lattice stops at the exact effort boundary', () => {
       [box('c', 100, 100, 100)],
       { configuration: {
         require_placement_coordinates: false,
+        multi_start_orders: 1,
         effort_budget: { [field]: 5 },
       } },
     ));
@@ -2075,7 +2080,7 @@ test('the shape memo answers a repeated pack exactly as the first one', () => {
     [{ id: 'crate', inner_dimensions: { length: '100', width: '100', height: '100' } }]));
   const first = build();
   const second = build();
-  assert.deepEqual(second, first);
+  assert.equal(withoutDuration(second), withoutDuration(first));
   // Named separately from the deep compare: the volume is the number the hull geometry
   // decides, so a memo handing back a stale or foreign shape shows here first.
   assert.equal(second.containers[0].used_volume_ticks3, String((100 * 16000) ** 3));
@@ -2655,10 +2660,7 @@ test('every requested restart runs and is recorded', () => {
   // start `balanced` adds to its own.
   assert.equal(one.termination.starts.length, 2);
   assert.equal(eight.termination.starts.length, 9);
-  assert.ok(
-    eight.algorithm.metrics.search_nodes_expanded > one.algorithm.metrics.search_nodes_expanded,
-    'eight restarts must cost more search than one',
-  );
+  assert.equal(eight.termination.starts.every((start) => start.started), true);
   assert.equal(eight.termination.starts.filter((start) => start.selected).length, 1);
 });
 
@@ -2984,9 +2986,11 @@ test('the added block start replaces an answer it strictly beats', () => {
   // The profile's own answer stays on offer, as a losing solver's does under `quality`.
   assert.deepEqual(result.alternatives.map((alternative) => alternative.score), [own.score]);
   assert.deepEqual(packFallback(cartons('balanced', { alternatives: 1 })).alternatives, []);
-  // Both runs are counted: the reported effort is the portfolio's, not the winner's.
-  assert.equal(result.algorithm.metrics.search_nodes_expanded > own.algorithm.metrics.search_nodes_expanded, true);
-  assert.equal(result.algorithm.candidates_evaluated > own.algorithm.candidates_evaluated, true);
+  // The selected start reports its own work, as every alternative does.
+  const blocks = packFallback(payload, () => 0, 'homogeneous_blocks', 0);
+  assert.deepEqual(result.algorithm.metrics, blocks.algorithm.metrics);
+  assert.equal(result.algorithm.candidates_evaluated, blocks.algorithm.candidates_evaluated);
+  assert.equal(result.algorithm.placements_attempted, blocks.algorithm.placements_attempted);
 });
 
 test('the added block start is discarded when it only ties', () => {
@@ -3006,10 +3010,13 @@ test('the added block start is discarded when it only ties', () => {
 });
 
 test('fast enumerates one block mode where balanced enumerates both', () => {
-  const spent = (profile) => packFallback(cartons(profile)).algorithm.metrics.search_nodes_expanded;
-  const own = ownAnswer(cartons('fast')).algorithm.metrics.search_nodes_expanded;
-  assert.equal(spent('fast') > own, true);
-  assert.equal(spent('balanced') - own, 2 * (spent('fast') - own));
+  const spent = (profile) => {
+    const result = packFallback(cartons(profile));
+    assert.equal(result.algorithm.solver, blockStartId);
+    return result.algorithm.metrics.search_nodes_expanded;
+  };
+  assert.equal(spent('fast') > 0, true);
+  assert.equal(spent('balanced'), 2 * spent('fast'));
 });
 
 test('the block solver carries its own node limit outside quality, not the container plan limit', () => {
@@ -3172,6 +3179,32 @@ test('stacking groups: rebalancing never moves an item onto a lower item that re
   assert.deepEqual(validate(payload, { ...original, containers: balanced.containers }), []);
   const withBase = balanced.containers.find((c) => c.placements.some((p) => p.item_type === 'base'));
   assert.deepEqual(withBase.placements.map((p) => p.item_type), ['base']);
+});
+
+test('rebalanceWeight accepts interlocking convex_hull placements and breaks tied source weights by first container', () => {
+  const wedgeVertices = [
+    { x: '0', y: '0', z: '0' },
+    { x: '100', y: '0', z: '0' },
+    { x: '0', y: '100', z: '0' },
+    { x: '0', y: '0', z: '100' },
+    { x: '100', y: '0', z: '100' },
+    { x: '0', y: '100', z: '100' },
+  ];
+  const payload = request(
+    [{
+      id: 'wedge',
+      quantity: 3,
+      weight: '100',
+      shape_type: 'convex_hull',
+      hull_vertices: wedgeVertices,
+      dimensions: mm(100, 100, 100),
+    }],
+    [box('crate', 100, 100, 100, { quantity: 2 })],
+  );
+  const original = packSound(payload);
+  assert.equal(original.containers.length, 2);
+  const balanced = rebalanceWeight(payload, original);
+  assert.deepEqual(validate(payload, { ...original, containers: balanced.containers }), []);
 });
 
 // --------------------------------------------------------------------------------

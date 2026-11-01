@@ -117,16 +117,29 @@ test('a block the budget cuts short places its first members and stops', () => {
   assert.ok(result.summary.packed_item_count > 0 && result.summary.packed_item_count < unlimited.summary.packed_item_count);
 });
 
-test('a later start handed a spent budget is still started and stopped', () => {
+test('later starts get independent effort budgets after an earlier start spends its own', () => {
   const portfolio = scene([box('a', 30, 20, 10, 12), box('b', 40, 40, 25, 4)], { multi_start_orders: 3 }, 1);
-  const first = packFallback(withBudget(portfolio, { max_restarts: 1 }));
-  const request = withBudget(portfolio, { max_search_nodes: first.algorithm.metrics.search_nodes_expanded });
+  const request = withBudget(portfolio, { max_search_nodes: 16 });
   const result = packFallback(request);
   assertEffortConsistent(request, result);
-  const [own, ...later] = result.termination.starts;
-  assert.deepEqual([own.started, own.truncated], [true, false]);
-  assert.ok(later.length >= 2);
-  for (const start of later) assert.deepEqual([start.started, start.truncated], [true, true]);
+  assert.equal(result.algorithm.metrics.search_nodes_expanded, 16);
+  assert.deepEqual(result.termination.starts.map((start) => [start.started, start.truncated]),
+    [[true, false], [true, false], [true, false], [true, true]]);
+  assert.equal(result.algorithm.effort_limit_reached, false);
+  assert.equal(result.termination.any_start_truncated, true);
+
+  // Each of the three item orders completes at its own ceiling. The added block
+  // start also gets sixteen nodes, then stops when it needs a seventeenth.
+  for (let index = 0; index < 3; index++) {
+    const own = packFallback(request, () => 0, null, index);
+    assertEffortConsistent(request, own);
+    assert.equal(own.algorithm.metrics.search_nodes_expanded, 16);
+    assert.equal(own.algorithm.effort_limit_reached, false);
+  }
+  const block = packFallback(request, () => 0, 'homogeneous_blocks', 0);
+  assertEffortConsistent(request, block);
+  assert.equal(block.algorithm.metrics.search_nodes_expanded, 16);
+  assert.equal(block.algorithm.effort_limit_reached, true);
 });
 
 test('a named block solver outside quality reaches its first block', () => {
