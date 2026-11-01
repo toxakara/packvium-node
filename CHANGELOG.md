@@ -4,6 +4,45 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0]
+
+The fallback now checks what the addon checks, spends an effort budget the same way and reports
+its time.
+
+### Changed
+
+- **Under a clearance a compressible item bears its load on its own footprint**, so its crush
+  check is stricter and `validate` measures its own compressed volume.
+- **Breaking for weights past `2^53 - 1` ticks:** a weight's `ticks`, and a `shipping_cost`
+  score position, are a `BigInt` past it, so `JSON.stringify` refuses such a result; the new
+  `stringifyExact` and `parseExact` carry it through JSON exactly. Below it nothing changes.
+- **A weight is at most `2^63 - 1` ticks, and so is every item's weight times its quantity plus
+  the heaviest tare**: past it, `invalid_request` / `above_maximum`; a weight written as a JSON
+  number past `2^53 - 1` is `invalid_value` and must be a string.
+- **The centre of gravity is checked under a `minimum_support_ratio` above 0:** a placement
+  covering at most half its base with the centroid outside the contact hull is refused.
+  A request without a ratio packs as before.
+- **Agrees with the other engines where 1.8 did not:** nesting under a clearance shares the
+  items' own overlap and a deep nesting column nests in pairs; a length past `2^53 - 1` ticks or
+  a box past `10^30` cubic ticks is `invalid_request` / `above_maximum`; a side that reads as zero
+  ticks is `invalid_value` / `must be positive`; an obstacle box outside its container is
+  `invalid_value` / `lies outside inner_dimensions`, each at its own pointer.
+- **`validate` checks the centroid (`centre_of_gravity_unsupported`) and the whole stack's load
+  (`top_load_exceeded`)**, an item on several bearers shared by contact area. It no longer
+  holds that item's whole weight against every bearer, so it accepts some results 1.8 rejected
+  and names the overloaded bearer.
+- **A plan beam wider than 1 compares every container type**, whatever the node limit.
+- **The JavaScript fallback spends `effort_budget` as the other engines do**, and its `quality`
+  beam refines its best order once instead of its first two: about 1.6x faster, no score changed.
+- **`algorithm.duration_ms` reports the milliseconds the fallback took**; it was always 0.
+- **The native backend accepts null obstacle coordinates as zero**, including additional boxes,
+  consistently with request admission.
+
+### Fixed
+
+- **The fallback no longer slides an item under a `ground_contact_rule: single` item that already
+  rests on one supporter.**
+
 ## [1.8.0]
 
 `validate` works after a plain `npm install`, results say how far they can be from the best

@@ -19,6 +19,9 @@ import { objective, validate } from './validate.mjs';
  * is deliberately unsatisfiable.
  */
 
+/** `algorithm.duration_ms` is the wall clock, the one field a determinism check must mask. */
+const withoutDuration = (result) => JSON.parse(JSON.stringify(result, (key, value) => (key === 'duration_ms' ? 0 : value)));
+
 const FIXTURES = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), '../../conformance/shared/fixtures');
 const FIELD_MATRIX = path.resolve(
@@ -153,6 +156,6 @@ for (const name of names) {
       context.skip('wall-clock-truncated searches promise soundness, not bit identity');
       return;
     }
-    assert.deepEqual(first, pack(request));
+    assert.deepEqual(withoutDuration(first), withoutDuration(pack(request)));
   });
 }

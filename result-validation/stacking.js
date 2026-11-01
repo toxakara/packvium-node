@@ -9,7 +9,7 @@
 
 import { cuboid, hullVolume, intersects, overlapAreaXY, rotateHull, vertices } from './geometry.js';
 import { at, hashKey, int, pyCmp, pyEq, sortPy, text } from './json.js';
-import { Ratio, ceilDiv, fixed6, floorDiv, max, ratioPpm } from './num.js';
+import { Ratio, ceilDiv, fixed6, floorDiv, max, min, ratioPpm } from './num.js';
 import { issue, shape } from './outcome.js';
 import { list, pyRepr, pyStr } from './pyfmt.js';
 import { EXIT_DIRECTIONS, holds, rotated, rotationAxes } from './spec.js';
@@ -98,6 +98,9 @@ export function checkSupportAndLoad(entries, graph, globalSupport, issues) {
         const ratio = new Ratio(area, envelope.baseArea);
         issues.push(issue('insufficient_support',
           `${itemId}: ${fixed6(ratio.toDouble())} < ${fixed6(required.toDouble())}`));
+      } else if (area * 2n <= envelope.baseArea
+        && !centroidSupported(envelope, supporting.map(([lower]) => entries[lower][1].envelope))) {
+        issues.push(issue('centre_of_gravity_unsupported', `${itemId}: centroid outside its support hull`));
       }
     }
     for (const [lower] of supporting) checkResting(itemId, spec, entries[lower], issues);
@@ -113,6 +116,39 @@ export function checkSupportAndLoad(entries, graph, globalSupport, issues) {
 }
 
 /** What one direct supporter allows to rest on it. */
+/**
+ * Whether the base centroid lies in the convex hull of the contact areas, the rule
+ * the searches apply once a support ratio is enforced; reached only at or below half the base,
+ * where it can refuse. Coordinates are doubled so the centroid is an integer for odd
+ * extents. The corners come four to a positive-area overlap, so the hull is empty or has at
+ * least three vertices. O(s log s) time and O(s) space for s supporters.
+ */
+function centroidSupported(envelope, surfaces) {
+  const unique = new Map();
+  for (const surface of surfaces) {
+    for (const x of [max(envelope.x, surface.x), min(envelope.x2, surface.x2)]) {
+      for (const y of [max(envelope.y, surface.y), min(envelope.y2, surface.y2)]) unique.set(`${x},${y}`, [2n * x, 2n * y]);
+    }
+  }
+  const points = [...unique.values()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  const hull = [...halfHull(points), ...halfHull([...points].reverse())];
+  const centroid = [envelope.x + envelope.x2, envelope.y + envelope.y2];
+  return hull.length > 0 && hull.every((vertex, index) => cross(vertex, hull[(index + 1) % hull.length], centroid) >= 0n);
+}
+
+/** One half of Andrew's monotone chain, its last point dropped for the other half to close. */
+function halfHull(points) {
+  const chain = [];
+  for (const point of points) {
+    while (chain.length >= 2 && cross(chain[chain.length - 2], chain[chain.length - 1], point) <= 0n) chain.pop();
+    chain.push(point);
+  }
+  chain.pop();
+  return chain;
+}
+
+const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+
 function checkResting(itemId, spec, [lowerId, lowerEntry], issues) {
   const lowerSpec = lowerEntry.spec;
   if (lowerSpec === undefined) return;
@@ -121,9 +157,6 @@ function checkResting(itemId, spec, [lowerId, lowerEntry], issues) {
     issues.push(issue('non_stackable', `${itemId} rests on ${lower}`));
   } else if (lowerSpec.acceptsStackingGroups.size > 0 && !holds(lowerSpec.acceptsStackingGroups, spec.stackingGroup)) {
     issues.push(issue('stacking_group_incompatible', `${itemId} rests on ${lower}`));
-  }
-  if (lowerSpec.maxTopLoad !== null && spec.weight > lowerSpec.maxTopLoad) {
-    issues.push(issue('top_load_exceeded', `${itemId} (${spec.weight} ticks) on ${lower} (limit ${lowerSpec.maxTopLoad})`));
   }
 }
 
@@ -192,12 +225,26 @@ function pressure(load, baseArea) {
   return new Ratio(load * 980665n * SQUARE_METRE_TICKS, TICKS_PER_KG * 100000n * 1000n * baseArea);
 }
 
+/**
+ * `max_top_load` against the whole stack an item bears, as every engine checks it. The
+ * only top-load rule since 1.9.0: an item resting on several bearers shares its weight
+ * among them by contact area. O(n) over the loads `propagateLoad` built.
+ */
+export function checkStackTopLoad(entries, loads, issues) {
+  entries.forEach(([rawId, entry], index) => {
+    const limit = entry.spec === undefined ? null : entry.spec.maxTopLoad;
+    if (limit === null || loads[index] <= limit) return;
+    issues.push(issue('top_load_exceeded', `${pyStr(rawId)} bears ${loads[index]} ticks (limit ${limit})`));
+  });
+}
+
 /**: no `compressible` item may carry more pressure than it declared. */
 export function checkCrush(packedId, entries, loads, issues) {
   entries.forEach(([rawId, entry], index) => {
     const limit = entry.spec === undefined ? null : entry.spec.maxCompressionPressureKpa;
     if (limit === null) return;
-    const carried = pressure(loads[index], entry.envelope.baseArea);
+    const [length, width] = physicalSides(entry.placement);
+    const carried = pressure(loads[index], length * width);
     if (carried.compare(Ratio.of(limit)) > 0) {
       issues.push(issue('crush_violation',
         `${pyStr(rawId)} in ${packedId}: ${fixed6(carried.toDouble())} kPa exceeds ${limit} kPa`));
@@ -205,16 +252,25 @@ export function checkCrush(packedId, entries, loads, issues) {
   });
 }
 
-/** Occupied height under load, rounded up, never below one tick; a crushed item keeps its height. */
-function compressedHeight(envelope, spec, load) {
+/** The placed item's own sides, without the clearance its envelope adds. */
+function physicalSides(placement) {
+  const dimensions = at(placement, 'dimensions');
+  return ['length', 'width', 'height'].map((name) => int(at(at(dimensions, name), 'ticks'), 'a placement dimension'));
+}
+
+/**
+ * Occupied height under load, rounded up, never below one tick; a crushed item keeps its height.
+ * The load presses on the item itself, so the footprint and the height are its own.
+ */
+function compressedHeight(height, footprint, spec, load) {
   const limit = spec.maxCompressionPressureKpa;
   // The reference asserts the pair: a pressure limit without a ratio is not a request it reads.
   if (spec.compressionRatioPpm === null) throw shape(`${spec.id}: max_compression_pressure_kpa without compression_ratio`);
-  const carried = pressure(load, envelope.baseArea);
-  if (carried.compare(Ratio.of(limit)) > 0 || limit === 0n) return envelope.height;
+  const carried = pressure(load, footprint);
+  if (carried.compare(Ratio.of(limit)) > 0 || limit === 0n) return height;
   const divisor = limit * 1000000n * carried.denominator;
   const retained = divisor - spec.compressionRatioPpm * carried.numerator;
-  return max(1n, ceilDiv(envelope.height * retained, divisor));
+  return max(1n, ceilDiv(height * retained, divisor));
 }
 
 /**: weight per square metre of an item's own base, at every level of the stack. */
@@ -329,14 +385,14 @@ export function placedHull(envelope, placement, spec) {
 /** Space a placement actually takes: its compressed box, its hull, or its box. */
 export function occupiedVolume(envelope, placement, spec, load) {
   if (spec !== undefined && spec.maxCompressionPressureKpa !== null) {
-    return envelope.baseArea * compressedHeight(envelope, spec, load);
+    const [length, width, height] = physicalSides(placement);
+    return length * width * compressedHeight(height, length * width, spec, load);
   }
   if (spec !== undefined && spec.shapeType === 'convex_hull' && spec.hullVertices !== null) {
     return hullVolume(rotateHull(spec.hullVertices, orientationAxes(placement)));
   }
   // Only an exact hull makes `_placed_hull` differ from the envelope's corners, and a hull was
   // answered above, so the reference's remaining `_hull_volume(solid)` arm is never reached.
-  const dimensions = at(placement, 'dimensions');
-  const side = (name) => int(at(at(dimensions, name), 'ticks'), 'a placement dimension');
-  return side('length') * side('width') * side('height');
+  const [length, width, height] = physicalSides(placement);
+  return length * width * height;
 }

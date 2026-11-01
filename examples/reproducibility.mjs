@@ -54,11 +54,16 @@ const solve = (maxCandidates) => pack({
 
 /**
  * A fingerprint of everything the result says. `duration_ms` is the one field that is a
- * measurement of the run rather than part of the answer, so it is zeroed first; the rest
- * is written in canonical JSON (sorted keys, no whitespace) so equal results hash equally.
+ * measurement of the run rather than part of the answer, so it is zeroed first, in the answer
+ * and in each alternative; the rest is written in canonical JSON (sorted keys, no whitespace)
+ * so equal results hash equally.
  */
+const withoutDuration = (answer) => ({ ...answer, algorithm: { ...answer.algorithm, duration_ms: 0 } });
 const fingerprint = (result) => createHash('sha256')
-  .update(commerce.canonicalJson({ ...result, algorithm: { ...result.algorithm, duration_ms: 0 } }))
+  .update(commerce.canonicalJson({
+    ...withoutDuration(result),
+    alternatives: (result.alternatives ?? []).map(withoutDuration),
+  }))
   .digest('hex')
   .slice(0, 16);
 

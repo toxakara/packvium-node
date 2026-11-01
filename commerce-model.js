@@ -159,7 +159,7 @@ export function isUnary(operator) {
 }
 
 /**
- * Value equality over the JSON scalar types, matching the reference implementation
+ * Structural equality over JSON values, matching the reference implementation
  * exactly -- including that a boolean equals the integer it stands for, the one place a
  * naive `===` would disagree and quietly change a decision.
  */
@@ -175,12 +175,20 @@ export function valuesEqual(left, right) {
   if (Array.isArray(left) || Array.isArray(right)) return false;
   if (left === null || right === null) return left === right;
   if (typeof left !== typeof right) return false;
+  if (typeof left === 'object') {
+    const keys = Object.keys(left);
+    return keys.length === Object.keys(right).length
+      && keys.every((key) => Object.hasOwn(right, key) && valuesEqual(left[key], right[key]));
+  }
   return left === right;
 }
 
 function contains(haystack, needle) {
   if (Array.isArray(haystack)) return haystack.some((entry) => valuesEqual(entry, needle));
   if (typeof haystack === 'string') return typeof needle === 'string' && haystack.includes(needle);
+  if (haystack !== null && typeof haystack === 'object') {
+    return typeof needle === 'string' && Object.hasOwn(haystack, needle);
+  }
   return false;
 }
 

@@ -133,7 +133,7 @@ function loadHistories(value, path, identityKeys, label, parseVersion) {
     const fields = asObject(entry, entryPath);
     checkKeys(fields, entryPath, [...identityKeys, 'versions']);
     const identity = identityKeys.map((name) => asText(fields[name], `${entryPath}.${name}`));
-    const key = identity.join('/');
+    const key = identity.length === 1 ? identity[0] : JSON.stringify(identity);
     if (histories.has(key)) fail(entryPath, `duplicate ${label} history for '${key}'`);
     const versions = asList(fields.versions, `${entryPath}.versions`);
     if (versions.length === 0) {
@@ -180,7 +180,7 @@ function parseTariff(value, path, [carrierId, serviceId], number) {
     ['minimum_charge_minor', 'fuel_surcharge_permille', 'accessorials'],
   );
   const zonesPath = `${path}.cost_per_dimensional_kg_minor`;
-  const costPerDimensionalKgMinor = {};
+  const costPerDimensionalKgMinor = Object.create(null);
   const zones = asObject(fields.cost_per_dimensional_kg_minor, zonesPath);
   for (const [zone, cost] of Object.entries(zones)) {
     costPerDimensionalKgMinor[zone] = nonNegative(
@@ -214,7 +214,7 @@ function parseTariff(value, path, [carrierId, serviceId], number) {
 }
 
 function parseAccessorials(value, path) {
-  const charges = {};
+  const charges = Object.create(null);
   asList(value, path).forEach((entry, index) => {
     const entryPath = `${path}[${index}]`;
     const fields = asObject(entry, entryPath);
@@ -311,12 +311,18 @@ function parseRollback(fields, path, number, history) {
   if (target === undefined) {
     fail(path, `rollback_to names version ${toVersion}, which is not published yet`);
   }
-  const publishedAt = asInteger(fields.published_at, `${path}.published_at`);
+  const publishedAt = nonNegative(
+    asInteger(fields.published_at, `${path}.published_at`),
+    path, 'published_at cannot be negative',
+  );
   const note = asText(optional(fields, 'note') ?? '', `${path}.note`);
   return {
     number,
     snapshot: target.snapshot,
-    effectiveAt: asInteger(optional(fields, 'effective_at') ?? publishedAt, `${path}.effective_at`),
+    effectiveAt: nonNegative(
+      asInteger(optional(fields, 'effective_at') ?? publishedAt, `${path}.effective_at`),
+      path, 'effective_at cannot be negative',
+    ),
     publishedAt,
     rolledBackFrom: toVersion,
     note: note === '' ? `rollback to version ${toVersion}` : note,
@@ -481,7 +487,7 @@ export function quote(document, request) {
 }
 
 function resolveTariff(carriers, identity, fields, pin) {
-  const history = carriers.get(`${identity.carrier_id}/${identity.service_id}`);
+  const history = carriers.get(JSON.stringify([identity.carrier_id, identity.service_id]));
   if (pin === 'tariff_version') {
     const version = asInteger(fields.tariff_version, 'request.tariff_version');
     const tariff = history?.find((candidate) => candidate.version === version);
@@ -591,7 +597,10 @@ export function catalogVersionInfo(document, request) {
   const fields = asObject(request, 'request');
   checkKeys(fields, 'request', ['catalog_id', 'resolved_at'], ['version', 'as_of']);
   const catalogId = asText(fields.catalog_id, 'request.catalog_id');
-  const resolvedAt = asInteger(fields.resolved_at, 'request.resolved_at');
+  const resolvedAt = nonNegative(
+    asInteger(fields.resolved_at, 'request.resolved_at'),
+    'request.resolved_at', 'resolved_at cannot be negative',
+  );
   const version = optional(fields, 'version') === undefined
     ? undefined
     : asInteger(fields.version, 'request.version');

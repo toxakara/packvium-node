@@ -319,7 +319,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.8"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.9"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -350,7 +350,7 @@ CodeMeta form.
 @software{packvium_node,
   author  = {{Packvium contributors}},
   title   = {Packvium for Node.js},
-  version = {1.8.0},
+  version = {1.9.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

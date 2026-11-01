@@ -51,7 +51,9 @@ const section = (title) => console.log(`\n${rule}\n${title}\n${rule}`);
 section('1. JSON in, JSON out');
 
 console.log(`  request  ${body.length} characters of text`);
-console.log(`  result   ${text.length} characters of text`);
+// `duration_ms` is the run's wall clock, so its digits are counted as one: the length below
+// is the answer's, the same on every run.
+console.log(`  result   ${text.replace(/"duration_ms":\s*\d+/g, '"duration_ms":0').length} characters of text`);
 console.log(`  status   ${result.status}`);
 console.log(`  score    [${result.score.join(', ')}]  <- exact integers, compared left to right`);
 console.log(`  opened   ${result.containers.map((container) => container.id).join(', ')}`);

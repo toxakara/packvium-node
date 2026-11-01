@@ -35,3 +35,21 @@ test('made-to-measure input parsing does not grow with portfolio starts',()=>{
   assert.equal(counts[1],counts[0],'machine input measures must come from the request table');
   delete globalThis.__requestMeasureParses;
 });
+
+test('each unit is worth its definition in ticks', () => {
+  // 1 in = 25.4 mm, 1 ft = 12 in, 1 lb = 453.59237 g, 1 oz = 1/16 lb: one item of one unit
+  // a side and one unit of weight, read back from the answer in ticks.
+  const lengths = { mm: 16000, cm: 160000, m: 16000000, in: 406400, ft: 4876800 };
+  const weights = { mg: 8000, g: 8000000, kg: 8000000000, oz: 226796185, lb: 3628738960 };
+  for (const [unit, ticks] of Object.entries(lengths)) {
+    const side = { value: '1', unit };
+    const answer = packFallback({ items: [{ id: 'a', dimensions: { length: side, width: side, height: side } }],
+      containers: [{ id: 'c', inner_dimensions: { length: '2000', width: '2000', height: '2000' } }] });
+    assert.equal(answer.containers[0].placements[0].dimensions.length.ticks, ticks, unit);
+  }
+  for (const [unit, ticks] of Object.entries(weights)) {
+    const answer = packFallback({ items: [{ id: 'a', weight: { value: '1', unit }, dimensions: { length: '1', width: '1', height: '1' } }],
+      containers: [{ id: 'c', inner_dimensions: { length: '10', width: '10', height: '10' } }] });
+    assert.equal(Number(answer.containers[0].payload_weight.ticks), ticks, unit);
+  }
+});

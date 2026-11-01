@@ -58,6 +58,10 @@ export function explanationForUnpackedItem(item:UnpackedItemResult):ExplanationD
 export function explainUnpackedItem(item:UnpackedItemResult):string;
 export function pack(request:PackingRequest):PackingResult;
 export function packJson(input:string):string;
+/** `JSON.stringify` that writes a `BigInt` (a weight's `ticks` past 2^53 - 1) as the integer it is. */
+export function stringifyExact(value:unknown):string;
+/** `JSON.parse` that reads a `ticks` past 2^53 - 1 as an exact `BigInt`. */
+export function parseExact(text:string):unknown;
 export function rebalanceWeight(request:PackingRequest,result:PackingResult,options?:{maxMoves?:number}):RebalanceResult;
 export function backend():"rust"|"javascript";
 export function version():string;
