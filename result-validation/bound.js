@@ -18,8 +18,17 @@ import { issue } from './outcome.js';
 import { intList, pyRepr } from './pyfmt.js';
 import { SCORE_SCALE } from './stacking.js';
 
-/** Where each covered objective reads `(L0, L1, L2, L3, L4)` in its own score order. */
-const BOUND_ORDERS = new Map([['default', [0, 1, 2, 3, 4]], ['lowest_cost', [0, 2, 1, 3, 4]]]);
+/**
+ * Where each covered objective reads `(L0, L1, L2, L3, L4)` in its own score order, a name
+ * standing for the one key only that objective ranks by. Any other objective has no bound.
+ */
+const BOUND_ORDERS = new Map([
+  ['default', [0, 1, 2, 3, 4]],
+  ['lowest_cost', [0, 2, 1, 3, 4]],
+  ['maximum_value', [0, 'value_forgone', 1, 2, 3]],
+  ['open_dimension_height', [0, 'achieved_height', 1, 2, 3]],
+  ['maximum_volume', ['unpacked_volume_ppm', 0, 1, 2, 3]],
+]);
 
 const MAX_BOUND_SUM = 10n ** 30n;
 const MAX_BOUND_VALUE = 2n ** 53n - 1n;
@@ -194,6 +203,100 @@ function boundInputs(items, containers) {
   return [volumes, weights, shrinks, types];
 }
 
+/** Every instance's `Item.value`, 0 when unset, as unsorted runs. Read only for `maximum_value`. */
+const valueRuns = (items) => items.values()
+  .map((spec) => [truthy(spec.value) ? int(spec.value, 'value') : 0n, int(spec.quantity, 'quantity')]);
+
+/** Restores the max-heap below `at`, by value. */
+function siftDown(heap, at) {
+  let index = at;
+  for (;;) {
+    let top = index;
+    for (const child of [2 * index + 1, 2 * index + 2]) {
+      if (child < heap.length && heap[child][0] > heap[top][0]) top = child;
+    }
+    if (top === index) return;
+    [heap[index], heap[top]] = [heap[top], heap[index]];
+    index = top;
+  }
+}
+
+function siftUp(heap, at) {
+  let index = at;
+  while (index > 0) {
+    const parent = (index - 1) >> 1;
+    if (heap[parent][0] >= heap[index][0]) return;
+    [heap[index], heap[parent]] = [heap[parent], heap[index]];
+    index = parent;
+  }
+}
+
+/**
+ * The sum of the `count` smallest values of unsorted `[value, count]` runs, selected rather than
+ * sorted (finding F6): a max-heap holds only the runs the `count` smallest can still reach, and
+ * the run on top contributes the part of it they need. O(t log k) for the k <= t runs held.
+ */
+export function smallestUnsorted(runs, count) {
+  if (count <= 0n) return 0n;
+  const heap = [];
+  let held = 0n;
+  let total = 0n;
+  for (const run of runs) {
+    if (run[1] > 0n && !(held >= count && run[0] >= heap[0][0])) {
+      heap.push(run);
+      held += run[1];
+      total += run[0] * run[1];
+      siftUp(heap, heap.length - 1);
+      while (held - heap[0][1] >= count) {
+        const [value, taken] = heap[0];
+        held -= taken;
+        total -= value * taken;
+        heap[0] = heap[heap.length - 1];
+        heap.pop();
+        siftDown(heap, 0);
+      }
+    }
+  }
+  return held > count ? total - (held - count) * heap[0][0] : total;
+}
+
+/**
+ * The key only one objective ranks by, each conditional on `L0` like the five: the
+ * least value forgone and the least summed top of a packing leaving `unpacked` behind, and the
+ * least unpacked share of requested volume any packing scores. No term sorts: the volume runs
+ * are the ones `boundInputs` sorted for the five, and the values are selected. O(t log t + c).
+ */
+function objectiveTerm(name, values, volumes, shrinks, containers, unpacked) {
+  if (name === 'value_forgone') return smallestUnsorted(values(), unpacked);
+  if (shrinks) return 0n;
+  if (name === 'achieved_height') {
+    const placed = runCount(volumes) - unpacked;
+    const floors = containers.map((container) => container.baseArea).filter((area) => area > 0n);
+    return placed > 0n && floors.length > 0 ? ceilDiv(smallest(volumes, placed), largestOf(floors)) : 0n;
+  }
+  const requested = volumes.reduce((total, [value, count]) => total + value * count, 0n);
+  const capacity = capacityTotal(containers.map((container) => container.usable), containers.map((container) => container.quantity));
+  if (requested === 0n || capacity === null) return 0n;
+  return ceilDiv(max(0n, requested - capacity) * SCORE_SCALE, requested);
+}
+
+/**
+ * A covered objective's bound in its own score order, or `null` with the reason a ceiling
+ * withholds it: the one refusal predicate's, or the objective's own term's, which withholds
+ * that objective alone. `values` yields the value runs, read only by `maximum_value`, so no
+ * other objective parses `Item.value`. Exported so the shared scene can hold it to the oracle.
+ */
+export function objectiveLowerBound(name, values, volumes, weights, shrinks, containers) {
+  const bound = lowerBound(volumes, weights, shrinks, containers);
+  if (bound === null) return { bound: null, withheld: 'the request is past a declared ceiling' };
+  const stated = BOUND_ORDERS.get(name).map((position) => (typeof position === 'number'
+    ? bound[position] : objectiveTerm(position, values, volumes, shrinks, containers, bound[0])));
+  if (stated.some((value) => value > MAX_BOUND_VALUE)) {
+    return { bound: null, withheld: `the ${name} key is past the portable ceiling` };
+  }
+  return { bound: stated, withheld: '' };
+}
+
 /** The bound in the objective's score order, or `null` with the reason none is stated (§ 1.5). */
 function statedBound(request, status, items, containers) {
   const name = getOr(getOr(request, 'configuration', {}), 'objective', 'default');
@@ -204,9 +307,8 @@ function statedBound(request, status, items, containers) {
   }
   if (status === 'infeasible') return { bound: null, withheld: "status is 'infeasible'" };
   if (status === 'invalid_result') return { bound: null, withheld: "status is 'invalid_result'" };
-  const bound = lowerBound(...boundInputs(items, containers));
-  if (bound === null) return { bound: null, withheld: 'the request is past a declared ceiling' };
-  return { bound: order.map((position) => bound[position]), withheld: '' };
+  const [volumes, weights, shrinks, types] = boundInputs(items, containers);
+  return objectiveLowerBound(name, () => valueRuns(items), volumes, weights, shrinks, types);
 }
 
 /** The first position where `score` leaves `bound`, and whether it is above (1) or below (-1). */

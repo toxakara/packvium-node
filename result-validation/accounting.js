@@ -1,6 +1,6 @@
 /** The summary, the item accounting, and the proof behind every unpacked reason. */
 
-import { ROTATIONS } from './geometry.js';
+import { BOX_ROTATIONS } from './geometry.js';
 import {
   PyDict, at, getNull, getOr, has, hashKey, isDict, list, pyCmp, pyEq, pyIntInstance, text, truthy,
 } from './json.js';
@@ -21,6 +21,15 @@ export function checkStructure(result, issues) {
   const complete = at(result, 'complete');
   if (!pyEq(complete, unpacked === 0)) {
     issues.push(issue('complete_mismatch', `complete=${pyStr(complete)} with ${unpacked} unpacked`));
+  }
+}
+
+/** The result echoes the request's currency, and states none the request did not declare; a null is the field left out. O(1). */
+export function checkCurrency(request, result, issues) {
+  const requested = getNull(request, 'currency');
+  const reported = getNull(result, 'currency');
+  if (!pyEq(reported, requested)) {
+    issues.push(issue('currency_mismatch', `reported ${pyRepr(reported)}, requested ${pyRepr(requested)}`));
   }
 }
 
@@ -108,7 +117,7 @@ export function checkAccounting(result, context, issues) {
  */
 export function fitsEmpty(container, size) {
   if (size.some((side, axis) => side > container.inner[axis])) return false;
-  return !container.flatBag || (size[0] + size[2] <= container.inner[0] && size[1] + size[2] <= container.inner[1]);
+  return !container.flatBag || (size[0] + size[2] <= container.inner[0] && size[1] + size[2] <= container.inner[1] + container.sideGusset);
 }
 
 /**
@@ -163,7 +172,8 @@ function checkReasonProof(unpacked, spec, context, timedOut, effortLimited, issu
   checkObservations(proof, reason, itemId, issues);
 }
 
-const EVERY_ROTATION = ROTATIONS.map(([name]) => name);
+// Every box a cuboid can make: a signed code is a hull's alone and spans no other envelope.
+const EVERY_ROTATION = BOX_ROTATIONS;
 
 function checkProvenReason(unpacked, reason, spec, context, itemId, issues) {
   const invalid = (detail) => issues.push(issue('invalid_proven_reason', `${itemId}: ${detail}`));

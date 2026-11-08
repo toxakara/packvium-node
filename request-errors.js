@@ -12,8 +12,8 @@
  * - `detail`: the fixed text for the reason, so the message is identical in every engine.
  *
  * `checkRequest` walks the schema's rules over the raw JSON before any model is built, and the
- * first violation wins, in the order every engine follows: units, output, configuration, items,
- * containers. A cross-engine suite holds all four engines to the same reason, field and
+ * first violation wins, in the order every engine follows: units, output, currency,
+ * configuration, items, containers. A cross-engine suite holds all four engines to the same reason, field and
  * message.
  *
  * This module is package-internal: the error class is re-exported from `fallback.js` and the
@@ -29,7 +29,87 @@ export const OBJECTIVES = Object.freeze(['default', 'lowest_cost', 'shipping_cos
 export const ACCESS_DIRECTIONS = Object.freeze(['+x', '-x', '+y', '-y', '+z', '-z']);
 // The schema's closed vocabularies, each refused as `not_allowed` like the two above.
 export const SOLVERS = Object.freeze(['grid', 'extreme_points', 'homogeneous_blocks', 'layer', 'maximal_spaces', 'exact_small']);
+// The six legacy orientation codes: a box's whole vocabulary and an item's default list.
 export const ROTATIONS = Object.freeze(['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL']);
+/**
+ * The 24 proper rotations in canonical table order (1.10), `packvium.orientations`: the code,
+ * the declared side (L=0, W=1, H=2) each container axis x, y, z takes, and the sign it carries.
+ * The six legacy codes come first with the matrices they have always had -- an odd permutation
+ * negates x -- then, per permutation in that order, its three other determinant +1 sign patterns.
+ * The index in this table is the tie-break order everywhere; codes are never compared as strings.
+ */
+export const ORIENTATION_TABLE = Object.freeze([
+  ['LWH', [0, 1, 2], [1, 1, 1]], ['LHW', [0, 2, 1], [-1, 1, 1]], ['WLH', [1, 0, 2], [-1, 1, 1]],
+  ['WHL', [1, 2, 0], [1, 1, 1]], ['HLW', [2, 0, 1], [1, 1, 1]], ['HWL', [2, 1, 0], [-1, 1, 1]],
+  ['+L-W-H', [0, 1, 2], [1, -1, -1]], ['-L+W-H', [0, 1, 2], [-1, 1, -1]], ['-L-W+H', [0, 1, 2], [-1, -1, 1]],
+  ['+L-H+W', [0, 2, 1], [1, -1, 1]], ['+L+H-W', [0, 2, 1], [1, 1, -1]], ['-L-H-W', [0, 2, 1], [-1, -1, -1]],
+  ['+W-L+H', [1, 0, 2], [1, -1, 1]], ['+W+L-H', [1, 0, 2], [1, 1, -1]], ['-W-L-H', [1, 0, 2], [-1, -1, -1]],
+  ['+W-H-L', [1, 2, 0], [1, -1, -1]], ['-W+H-L', [1, 2, 0], [-1, 1, -1]], ['-W-H+L', [1, 2, 0], [-1, -1, 1]],
+  ['+H-L-W', [2, 0, 1], [1, -1, -1]], ['-H+L-W', [2, 0, 1], [-1, 1, -1]], ['-H-L+W', [2, 0, 1], [-1, -1, 1]],
+  ['+H-W+L', [2, 1, 0], [1, -1, 1]], ['+H+W-L', [2, 1, 0], [1, 1, -1]], ['-H-W-L', [2, 1, 0], [-1, -1, -1]],
+].map((row) => Object.freeze(row)));
+/** Every code, in table order: a convex hull's vocabulary. */
+export const ORIENTATIONS = Object.freeze(ORIENTATION_TABLE.map(([code]) => code));
+const SIGNED_ORIENTATIONS = ORIENTATIONS.slice(ROTATIONS.length);
+/** The codes that keep the item's own height vertical and pointing up (z takes `+H`), in table order. */
+export const UPRIGHT_ORIENTATIONS = Object.freeze(ORIENTATION_TABLE
+  .filter(([, axes, signs]) => axes[2] === 2 && signs[2] === 1).map(([code]) => code));
+/** What a signed code on anything but a hull is refused with, at its own pointer. */
+export const SIGNED_CODE_NEEDS_A_HULL = 'a signed rotation code requires shape_type convex_hull';
+
+/** The codes an item may name: all 24 for a hull, the six legacy codes for anything else. */
+export const orientationVocabulary = (hull) => (hull ? ORIENTATIONS : ROTATIONS);
+
+/**
+ * Why `value` cannot orient an item of this shape, or `null` when it can: `invalid_value` for a
+ * signed code beside a non-hull -- a rule broken, not an unknown word -- and `not_allowed` for
+ * anything outside the item's vocabulary. Every field that names a requested item's orientation
+ * reads it through `refuseOrientation`. O(1).
+ */
+function orientationRefusal(value, hull) {
+  if (!hull && SIGNED_ORIENTATIONS.includes(value)) return 'invalid_value';
+  return orientationVocabulary(hull).includes(value) ? null : 'not_allowed';
+}
+
+/**
+ * Throw `error(reason, field, detail)` when `value` cannot orient an item of this shape. `where`
+ * names the value inside the detail, the way a fixed placement or a revision event words its own
+ * refusals. `packvium.request_errors.refuse_orientation`. O(1).
+ */
+export function refuseOrientation(value, hull, field, error, where = '') {
+  const reason = orientationRefusal(value, hull);
+  if (reason === 'invalid_value') {
+    throw error(reason, field, where ? `${where}: ${SIGNED_CODE_NEEDS_A_HULL}` : SIGNED_CODE_NEEDS_A_HULL);
+  }
+  if (reason !== null) {
+    const rule = `must be one of ${jsonSpelling([...orientationVocabulary(hull)])}`;
+    throw error(reason, field, where ? `${where} ${rule}` : rule);
+  }
+}
+
+/**
+ * The ids of the requested item types that are `convex_hull`, read from JSON items as written;
+ * anything that is not an item object names no hull. O(items).
+ */
+export function hullItemTypes(items) {
+  if (!Array.isArray(items)) return new Set();
+  return new Set(items.filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item)
+    && item.shape_type === 'convex_hull' && typeof item.id === 'string').map((item) => item.id));
+}
+
+/**
+ * An item's rotation list as the engines search it: its own list, or the six legacy codes, then
+ * narrowed to the upright codes under `keep_upright`, keeping the list's own order. O(r).
+ *
+ * The default is a plain copy, never the frozen `ROTATIONS` itself: the fallback's solver reads
+ * this list in its hottest sweep, and a frozen array is another elements kind there. Handing it
+ * the frozen constant (1.10) cost 1-3 MB of process peak in the frontier's Node 22 image, in
+ * TurboFan memory outside the JS heap, and bought nothing (docs/PERFORMANCE-PRACTICE.md).
+ */
+export function itemRotations(raw) {
+  const listed = raw.allowed_rotations ?? [...ROTATIONS];
+  return raw.keep_upright ? listed.filter((code) => UPRIGHT_ORIENTATIONS.includes(code)) : listed;
+}
 export const LENGTH_UNITS = Object.freeze(['mm', 'cm', 'm', 'in', 'ft']);
 export const WEIGHT_UNITS = Object.freeze(['mg', 'g', 'kg', 'oz', 'lb']);
 export const GROUND_CONTACT_RULES = Object.freeze(['free', 'covered', 'single', 'multiple']);
@@ -244,6 +324,8 @@ export function checkRequest(data, measures) {
   const request = requireObject(data, '');
   const unit = checkUnits(request.units, measures.length);
   checkOutput(request.output);
+  const currency = hasOwn(request, 'currency') ? request.currency : null;
+  optional(request, 'currency', '', currencyCode);
   const length = (value, field) => requireLength(requireMeasure(value, field, measures.length, unit), field);
   const weight = (value, field) => requireWeight(value, field, measures.weight);
   checkConfiguration(request.configuration, length);
@@ -252,14 +334,17 @@ export function checkRequest(data, measures) {
   items.forEach((raw, index) => checkItem(raw, pointer('items', index), length, weight, lengthTicks));
   requireUniqueIds(items, 'items');
   const containers = requiredList(request, 'containers', '');
-  containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight, lengthTicks));
+  containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight, lengthTicks, currency));
   requireUniqueIds(containers, 'containers');
   requireTotalWeight(items, containers, measures.weight);
 }
 
 function checkUnits(raw, lengths) {
   if (raw == null) return 'mm';
-  const length = requireObject(raw, '/units').length;
+  const units = requireObject(raw, '/units');
+  // `{"length": "cm", "weight": "kg"}` used to read every bare weight as grams.
+  requireKnownFields(units, '/units', ['length']);
+  const length = units.length;
   if (length == null) return 'mm';
   if (!knownUnit(length, lengths)) {
     throw new InvalidRequestError('invalid_unit', '/units/length', `has an unknown unit ${jsonSpelling(length)}`);
@@ -310,10 +395,26 @@ function checkItem(raw, where, length, weight, lengthTicks) {
   optional(item, 'compression_ratio', where, requireUnbounded);
   optional(item, 'stacking_group', where, stackingGroupName);
   optional(item, 'accepts_stacking_groups', where, stackingGroupNames);
-  optional(item, 'allowed_rotations', where, eachOneOf(ROTATIONS));
+  optional(item, 'allowed_rotations', where, (value, field) => allowedRotations(value, field, item));
   optional(item, 'ground_contact_rule', where, oneOf(GROUND_CONTACT_RULES));
   optional(item, 'shape_type', where, oneOf(SHAPE_TYPES));
   for (const name of ITEM_BOOLEANS) optional(item, name, where, requireBoolean);
+  const listed = item.allowed_rotations;
+  if (listed != null && !listed.some((code) => !item.keep_upright || UPRIGHT_ORIENTATIONS.includes(code))) {
+    throw new InvalidRequestError('invalid_value', `${where}/allowed_rotations`,
+      'must allow at least one rotation after keep_upright');
+  }
+}
+
+/**
+ * Each code from the item's vocabulary (1.10): all 24 for a hull, the six legacy codes for
+ * anything else, where a signed code is a rule broken rather than an unknown word. The shape is
+ * read as written, so a shape no engine knows is not a hull. O(len(raw)).
+ */
+function allowedRotations(raw, where, item) {
+  const hull = item.shape_type === 'convex_hull';
+  requireList(raw, where).forEach((value, index) => refuseOrientation(value, hull, where + pointer(index),
+    (reason, field, detail) => new InvalidRequestError(reason, field, detail)));
 }
 
 /**
@@ -335,7 +436,7 @@ function stackingGroupNames(raw, where) {
   requireList(raw, where).forEach((name, index) => stackingGroupName(name, where + pointer(index)));
 }
 
-function checkContainer(raw, where, length, weight, lengthTicks) {
+function checkContainer(raw, where, length, weight, lengthTicks, currency) {
   const container = requireObject(raw, where);
   requiredString(container, 'id', where);
   optional(container, 'quantity', where, atLeast(1));
@@ -347,11 +448,36 @@ function checkContainer(raw, where, length, weight, lengthTicks) {
   optional(container, 'void_fill_reserve_ratio', where, requireRatio);
   optional(container, 'access_directions', where, accessDirections);
   optional(container, 'tag_limits', where, tagLimits);
-  optional(container, 'rate_table', where, rateTable);
+  optional(container, 'rate_table', where, (v, f) => rateTable(v, f, currency));
   const inner = SIDES.map((side) => lengthTicks(container.inner_dimensions[side]));
   optional(container, 'obstacles', where, (v, f) => obstacles(v, f, length, inner));
-  optional(container, 'deformable_boundary', where, (v, f) => deformableBoundary(container, v, f, where));
+  optional(container, 'deformable_boundary', where, (v, f) => deformableBoundary(container, v, f, where, length, inner));
   optional(container, 'made_to_measure', where, (v, f) => madeToMeasure(container, v, f, where, { length, weight, lengthTicks }));
+  optional(container, 'pallet_overhang_limit', where, (v, f) => palletOverhangLimit(container, v, f, length, lengthTicks));
+}
+
+/** The two axes `pallet_overhang_limit` requires, in the order they are checked. */
+const PALLET_OVERHANG_FIELDS = ['length', 'width'];
+
+/**
+ * Both axes, each a non-negative length, and a solving frame `(L + 2l, W + 2w, H)` held
+ * to the ceiling every box is: each side, then what it encloses. In `BigInt`, since a frame side
+ * may pass 2^53 - 1 where each measure does not. O(1).
+ */
+function palletOverhangLimit(container, raw, field, length, lengthTicks) {
+  const limit = requireObject(raw, field);
+  requireKnownFields(limit, field, PALLET_OVERHANG_FIELDS);
+  for (const axis of PALLET_OVERHANG_FIELDS) length(required(limit, axis, field), field + pointer(axis));
+  const [innerLength, innerWidth, height] = SIDES.map((side) => BigInt(lengthTicks(container.inner_dimensions[side])));
+  const frame = [innerLength + 2n * BigInt(lengthTicks(limit.length)), innerWidth + 2n * BigInt(lengthTicks(limit.width)), height];
+  frame.forEach((ticks, axis) => {
+    if (ticks > BigInt(MAX_LENGTH_TICKS)) {
+      throw new InvalidRequestError('above_maximum', field + pointer(SIDES[axis]), `must be at most ${MAX_LENGTH_TICKS} ticks`);
+    }
+  });
+  if (frame[0] * frame[1] * frame[2] > MAX_VOLUME_TICKS3) {
+    throw new InvalidRequestError('above_maximum', field, 'must enclose at most 10^30 cubic ticks');
+  }
 }
 
 /** Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`. */
@@ -391,20 +517,36 @@ function madeToMeasure(container, raw, field, where, { length, weight, lengthTic
 }
 
 /**: the kinds `deformable_boundary` admits. */
-export const DEFORMABLE_BOUNDARY_KINDS = Object.freeze(['flat_bag']);
+export const DEFORMABLE_BOUNDARY_KINDS = Object.freeze(['flat_bag', 'gusseted_bag']);
 /** Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md). */
 const BAG_EXCLUSIONS = Object.freeze(['obstacles', 'axles', 'access_directions', 'max_stack_density',
-  'outer_dimensions', 'void_fill_reserve_ratio', 'made_to_measure']);
+  'outer_dimensions', 'void_fill_reserve_ratio', 'made_to_measure', 'pallet_overhang_limit']);
 
-function deformableBoundary(container, raw, field, where) {
+/**
+ * The boundary object top to bottom -- kind, unknown keys, the gusset (1.10) -- then the
+ * container fields a bag refuses. O(1).
+ */
+function deformableBoundary(container, raw, field, where, length, inner) {
   const boundary = requireObject(raw, field);
-  requireOneOf(required(boundary, 'kind', field), field + pointer('kind'), DEFORMABLE_BOUNDARY_KINDS);
-  requireKnownFields(boundary, field, ['kind']);
+  const kind = required(boundary, 'kind', field);
+  requireOneOf(kind, field + pointer('kind'), DEFORMABLE_BOUNDARY_KINDS);
+  const gusseted = kind === 'gusseted_bag';
+  requireKnownFields(boundary, field, gusseted ? ['kind', 'side_gusset_depth'] : ['kind']);
+  if (gusseted) {
+    sideGussetDepth(required(boundary, 'side_gusset_depth', field), field + pointer('side_gusset_depth'), length, inner);
+  }
   for (const name of BAG_EXCLUSIONS) {
     if (setBesideABag(name, hasOwn(container, name) ? container[name] : null)) {
       throw new InvalidRequestError('not_allowed', where + pointer(name), 'cannot be combined with deformable_boundary');
     }
   }
+}
+
+/** A length, positive once read in ticks, and no deeper than the bag's inner width. */
+function sideGussetDepth(value, field, length, inner) {
+  const depth = length(value, field);
+  if (depth === 0) throw new InvalidRequestError('invalid_value', field, 'must be positive');
+  if (depth > inner[1]) throw new InvalidRequestError('invalid_value', field, 'exceeds inner_dimensions width');
 }
 
 // An empty obstacle list and a zero reserve change nothing, so only they are let through.
@@ -439,7 +581,7 @@ function tagLimits(raw, where) {
   for (const tag of Object.keys(limits).sort(compareCodePoints)) requireInteger(limits[tag], where + pointer(tag), 1);
 }
 
-function rateTable(raw, where) {
+function rateTable(raw, where, currency) {
   const table = requireObject(raw, where);
   for (const [name, minimum] of [['weight_brackets_g', 1], ['prices_minor', 0]]) {
     if (table[name] == null) continue;
@@ -448,6 +590,29 @@ function rateTable(raw, where) {
   }
   optional(table, 'minimum_charge_minor', where, atLeast(0));
   optional(table, 'fuel_surcharge_permille', where, atLeast(0));
+  optional(table, 'currency', where, (v, f) => rateTableCurrency(v, f, currency));
+}
+
+/**
+ * An ISO 4217 shape, `^[A-Z]{3}$`, with no code list: the engines never convert, so a code they
+ * do not know is still one they can echo. ASCII letters only, and no trailing newline. O(1).
+ */
+function currencyCode(value, field) {
+  if (typeof value !== 'string') throw new InvalidRequestError('wrong_type', field, 'must be a string');
+  if (!/^[A-Z]{3}$/.test(value)) {
+    throw new InvalidRequestError('invalid_value', field, 'must be three capital letters (ISO 4217)');
+  }
+}
+
+/** A rate table prices in the request's currency or says nothing: another one's minor units would be ranked as the request's. O(1). */
+function rateTableCurrency(value, field, currency) {
+  currencyCode(value, field);
+  if (currency == null) {
+    throw new InvalidRequestError('missing_field', '/currency', 'is required when a rate_table declares a currency');
+  }
+  if (value !== currency) {
+    throw new InvalidRequestError('not_allowed', field, `must equal the request currency ${jsonSpelling(currency)}`);
+  }
 }
 
 function obstacles(raw, where, length, inner) {

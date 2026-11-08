@@ -23,6 +23,7 @@ export { parseExact, stringifyExact } from './exact-json.js';
 import { SUITE_VERSION } from './artifacts.js';
 import { validateDocuments } from './result-validation/index.js';
 import { parseExact, stringifyExact } from './exact-json.js';
+import { packNestedWith } from './nested.js';
 const require = createRequire(import.meta.url);
 
 /** The largest `maxMoves` the addon's `u32` parameter holds; napi wraps anything above it. */
@@ -131,6 +132,15 @@ export function pack(request) {
   return parseExact(packJson(stringifyExact(request)));
 }
 
+/**
+ * Levels packed in order, each level's packed containers becoming the next level's items,
+ * with the `levelBeamWidth` best chains carried between levels. Every level packs
+ * through `pack`, so through whichever backend is loaded.
+ */
+export function packNested(options) {
+  return packNestedWith(pack, options);
+}
+
 export function rebalanceWeight(request, result, options) {
   return rebalanceWeightWith(native, request, result, options);
 }
@@ -152,7 +162,7 @@ export function rebalanceWeightWith(binding, request, result, { maxMoves = 64 } 
   return rebalanceFallback(request, result, { maxMoves });
 }
 
-export const version = () => native?.version?.() ?? '1.9.0-js-fallback';
+export const version = () => native?.version?.() ?? '1.10.0-js-fallback';
 
 /**
  * The result is not a document the reference validator can judge (docs/VALIDATION-CONTRACT.md):

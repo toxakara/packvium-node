@@ -41,7 +41,7 @@ test('a malformed bag is refused with its pointer, reason and text', () => {
   const cases = [
     [{ deformable_boundary: 'flat_bag' }, '/deformable_boundary', 'wrong_type', 'must be an object'],
     [{ deformable_boundary: {} }, '/deformable_boundary/kind', 'missing_field', 'is required'],
-    [{ deformable_boundary: { kind: 'pouch' } }, '/deformable_boundary/kind', 'not_allowed', 'must be one of ["flat_bag"]'],
+    [{ deformable_boundary: { kind: 'pouch' } }, '/deformable_boundary/kind', 'not_allowed', 'must be one of ["flat_bag","gusseted_bag"]'],
     [{ deformable_boundary: { kind: 'flat_bag', seam: 1 } }, '/deformable_boundary/seam', 'not_allowed', 'is not a known field'],
     [{ ...BAG, made_to_measure: {} }, '/made_to_measure', 'not_allowed', 'cannot be combined with deformable_boundary'],
     [{ ...BAG, obstacles: [{ id: 'o', dimensions: { length: '1', width: '1', height: '1' } }] }, '/obstacles', 'not_allowed',

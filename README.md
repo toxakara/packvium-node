@@ -144,11 +144,13 @@ and `''` means the request as a whole. The message is `<code>: <field>: <detail>
 every Packvium engine. Branch on `reason` and `field`; show the message to a person.
 
 - `FixedPlacementError` extends it, with code `invalid_fixed_placement` and reason `malformed`
-  (`field` points at the bad value) or `cannot_hold` (the fixed items are not a valid packing on
-  their own; `field` is `/fixed_placements`). One `catch` for `InvalidRequestError` covers both.
+  (`field` points at the bad value), `invalid_value` (a `placement_id` that is not the one the
+  entry's own fields spell, or a signed orientation on an item that is not a `convex_hull`) or
+  `cannot_hold` (the fixed items are not a valid packing on their own; `field` is
+  `/fixed_placements`). One `catch` for `InvalidRequestError` covers all three.
 - `UnsupportedFeatureError` is separate, with code `unsupported_feature` and a `fields` list: the
-  request uses a field the schema reserves but this engine does not implement yet, such as
-  `container.pallet_overhang_limit`. It is refused rather than silently ignored.
+  request uses a field, or a combination of fields, this engine does not implement yet, such as
+  `container.pallet_overhang_limit+axles`. It is refused rather than silently ignored.
 - Numbers are judged by value, as the other engines judge them: `2.0` is the integer `2`, `2.5`
   and `'2'` are not integers, and an integer above `Number.MAX_SAFE_INTEGER` (2^53 - 1) is
   `above_maximum` -- also when it arrives as JSON text, which `JSON.parse` would otherwise round.
@@ -233,21 +235,22 @@ and execute without a project around it, and each prints what it teaches.
 | File | What it shows |
 | --- | --- |
 | [`basic.mjs`](examples/basic.mjs) | Pack an order, read placements, and see why an item was refused. |
-| [`objectives.mjs`](examples/objectives.mjs) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree about which container to open. |
+| [`objectives.mjs`](examples/objectives.mjs) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree about which container to open, a declared `currency` echoed on the answer, and the `optimality.lower_bound` five of them state. |
 | [`constraints.mjs`](examples/constraints.mjs) | Rotations and `keep_upright`, support ratio, top load, stacking caps, incompatible tags and atomic groups — each with and without the rule — and `explainUnpackedItem` turning a refusal into a sentence. |
-| [`limits.mjs`](examples/limits.mjs) | Wheel arches as `obstacles` with `additional_boxes`, `max_items` and `tag_limits` per container, and what happens when container stock or `max_containers` runs out. |
+| [`limits.mjs`](examples/limits.mjs) | Wheel arches as `obstacles` with `additional_boxes`, `max_items` and `tag_limits` per container, what happens when container stock or `max_containers` runs out, a crate overhanging its pallet under `pallet_overhang_limit`, and a flat bag against a gusseted one. |
 | [`trucking.mjs`](examples/trucking.mjs) | A multi-drop van: `stop_index` and a rear door in `access_directions`, two `axles` with load limits, and a safe loading order fed into `buildExecutionPlan`. |
-| [`shapes.mjs`](examples/shapes.mjs) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, and a cushion that compresses under load until the crush limit refuses it. |
+| [`shapes.mjs`](examples/shapes.mjs) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, two identical wedges that need one of the 18 signed rotations to share it, and a cushion that compresses under load until the crush limit refuses it. |
 | [`units.mjs`](examples/units.mjs) | Why lengths travel as strings: fractional inches kept exact, one tick deciding a fit, and the point where a JavaScript number stops being exact and a quote is refused rather than rounded. |
 | [`serialization.mjs`](examples/serialization.mjs) | `packJson` with JSON text in and out, runners-up through `alternatives`, and exactly which mistakes are refused and which are ignored. |
 | [`reproducibility.mjs`](examples/reproducibility.mjs) | `effort_budget` against `time_limit_ms`: a budget that never binds, one that cuts the search short and still repeats exactly, and how to tell from the result which one stopped it. |
 | [`errors.mjs`](examples/errors.mjs) | `InvalidRequestError`'s `code`, `reason`, `field` and message for each kind of bad request, JavaScript's integer range, `FixedPlacementError` and `UnsupportedFeatureError` — and a valid request that simply does not fit. |
-| [`fixed_placements.mjs`](examples/fixed_placements.mjs) | Pack around items already loaded, lock half of an earlier plan by quoting its placements, and a fixed set that cannot hold. |
+| [`fixed_placements.mjs`](examples/fixed_placements.mjs) | Pack around items already loaded, lock half of an earlier plan by quoting its placements and their `placement_id`, a fixed set that cannot hold, and an id that names another placement. |
 | [`rebalancing.mjs`](examples/rebalancing.mjs) | `rebalanceWeight` evening out payload between packed crates, the moves it made, and `maxMoves`. |
 | [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`execution.mjs`](examples/execution.mjs) | Turn a result into dock instructions, and what "byte-identical" does and does not promise: the four adapters agree on any given result, while this engine is free to reach a different packing than Python does. |
 | [`artifacts.mjs`](examples/artifacts.mjs) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable HTML work order, and a refusal for a format it does not know. |
-| [`revisions.mjs`](examples/revisions.mjs) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, and a hash-chained record that notices an edit. |
+| [`revisions.mjs`](examples/revisions.mjs) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, a hash-chained record that notices an edit, and a box cut to measure (with a void-fill reserve) that a revision turns into stock. |
+| [`nested.mjs`](examples/nested.mjs) | `packNested`: cartons, then a pallet, and the carton set the greedy chain picks against the one `levelBeamWidth: 2` finds the pallet can take. |
 
 ```bash
 node examples/basic.mjs
@@ -280,15 +283,26 @@ step's placement the way its scene item is named, to match one to the other.
 ## Features
 
 - Exact, deterministic placement with no floating-point geometry decisions.
-- Rotation, payload, stackability, support, clearance, obstacle and tag constraints.
+- Rotation, payload, stackability, support, clearance, obstacle and tag constraints; a
+  `convex_hull` item may also take the 18 signed rotations (`-L-W+H` and the rest), 24 in all.
+- Pallets a load may overhang (`pallet_overhang_limit`), flat and gusseted mailer bags
+  (`deformable_boundary`), and boxes cut to measure (`made_to_measure`), with a void-fill
+  reserve if you want one.
+- A declared `currency` on the request and its rate tables, echoed on the result, so a price is
+  never read in the wrong money.
+- A `placement_id` on every placement, the same string in every engine, to key a lock or match a
+  plan step to the box it places.
 - Multiple container types and clear explanations for unpacked items.
-- A proof, or the distance to one: under the `default` and `lowest_cost` objectives every result
-  states `optimality.lower_bound`; a complete result that attains it reports `optimal`, and any
-  other carries the gap to the bound.
+- A proof, or the distance to one: under the `default`, `lowest_cost`, `open_dimension_height`,
+  `maximum_value` and `maximum_volume` objectives every result states `optimality.lower_bound`; a
+  complete result that attains it reports `proven_optimal`, and any other carries the gap to the bound.
 - `validate(request, result)`, the reference validator, on every backend: a plain `npm install`
   checks results without the compiled addon.
 - JSON input/output through `pack()` or `packJson()`.
 - Optional payload rebalancing with `rebalanceWeight()`.
+- Nested packing with `packNested({ levels, levelBeamWidth })`: cartons, then pallets, each
+  level a JSON request; a width above 1 carries the best carton sets up a level so the pallet
+  decides between them.
 - Loading and removal sequence helpers for already placed boxes.
 - Execution plans through `buildExecutionPlan()` / `canonicalPlanJson()`: a work-order view of a
   result, with solver facts separated from the text that cites them.
@@ -319,7 +333,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.9"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.10"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -350,7 +364,7 @@ CodeMeta form.
 @software{packvium_node,
   author  = {{Packvium contributors}},
   title   = {Packvium for Node.js},
-  version = {1.9.0},
+  version = {1.10.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

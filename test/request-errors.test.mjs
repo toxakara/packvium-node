@@ -191,13 +191,13 @@ function assertRefusedWith(edit, message) {
 }
 
 test('an error that carries its own code is not relabelled', () => {
-  const unsupported = refusalOf((r) => { r.containers[0].pallet_overhang_limit = '10'; });
+  const unsupported = refusalOf((r) => { Object.assign(r.containers[0], { pallet_overhang_limit: '10', axles: [] }); });
   assert.ok(unsupported instanceof UnsupportedFeatureError);
   assert.equal(unsupported.code, 'unsupported_feature');
 });
 
 test('an unsupported field is refused ahead of a malformed shape, without crashing on it', () => {
-  const error = refusalOf((r) => { r.items = { cube: r.items[0] }; r.containers.push(null, { id: 'b', pallet_overhang_limit: 1 }); });
+  const error = refusalOf((r) => { r.items = { cube: r.items[0] }; r.containers.push(null, { id: 'b', pallet_overhang_limit: 1, axles: 1 }); });
   assert.ok(error instanceof UnsupportedFeatureError, `${error.name}: ${error.message}`);
   assertRefused((r) => { r.containers[0].obstacles = [null]; }, 'wrong_type', '/containers/0/obstacles/0', 'must be an object');
 });
@@ -253,6 +253,35 @@ test('a fixed placement orientation outside the six codes names them as a requir
   assert.ok(error instanceof FixedPlacementError, `${error.name}: ${error.message}`);
   assert.deepEqual([error.reason, error.field, error.message], ['malformed', '/fixed_placements/0/orientation',
     'invalid_fixed_placement: fixed_placements[0].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]']);
+});
+
+const wedge = (extra) => ({
+  id: 'wedge', quantity: 1, weight: '1000', dimensions: { length: '100', width: '100', height: '100' },
+  shape_type: 'convex_hull',
+  hull_vertices: [[0, 0, 0], [100, 0, 0], [0, 100, 0], [0, 0, 100]].map(([x, y, z]) => ({ x: `${x}`, y: `${y}`, z: `${z}` })),
+  ...extra,
+});
+const EVERY_ORIENTATION = '["LWH","LHW","WLH","WHL","HLW","HWL","+L-W-H","-L+W-H","-L-W+H","+L-H+W","+L+H-W","-L-H-W",'
+  + '"+W-L+H","+W+L-H","-W-L-H","+W-H-L","-W+H-L","-W-H+L","+H-L-W","-H+L-W","-H-L+W","+H-W+L","+H+W-L","-H-W-L"]';
+
+test('a signed rotation code needs a convex hull, and a hull names all 24 codes (1.10)', () => {
+  assertRefused((r) => { r.items[0].allowed_rotations = ['LWH', '-L-W+H']; }, 'invalid_value',
+    '/items/0/allowed_rotations/1', 'a signed rotation code requires shape_type convex_hull');
+  assertRefused((r) => { r.items[0] = wedge({ allowed_rotations: ['+L+W+H'] }); }, 'not_allowed',
+    '/items/0/allowed_rotations/0', `must be one of ${EVERY_ORIENTATION}`);
+  const placed = (orientation, item) => refusalOf((r) => {
+    if (item) r.items[0] = item;
+    r.fixed_placements = [{ item_type: item ? 'wedge' : 'cube', container_type: 'box', orientation }];
+  });
+  const signed = placed('-L-W+H');
+  assert.ok(signed instanceof FixedPlacementError, `${signed.name}: ${signed.message}`);
+  assert.deepEqual([signed.reason, signed.field, signed.message], ['invalid_value', '/fixed_placements/0/orientation',
+    'invalid_fixed_placement: fixed_placements[0].orientation: a signed rotation code requires shape_type convex_hull']);
+  const unknown = placed('LLL', wedge());
+  assert.deepEqual([unknown.reason, unknown.message], ['malformed',
+    `invalid_fixed_placement: fixed_placements[0].orientation must be one of ${EVERY_ORIENTATION}`]);
+  const refused = placed('-L-W+H', wedge({ allowed_rotations: ['LWH'] }));
+  assert.deepEqual([refused.reason, refused.message], ['cannot_hold', 'invalid_fixed_placement: wedge may not be placed in orientation -L-W+H']);
 });
 
 test('a nesting height not below the item height is refused at its pointer', () => {

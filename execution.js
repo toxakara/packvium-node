@@ -68,6 +68,28 @@ export function placementReference(containerIndex, placement) {
   };
 }
 
+/** How Python's `repr` spells the values a malformed `placement_id` can be. */
+const reprOf = (value) => {
+  if (value === null) return 'None';
+  if (typeof value === 'boolean') return value ? 'True' : 'False';
+  return typeof value === 'string' ? `'${value}'` : JSON.stringify(value);
+};
+
+/**
+ * `placementReference` plus the result placement's `placement_id` (1.10), copied rather than
+ * derived, when the result carries one. A canonical projection (a golden) has no ids, so its
+ * plan keeps the bytes it always had.
+ */
+function stepReference(containerIndex, placement) {
+  const reference = placementReference(containerIndex, placement);
+  if (!Object.prototype.hasOwnProperty.call(placement, 'placement_id')) return reference;
+  const identifier = placement.placement_id;
+  if (typeof identifier !== 'string' || !identifier) {
+    throw new ExecutionPlanError(`placement_id ${reprOf(identifier)} is not a non-empty string`);
+  }
+  return { ...reference, placement_id: identifier };
+}
+
 /**
  * The operator sequence for one container, or an honest absence of one.
  *
@@ -80,7 +102,7 @@ function steps(containerIndex, placements, loadingOrder) {
     return {
       order: 'unavailable',
       steps: placements.map((placement) => ({
-        placement: placementReference(containerIndex, placement),
+        placement: stepReference(containerIndex, placement),
       })),
     };
   }
@@ -95,7 +117,7 @@ function steps(containerIndex, placements, loadingOrder) {
     order: 'loading',
     steps: loadingOrder.map((index, step) => ({
       sequence: step + 1,
-      placement: placementReference(containerIndex, placements[index]),
+      placement: stepReference(containerIndex, placements[index]),
     })),
   };
 }

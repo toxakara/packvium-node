@@ -140,10 +140,11 @@ try {
   console.log(`  ${error.message}`);
 }
 
-// A field the schema reserves but no engine implements yet is refused by name rather
-// than silently ignored. It is a different error type, with its own code.
+// A field, or a combination of fields, that no engine implements yet is refused by name
+// rather than silently ignored. It is a different error type, with its own code.
 const ahead = valid();
 ahead.containers[0].pallet_overhang_limit = { length: '50', width: '50' };
+ahead.containers[0].axles = [{ position: '0' }, { position: '100' }];
 try {
   pack(ahead);
 } catch (error) {

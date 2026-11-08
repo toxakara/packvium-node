@@ -177,7 +177,8 @@ test('a hull\'s volume is exact, whatever the vertex order', () => {
   const cube = [];
   for (const x of [0n, 2n]) for (const y of [0n, 2n]) for (const z of [0n, 2n]) cube.push([x, y, z]);
   assert.equal(hullVolume(cube), 8n);
-  assert.equal(hullVolume(rotateHull(cube.slice().reverse(), [1, 0, 2])), 8n);
+  assert.equal(hullVolume(rotateHull(cube.slice().reverse(), 'WLH')), 8n);
+  assert.equal(hullVolume(rotateHull(cube, '-H-W-L')), 8n);
   // A wedge with a vertex on an edge midpoint: the face walk passes over it.
   const wedge = [[0n, 0n, 0n], [4n, 0n, 0n], [0n, 4n, 0n], [0n, 0n, 4n], [2n, 0n, 0n]];
   assert.equal(hullVolume(wedge), 10n);
@@ -202,7 +203,11 @@ test('a container without an id is refused once an issue has to name it', () => 
   const result = pack(request);
   assert.deepEqual(validateWith(null, request, result), []);
   delete result.containers[0].id;
-  assert.deepEqual(validateWith(null, request, result), []);
+  // The reference reads a missing id as `""`, so the only issue is the placement id naming it.
+  assert.deepEqual(validateWith(null, request, result), [{
+    code: 'placement_id_mismatch',
+    detail: 'cube#1 in : reported ["box#1",0,0,0,"cube","LWH"], expected ["",0,0,0,"cube","LWH"]',
+  }]);
   result.containers[0].payload_weight = { ticks: 1 };
   assert.throws(() => validateWith(null, request, result), (error) => error instanceof MalformedResult && error.kind === 'shape');
 });

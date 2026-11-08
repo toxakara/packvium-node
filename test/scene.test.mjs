@@ -110,7 +110,9 @@ const MALFORMED = [
   ['a placement with no reference', (a) => ({ ...a, geometry: { containers: [{ ...a.geometry.containers[0], placements: [{ dimensions: a.geometry.containers[0].placements[0].dimensions }] }] } }),
     'artifact.geometry.containers[0].placements[0].placement must be an object'],
   ['an unknown orientation', (a) => ({ ...a, geometry: { containers: [{ ...a.geometry.containers[0], placements: [{ ...a.geometry.containers[0].placements[0], placement: { ...REFERENCE, orientation: 'XYZ' } }] }] } }),
-    'artifact.geometry.containers[0].placements[0].placement.orientation must be one of LWH, LHW, WLH, WHL, HLW, HWL'],
+    'artifact.geometry.containers[0].placements[0].placement.orientation must be one of LWH, LHW, WLH, WHL, HLW, HWL, '
+      + '+L-W-H, -L+W-H, -L-W+H, +L-H+W, +L+H-W, -L-H-W, +W-L+H, +W+L-H, -W-L-H, +W-H-L, -W+H-L, -W-H+L, '
+      + '+H-L-W, -H+L-W, -H-L+W, +H-W+L, +H+W-L, -H-W-L'],
   ['a fractional position', (a) => ({ ...a, geometry: { containers: [{ ...a.geometry.containers[0], placements: [{ ...a.geometry.containers[0].placements[0], placement: { ...REFERENCE, position_ticks: { x: 0.5, y: 0, z: 0 } } }] }] } }),
     'artifact.geometry.containers[0].placements[0].placement.position_ticks.x must be an integer'],
 ];
@@ -138,4 +140,28 @@ test('a packing result becomes one scene per container, read through its artifac
   const artifact = buildOperationalArtifact(request, result);
   assert.equal(scenes.length, result.containers.length);
   assert.deepEqual(scenes, result.containers.map((_, index) => artifactToScene(artifact, index)));
+});
+
+test('a hull placed in a signed rotation is drawn as its rotated envelope, not refused (1.10)', () => {
+  // Two chiral wedges share one cube only when one is turned half a turn about z (-L-W+H).
+  const vertices = [[0, 0, 0], [100, 0, 0], [0, 100, 0], [0, 0, 100], [100, 0, 100], [0, 100, 100]];
+  const request = {
+    items: [{
+      id: 'wedge', quantity: 2, weight: '1000', dimensions: { length: '100', width: '60', height: '80' },
+      shape_type: 'convex_hull', allowed_rotations: ['LWH', '-L-W+H'],
+      hull_vertices: vertices.map(([x, y, z]) => ({ x: `${x}`, y: `${y * 0.6}`, z: `${z * 0.8}` })),
+    }],
+    containers: [{ id: 'crate', quantity: 1, inner_dimensions: { length: '100', width: '60', height: '80' } }],
+    configuration: { solver_profile: 'balanced', time_limit_ms: 60000 },
+  };
+  const result = pack(request);
+  assert.equal(result.unpacked_items.length, 0);
+  const [scene] = resultToScenes(request, result);
+  assert.deepEqual(scene.items.map((item) => item.rotation).sort(), ['-L-W+H', 'LWH']);
+  for (const item of scene.items) {
+    assert.deepEqual(item.dimensions, { length: { ticks: '1600000', mm: '100' }, width: { ticks: '960000', mm: '60' },
+      height: { ticks: '1280000', mm: '80' } });
+  }
+  const signed = scene.items.find((item) => item.rotation === '-L-W+H');
+  assert.ok(signed.id.endsWith('/-L-W+H'), signed.id);
 });

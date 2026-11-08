@@ -8,11 +8,11 @@ import {
   PyDict, at, get, getNull, getOr, has, int, isDict, list, pyEq, pyInt, truthy,
 } from './json.js';
 import { Refusal, contract, issue, shape } from './outcome.js';
-import { abs, ceilDiv, floorDiv, max, pyMod, ratioPpm } from './num.js';
+import { Ratio, abs, ceilDiv, floorDiv, max, min, pyMod, ratioPpm } from './num.js';
 import { intTuple, list as listRepr, pyRepr, pyStr, strRepr, valueTuple } from './pyfmt.js';
 import { allows, intersectsTags, isRotation, rotated, sortedTags, volumeOf } from './spec.js';
 import {
-  SCORE_SCALE, SQUARE_METRE_TICKS, checkCrush, checkRouteRemovalOrder, checkStackDensity, checkStackTopLoad, checkSupportAndLoad,
+  SCORE_SCALE, SQUARE_METRE_TICKS, checkCrush, checkDeckSupport, checkRouteRemovalOrder, checkStackDensity, checkStackTopLoad, checkSupportAndLoad,
   occupiedVolume, placedHull, propagateLoad, supportGraph, validNesting,
 } from './stacking.js';
 
@@ -58,6 +58,28 @@ export function envelopeOf(placement, clearance) {
   }
 }
 
+/** The deck grown by the overhang the placements use past each of its edges. O(p). */
+export function palletFootprint(packed, [x, y, length, width], clearance) {
+  const envelopes = list(at(packed, 'placements'), 'placements').map((placement) => envelopeOf(placement, clearance));
+  const lowX = envelopes.reduce((low, box) => min(low, box.x), x);
+  const lowY = envelopes.reduce((low, box) => min(low, box.y), y);
+  const highX = envelopes.reduce((high, box) => max(high, box.x2), x + length);
+  const highY = envelopes.reduce((high, box) => max(high, box.y2), y + width);
+  return [highX - lowX, highY - lowY];
+}
+
+/**
+ * What a carrier measures: a bag's package; a pallet's declared footprint or its grown
+ * deck, the larger per axis; else the declared outer, else inner size.
+ */
+export function billedSize(packed, spec, clearance) {
+  if (spec.flatBag) return achievedExtent(packed, clearance);
+  if (spec.deck === null) return spec.outer ?? spec.inner;
+  const [length, width] = palletFootprint(packed, spec.deck, clearance);
+  const base = spec.outer ?? [spec.deck[2], spec.deck[3], spec.inner[2]];
+  return [max(base[0], length), max(base[1], width), base[2]];
+}
+
 /** The largest envelope x2, y2 and z2 over a packed container's placements. */
 export function achievedExtent(packed, clearance) {
   const boxes = list(at(packed, 'placements'), 'placements').map((placement) => envelopeOf(placement, clearance));
@@ -75,7 +97,7 @@ const optionalTuple = (values) => (values === null ? 'None' : valueTuple(values)
 
 /**
  * `achieved_dimensions` is present exactly when the container declares a soft size, and equals
- * the tight extent; a flat bag's extent must pass the girth rule.
+ * the tight extent; a bag's extent must pass the girth rule, widened by a side gusset (1.10).
  */
 export function checkAchievedExtent(packed, spec, clearance, issues) {
   const reported = getNull(packed, 'achieved_dimensions');
@@ -85,14 +107,16 @@ export function checkAchievedExtent(packed, spec, clearance, issues) {
     packedId.verify();
     return;
   }
-  const [a, b, c] = achievedExtent(packed, clearance);
+  let [a, b, c] = achievedExtent(packed, clearance);
+  if (spec.deck !== null) [a, b] = palletFootprint(packed, spec.deck, clearance);
   const stated = isDict(reported) ? SIDES.map((side) => getNull(getOr(reported, side, {}), 'ticks')) : null;
   if (!matchesInts(stated, [a, b, c])) {
     issues.push(issue('achieved_dimensions_mismatch', `${packedId}: reported ${optionalTuple(stated)}, computed ${intTuple([a, b, c])}`));
   }
-  if (spec.flatBag && (a + c > spec.inner[0] || b + c > spec.inner[1])) {
+  if (spec.flatBag && (a + c > spec.inner[0] || b + c > spec.inner[1] + spec.sideGusset)) {
+    const gusset = spec.sideGusset > 0n ? `, side gusset ${spec.sideGusset}` : '';
     issues.push(issue('bag_girth_exceeded',
-      `${packedId}: a + c = ${a + c}, b + c = ${b + c}, flat size ${spec.inner[0]} x ${spec.inner[1]}`));
+      `${packedId}: a + c = ${a + c}, b + c = ${b + c}, flat size ${spec.inner[0]} x ${spec.inner[1]}${gusset}`));
   }
   packedId.verify();
 }
@@ -103,6 +127,26 @@ const fabricatedSide = (achieved, minimum, increment) => minimum + ceilDiv(max(a
 /** `ceil(rate * 2(LW + LH + WH) / 1 m^2)`, the material and board rounding. */
 function perSquareMetreCeiling(rate, [length, width, height]) {
   return ceilDiv(rate * 2n * (length * width + length * height + width * height), SQUARE_METRE_TICKS);
+}
+
+/**
+ * Whether a reported box larger than the tight cut is a reserve cut: the tight box
+ * breaks the void-fill reserve, and the reported one is on the machine grid between the tight box
+ * and the maximum. That it keeps the reserve is the ordinary reserve check's. Reads the reported
+ * used volume, which `used_volume_mismatch` holds to the placements. O(1).
+ */
+function reserveCut(packed, spec, machine, tight, reported) {
+  if (spec.voidFillReserveRatio.compare(Ratio.of(0n)) === 0 || reported === null) return false;
+  if (!reported.every((side) => typeof side === 'bigint' || Number.isInteger(side))) return false;
+  const sides = reported.map(BigInt);
+  const onGrid = sides.every((side, axis) => tight[axis] <= side && side <= spec.inner[axis]
+    && pyMod(side - machine.minimum[axis], machine.increment[axis]) === 0n);
+  const used = getNull(packed, 'used_volume_ticks3');
+  if (!onGrid || typeof used !== 'string' || !/^[0-9]+$/.test(used)) return false;
+  const volume = tight[0] * tight[1] * tight[2];
+  const scaled = ratioPpm(spec.voidFillReserveRatio);
+  const reserved = (volume / SCORE_SCALE) * scaled + ((volume % SCORE_SCALE) * scaled) / SCORE_SCALE;
+  return BigInt(used) > volume - reserved;
 }
 
 /** `(block.get(key) or {}).get("ticks")`. */
@@ -138,11 +182,12 @@ export function checkMadeToMeasure(packed, compact, spec, items, clearance, issu
   const block = isDict(reportedBlock) ? reportedBlock : {};
   if (compact) issues.push(issue('lattice_summary_on_made_to_measure', containerId));
   const achieved = achievedExtent(packed, clearance);
-  const fabricated = [0, 1, 2].map((axis) => fabricatedSide(achieved[axis], machine.minimum[axis], machine.increment[axis]));
+  let fabricated = [0, 1, 2].map((axis) => fabricatedSide(achieved[axis], machine.minimum[axis], machine.increment[axis]));
   if (fabricated.some((side, axis) => side > spec.inner[axis])) {
     issues.push(issue('fabricated_dimensions_exceed_machine', `${containerId}: ${intTuple(fabricated)} beyond ${intTuple(spec.inner)}`));
   }
   const reportedInner = reportedTicks(getNull(packed, 'inner_dimensions'));
+  if (!matchesInts(reportedInner, fabricated) && reserveCut(packed, spec, machine, fabricated, reportedInner)) fabricated = reportedInner.map(BigInt);
   if (!matchesInts(reportedInner, fabricated)) {
     issues.push(issue('fabricated_dimensions_mismatch',
       `${containerId}: reported ${optionalTuple(reportedInner)}, computed ${intTuple(fabricated)}`));
@@ -187,6 +232,7 @@ export function checkContainer(packed, spec, items, clearance, globalSupport, is
   checkPairs(entries, packedId, issues);
   const graph = supportGraph(entries);
   checkSupportAndLoad(entries, graph, globalSupport, issues);
+  if (spec.deck !== null) checkDeckSupport(entries, spec.deck, globalSupport, issues);
   const loads = propagateLoad(entries, graph);
   checkStackTopLoad(entries, loads, issues);
   if (spec.maxStackDensity !== null) checkStackDensity(packedId, entries, loads, spec.maxStackDensity, issues);

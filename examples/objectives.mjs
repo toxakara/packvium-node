@@ -81,6 +81,22 @@ const cheapPerGram = box('roomy', '400', {
 const byMoney = { seed: 42, objective: 'lowest_landed_cost', time_limit_ms: SAFETY_FUSE_MS, ...weightPricing };
 console.log('lowest_landed_cost  ', solve(byMoney, [dearPerGram, cheapPerGram]));
 
+// A rate card is written in one currency, and the request can say which. Declare it on
+// the request and on each rate table: the answer echoes it, so a price is never read in
+// the wrong money. It never changes the packing or the score; a table in another
+// currency than the request's is refused rather than converted.
+const inEuros = (rateCurrency) => pack({
+  units: { length: 'mm' }, configuration: byMoney, items: widgets, currency: 'EUR',
+  containers: [{ ...cheapPerGram, rate_table: { ...cheapPerGram.rate_table, currency: rateCurrency } }],
+});
+const euros = inEuros('EUR');
+console.log('lowest_landed_cost  ', `${euros.currency} ${euros.score[1]} minor units, score=${JSON.stringify(euros.score)}`);
+try {
+  inEuros('USD');
+} catch (refusal) {
+  console.log('lowest_landed_cost* ', `refused: ${refusal.message}`);
+}
+
 // A rate card that stops short of the shipment is a refusal, never a silent clamp to the
 // top bracket -- you would otherwise be quoted a price the carrier never published.
 const tooNarrow = box('roomy', '400', {
@@ -117,3 +133,23 @@ const scarce = pack({
 const kept = scarce.containers.flatMap((c) => c.placements.map((p) => p.item_type)).sort();
 const left = (scarce.unpacked_items ?? []).map((u) => u.item_type ?? u.item_id).sort();
 console.log('maximum_value       ', `packed=${JSON.stringify(kept)} left behind=${JSON.stringify(left)}`);
+
+// How far from the best possible answer? Under `default`, `lowest_cost`, and since 1.10
+// `open_dimension_height`, `maximum_value` and `maximum_volume`, every result states
+// `optimality.lower_bound`: no packing can score below it. An answer that attains it is
+// proven best; any other names the first key that falls short and the gap on it. The
+// bound is a cheap volume argument, so on the roomy box `default` keeps a gap on unused
+// volume that no search could close -- read it as "at most this far", never "this far".
+// `shipping_cost` and `lowest_landed_cost` state no bound. The scarce `maximum_value`
+// scene attains its bound, its 20 units of gravel left behind being the least any packing
+// leaves, and still reads `best_found`: `proven_optimal` is only ever said of a complete
+// result.
+console.log();
+for (const objective of ['default', 'open_dimension_height', 'maximum_volume']) {
+  const { optimality } = pack({ units: { length: 'mm' }, items: widgets, containers: [snug, roomy],
+    configuration: { seed: 42, objective, time_limit_ms: SAFETY_FUSE_MS } });
+  console.log(`bound ${objective.padEnd(22)}`, `${optimality.code} lower_bound=${JSON.stringify(optimality.lower_bound)} ` +
+    `gap on key ${optimality.gap_key}: ${optimality.absolute_gap}`);
+}
+console.log(`bound ${'maximum_value'.padEnd(22)}`, `${scarce.optimality.code} lower_bound=${JSON.stringify(scarce.optimality.lower_bound)} ` +
+  `score=${JSON.stringify(scarce.score)}`);

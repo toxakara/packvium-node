@@ -97,11 +97,14 @@ for (const name of names) {
 
   test(`${name}: the result has the documented shape`, () => {
     const result = pack(request);
+    // `currency` is echoed exactly when the request declares one (1.10).
+    const declared = request.currency == null ? [] : ['currency'];
     assert.deepEqual(Object.keys(result).sort(), [
-      'algorithm', 'alternatives', 'catalog_versions_used', 'complete', 'containers',
+      'algorithm', 'alternatives', 'catalog_versions_used', 'complete', 'containers', ...declared,
       'feasibility', 'objective', 'optimality', 'score', 'status', 'summary',
       'termination', 'unpacked_items', 'warnings',
     ]);
+    assert.equal(result.currency, request.currency ?? undefined);
     assert.equal(typeof result.feasibility.code, 'string');
     assert.equal(typeof result.termination.code, 'string');
     assert.equal(typeof result.optimality.code, 'string');

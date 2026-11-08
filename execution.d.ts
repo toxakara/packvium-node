@@ -14,7 +14,8 @@ export class ExecutionPlanError extends Error {}
 export interface PositionTicks{x:number;y:number;z:number}
 
 /** How a step names a placement. Ticks are the exact integer coordinate, never a rendering. */
-export interface PlacementReference{container_index:number;item_type:string;orientation:string;position_ticks:PositionTicks}
+/** `placement_id` (1.10) is copied from the result placement when it carries one; `placementReference` alone never sets it. */
+export interface PlacementReference{container_index:number;item_type:string;orientation:string;position_ticks:PositionTicks;placement_id?:string}
 
 /** `sequence` is present only when a loading order was supplied; it is never derived. */
 export interface ExecutionStep{sequence?:number;placement:PlacementReference}

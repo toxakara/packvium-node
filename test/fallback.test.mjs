@@ -5,7 +5,7 @@ import test from 'node:test';
 import {
   Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
   BoundOverflowError, __spatialIndexForTests, __inspectHullShapeForTests, __objectiveBoundsForTests,
-  __requestBoundForTests,
+  __objectiveVectorForTests, __requestBoundForTests, __runSmallestUnsortedForTests,
   __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
   InvalidRequestError, explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules, __ratiosForTests, __planBeamForTests,
@@ -2144,45 +2144,50 @@ test('the objective lower bound matches Python on every corpus case', (t) => {
     return;
   }
   const scene = JSON.parse(readFileSync(sceneUrl));
-  assert.equal(scene.format, 'packvium-objective-bounds/v1');
+  assert.equal(scene.format, 'packvium-objective-bounds/v2');
   assert.ok(scene.cases.length > 300,
     'a scene that quietly emptied itself would make every case below vacuous');
+  const instancesOf = (scenario) => scenario.instances.map((raw) => ({
+    volume: BigInt(raw.volume), weight: BigInt(raw.weight), shrinks: raw.shrinks,
+    value: BigInt(raw.value),
+  }));
+  const containersOf = (scenario) => scenario.containers.map((raw) => ({
+    usable: BigInt(raw.usable), inner: BigInt(raw.inner), baseArea: BigInt(raw.base_area),
+    height: BigInt(raw.height),
+    payload: raw.payload === null ? null : BigInt(raw.payload),
+    maxItems: raw.max_items === null ? null : BigInt(raw.max_items),
+    quantity: raw.quantity === null ? null : BigInt(raw.quantity),
+    costMinor: BigInt(raw.cost_minor),
+  }));
+  // Every covered objective's vector, `null` where a ceiling withholds it: the
+  // objective-only keys of maximum_value, open_dimension_height and maximum_volume included.
+  const assertObjectives = (scenario, instances, containers, name) => {
+    assert.deepEqual(Object.keys(scenario.objectives).sort(),
+      ['default', 'lowest_cost', 'maximum_value', 'maximum_volume', 'open_dimension_height'], name);
+    for (const [objective, expected] of Object.entries(scenario.objectives)) {
+      assert.deepEqual(__objectiveVectorForTests(instances, containers, objective), expected,
+        `${objective} diverges from Python on ${name}`);
+    }
+  };
   for (const one of scene.cases) {
-    const instances = one.instances.map((raw) => ({
-      volume: BigInt(raw.volume), weight: BigInt(raw.weight), shrinks: raw.shrinks,
-    }));
-    const containers = one.containers.map((raw) => ({
-      usable: BigInt(raw.usable), inner: BigInt(raw.inner), baseArea: BigInt(raw.base_area),
-      height: BigInt(raw.height),
-      payload: raw.payload === null ? null : BigInt(raw.payload),
-      maxItems: raw.max_items === null ? null : BigInt(raw.max_items),
-      quantity: raw.quantity === null ? null : BigInt(raw.quantity),
-      costMinor: BigInt(raw.cost_minor),
-    }));
+    const instances = instancesOf(one), containers = containersOf(one);
     assert.deepEqual(__objectiveBoundsForTests(instances, containers), one.bounds,
       `bounds diverge from Python on ${one.fixture}`);
+    assertObjectives(one, instances, containers, one.fixture);
   }
-  // The edges are written from the oracle: the fixed-placement rule and every edge of the one
-  // refusal predicate, where null means this port must refuse too (finding F4).
+  // The edges are written from the oracle: the fixed-placement rule, the objective-only keys
+  // and every edge of the one refusal predicate, where null means this port must refuse too
+  // (finding F4).
   assert.ok(scene.edges.length > 0, 'the refusal predicate\'s edges are not optional');
   for (const edge of scene.edges) {
-    const instances = edge.instances.map((raw) => ({
-      volume: BigInt(raw.volume), weight: BigInt(raw.weight), shrinks: raw.shrinks,
-    }));
-    const containers = edge.containers.map((raw) => ({
-      usable: BigInt(raw.usable), inner: BigInt(raw.inner), baseArea: BigInt(raw.base_area),
-      height: BigInt(raw.height),
-      payload: raw.payload === null ? null : BigInt(raw.payload),
-      maxItems: raw.max_items === null ? null : BigInt(raw.max_items),
-      quantity: raw.quantity === null ? null : BigInt(raw.quantity),
-      costMinor: BigInt(raw.cost_minor),
-    }));
+    const instances = instancesOf(edge), containers = containersOf(edge);
     if (edge.bounds === null) {
       assert.throws(() => __objectiveBoundsForTests(instances, containers), BoundOverflowError,
         edge.name);
     } else {
       assert.deepEqual(__objectiveBoundsForTests(instances, containers), edge.bounds, edge.name);
     }
+    assertObjectives(edge, instances, containers, edge.name);
   }
 });
 
@@ -2194,7 +2199,7 @@ test('the request bound is read from the request itself, in the objective\'s own
   assert.deepEqual(__requestBoundForTests(metre), [0, 1, 3, 0, 1000000]);
   assert.deepEqual(__requestBoundForTests({ ...metre, configuration: { objective: 'lowest_cost' } }),
     [0, 3, 1, 0, 1000000]);
-  assert.equal(__requestBoundForTests({ ...metre, configuration: { objective: 'maximum_value' } }), null);
+  assert.equal(__requestBoundForTests({ ...metre, configuration: { objective: 'shipping_cost' } }), null);
   assert.equal(__requestBoundForTests({ ...metre, configuration: { objective: 'constructor' } }), null);
 });
 
@@ -2213,8 +2218,76 @@ test('a result states its bound, and attainment is the only route to optimal', (
     missed.score[missed.optimality.gap_key] - missed.optimality.lower_bound[missed.optimality.gap_key]);
 
   const uncovered = packFallback(request([cube('c', 100)], [box('b', 300, 100, 100)],
-    { configuration: { objective: 'maximum_volume' } }));
+    { configuration: { objective: 'shipping_cost', dimensional_weight_divisor: 5000 } }));
   assert.deepEqual(uncovered.optimality, { code: 'not_proven' });
+});
+
+test('maximum_value, open_dimension_height and maximum_volume each bound their own key', () => {
+  // One metre cube of three fits the only box. Leaving the two cheapest forgoes
+  // 10 + 50; the one placed stands at least its volume over the floor, 1000 mm in ticks;
+  // 2 of the 3 requested volumes cannot fit, 666666.7 ppm, scored rounded up.
+  const values = [50, 10, 90].map((value, index) => cube(`m${index}`, 1000, { value }));
+  const crowded = (objective) => request(values, [box('b', 1000, 1000, 1000, { quantity: 1 })],
+    { configuration: { objective } });
+  assert.deepEqual(__requestBoundForTests(crowded('maximum_value')), [2, 60, 1, 0, 0]);
+  assert.deepEqual(__requestBoundForTests(crowded('open_dimension_height')), [2, 16000000, 1, 0, 0]);
+  assert.deepEqual(__requestBoundForTests(crowded('maximum_volume')), [666667, 2, 1, 0, 0]);
+  // Nothing placed, or an instance smaller than its box, gives the volume terms nothing.
+  const none = request([cube('m', 1000)], [box('b', 10, 10, 10, { quantity: 1 })],
+    { configuration: { objective: 'open_dimension_height' } });
+  assert.deepEqual(__requestBoundForTests(none), [1, 0, 0, 0, 0]);
+  const nested = request([cube('m', 1000, { quantity: 3, nesting_height: 10 })],
+    [box('b', 1000, 1000, 1000, { quantity: 1 })], { configuration: { objective: 'maximum_volume' } });
+  assert.deepEqual(__requestBoundForTests(nested), [0, 0, 1, 0, 0]);
+  // Unlimited stock holds everything, so no volume is forced out.
+  const stocked = request([cube('m', 1000, { quantity: 3 })], [box('b', 1000, 1000, 1000)],
+    { configuration: { objective: 'maximum_volume' } });
+  assert.deepEqual(__requestBoundForTests(stocked).slice(0, 2), [0, 0]);
+});
+
+test('the smallest values are selected from unsorted runs exactly as a sort would take them', () => {
+  // / F6: value_forgone selects rather than sorts, so it must agree with the sort.
+  const runs = [[5n, 2n], [1n, 3n], [9n, 1n], [1n, 0n], [3n, 2n], [5n, 1n], [0n, 1n]];
+  const flat = runs.flatMap(([value, count]) => Array.from({ length: Number(count) }, () => value))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  for (let count = 0; count <= flat.length + 1; count += 1) {
+    const expected = flat.slice(0, count).reduce((total, value) => total + value, 0n);
+    assert.equal(__runSmallestUnsortedForTests(runs, BigInt(count)), expected, `count ${count}`);
+    assert.equal(__runSmallestUnsortedForTests([...runs].reverse(), BigInt(count)), expected,
+      `reversed, count ${count}`);
+  }
+});
+
+test('a value forgone past the portable ceiling withholds only maximum_value', () => {
+  // Each value is exact; the two cheapest sum to 2^53, one past what JSON carries exactly.
+  const items = [Number.MAX_SAFE_INTEGER, 1, Number.MAX_SAFE_INTEGER]
+    .map((value, index) => cube(`m${index}`, 1000, { value }));
+  const crowded = (objective) => request(items, [box('b', 1000, 1000, 1000, { quantity: 1 })],
+    { configuration: { objective } });
+  assert.equal(__requestBoundForTests(crowded('maximum_value')), null);
+  assert.deepEqual(__requestBoundForTests(crowded('maximum_volume')), [666667, 2, 1, 0, 0]);
+  assert.deepEqual(packFallback(crowded('maximum_value')).optimality.lower_bound, undefined);
+});
+
+test('an achieved height past the portable ceiling withholds only open_dimension_height', () => {
+  // A one-tick floor under a column of volume: the summed top passes 2^53 ticks while every
+  // one of the five bounds stays small.
+  const instances = [{ volume: 2n ** 53n, weight: 0n, shrinks: false, value: 0n }];
+  const containers = [{ usable: 2n ** 53n, inner: 2n ** 53n, baseArea: 1n, height: 2n ** 53n,
+    payload: null, maxItems: null, quantity: 1n, costMinor: 0n }];
+  assert.equal(__objectiveVectorForTests(instances, containers, 'open_dimension_height'), null);
+  assert.deepEqual(__objectiveVectorForTests(instances, containers, 'maximum_volume'), [0, 0, 1, 0, 0]);
+});
+
+test('a covered objective is proven optimal by attaining its own key', () => {
+  // Everything fits: maximum_value forgoes nothing and maximum_volume leaves no volume out,
+  // so each attains its bound on every key.
+  for (const objective of ['maximum_value', 'maximum_volume']) {
+    const proven = packFallback(request([cube('c', 100, { quantity: 2, value: 5 })], [box('b', 200, 100, 100)],
+      { configuration: { objective } }));
+    assert.equal(proven.status, 'optimal', objective);
+    assert.deepEqual(proven.optimality, { code: 'proven_optimal', lower_bound: proven.score }, objective);
+  }
 });
 
 test('a sum past the declared ceiling is refused rather than answered', () => {
@@ -2307,6 +2380,24 @@ test('a hull is tested against an obstacle as a solid, not as its bounding box',
   assert.equal(beside.status, 'feasible');
   assert.deepEqual(placements(beside).map(placement => at(placement)), [[0, 0, 0]]);
   assert.deepEqual(attempt(0, 0).unpacked_items.map(item => item.item_id), ['wedge#1']);
+});
+
+test('a chiral wedge pair fits one crate only under a signed rotation, and keep_upright narrows a list (1.10)', () => {
+  // Two half-cube wedges fill a cube when one is turned half a turn about z; no legacy code
+  // does that, since an odd legacy code mirrors x and the even ones lay the wedge down.
+  const wedge = [[0, 0, 0], [100, 0, 0], [0, 100, 0], [0, 0, 100], [100, 0, 100], [0, 100, 100]];
+  const attempt = (rotations, extra = {}) => packSound(request([{
+    ...cube('wedge', 100, { quantity: 2 }), shape_type: 'convex_hull', allowed_rotations: rotations, ...extra,
+    hull_vertices: wedge.map(([vx, vy, vz]) => ({ x: String(vx), y: String(vy), z: String(vz) })),
+  }], [box('crate', 100, 100, 100, { quantity: 1 })], { configuration: { time_limit_ms: 60_000 } }));
+  const legacy = ['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL'];
+  assert.equal(attempt(legacy).unpacked_items.length, 1);
+  const signed = attempt([...legacy, '-L-W+H']);
+  assert.equal(signed.unpacked_items.length, 0);
+  assert.deepEqual(placements(signed).map(placement => placement.orientation).sort(), ['-L-W+H', 'LWH']);
+  // Upright keeps only codes whose z takes +H; -L-W+H is one, +L-W-H is not.
+  assert.equal(attempt(['+L-W-H', 'LWH', '-L-W+H'], { keep_upright: true }).unpacked_items.length, 0);
+  assert.equal(attempt(['+L-W-H', 'LWH'], { keep_upright: true }).unpacked_items.length, 1);
 });
 
 test('a compressible column compresses its own base', () => {
@@ -3266,3 +3357,36 @@ test('plan-beam dominance keys and their tie-break cannot be fooled by a separat
   assert.ok(compareIdLists(['a'], ['a', 'b']) < 0);
   assert.equal(compareIdLists(['a', 'b'], ['a', 'b']), 0);
 });
+
+test('verifyLoadingPrefixBusinessRules catches out-of-z-order floor box sliding under an elevated box', () => {
+  const container = { length: 10, width: 10, height: 20 };
+  const fragileFloor = { x: 0, y: 0, z: 0, length: 10, width: 10, height: 5, weight: 100, max_top_load: 100 };
+  const heavyUpper = { x: 0, y: 0, z: 5, length: 10, width: 10, height: 5, weight: 500 };
+  assert.throws(
+    () => verifyLoadingPrefixBusinessRules([fragileFloor, heavyUpper], [1, 0], container),
+    (err) => err instanceof SequenceReplayError && err.index === 0 && err.step === 1 && err.reason === 'top_load_exceeded',
+  );
+});
+
+test('multilayer quality beam search with diamond top_load and compressible items stays valid', () => {
+  const payload = request(
+    [
+      { id: 'base', quantity: 2, dimensions: mm(50, 100, 50), weight: '5', max_top_load: '12' },
+      {
+        id: 'foam',
+        quantity: 2,
+        dimensions: mm(50, 100, 50),
+        weight: '4',
+        shape_type: 'compressible',
+        compression_ratio: 0.1,
+        max_compression_pressure_kpa: 50,
+      },
+      { id: 'cap', quantity: 2, dimensions: mm(100, 50, 50), weight: '3' },
+    ],
+    [box('crate', 100, 100, 150, { quantity: 2 })],
+    { configuration: { solver_profile: 'quality' } },
+  );
+  const result = packFallback(payload);
+  assert.deepEqual(validate(payload, result), []);
+});
+

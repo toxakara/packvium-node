@@ -4,6 +4,68 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0]
+
+Nested packing, overhanging pallets, gusseted bags, 24 rotations for a hull, a declared currency
+and an id on every placement.
+
+### Added
+
+- **`packNested({ levels, levelBeamWidth })`**, this package's first nested packer: each level is
+  a JSON request, and each packed container is handed up as one upright item. A `levelBeamWidth`
+  above 1 (default 1, the greedy chain) carries that many carton sets up a level, so a slightly
+  worse carton level can win by needing fewer pallets.
+- **`container.pallet_overhang_limit`** is honoured instead of refused: a load may pass the deck by
+  the stated length at each end and width at each side. Positions are measured from the corner of
+  the overhang zone, only the deck bears weight, and the packed pallet gains
+  `achieved_dimensions`. Refused beside `access_directions`, `axles`, `made_to_measure`,
+  `obstacles`, a non-zero `void_fill_reserve_ratio` or any `stop_index`.
+- **`deformable_boundary: { kind: 'gusseted_bag', side_gusset_depth }`**: a mailer whose side
+  gussets let the load's width plus its thickness reach the flat width plus the gusset depth.
+- **18 signed rotations for a `convex_hull` item** (`-L-W+H` and the rest), 24 in all, in
+  `allowed_rotations`, a placement's `orientation`, `fixed_placements` and revision events. A
+  signed code on any other item is `invalid_request` / `invalid_value`.
+- **An optional `currency`** on the request and on each `rate_table`, three capital letters,
+  echoed as the result's `currency`. It never changes the packing or the score; a rate table in
+  another currency is `not_allowed`, and one with no request currency is `missing_field`.
+- **`placement_id` on every placement**: the canonical JSON of `[container id, x, y, z,
+  item_type, orientation]`, positions in ticks. A fixed placement or a locked revision event
+  may quote it, and the execution plan's placement reference copies it.
+- **`optimality.lower_bound` and the gap under `open_dimension_height`, `maximum_value` and
+  `maximum_volume`**, besides `default` and `lowest_cost`; `validate` checks them.
+- **A made-to-measure box may keep a `void_fill_reserve_ratio`**: when the box cut tight to the
+  load would break the reserve, a larger one is cut.
+- **`stockCutBoxes`** in `revisions.js`, and the matching `artifact_required` revision issue.
+- **`validate` reports `placement_id_mismatch`, `duplicate_placement_id` and
+  `currency_mismatch`.**
+
+### Changed
+
+- **Breaking for requests with a `units` key other than `length`:** it was ignored, so
+  `units.weight` silently read bare weights as grams; it is now `invalid_request` / `not_allowed`
+  at `/units/<key>`. Write the unit on each weight instead.
+- **`deriveRevision` stocks the boxes a plan already cut:** a locked or verified placement in a
+  made-to-measure box used to derive a request every engine refused. The box now becomes a stock
+  container `<type>@<revision>#<instance>` at its cut size, and `verifyRevisionChain` checks that
+  revision only when given its approved artifact.
+- **`keep_upright` narrows an explicit `allowed_rotations` list** in the fallback and in
+  `validate`, not only the default list.
+- **The fallback breaks rotation ties by the rotation table's order**, not by string order; a hull
+  answer can move, and three now match the other engines.
+- **On the native backend, containers are numbered per type** (`pair#1`, `large#1`) on every
+  path, as the fallback always did.
+- **`FixedPlacementError` has a third reason, `invalid_value`**, for a `placement_id` that is not
+  the one its entry spells, or a signed orientation on an item that is not a hull.
+
+### Fixed
+
+- **An explicit rotation list emptied by `keep_upright` is refused at `allowed_rotations`**,
+  with the same named request error the independent validator checks.
+- **Stocking cut boxes indexes artifact lookups once** and reports malformed consumed
+  machine fields as structured `invalid_revision` errors.
+- **Nested beams keep fixed placements across container offers and handoffs** instead of
+  aborting when a different carried branch cannot supply a locked item or container.
+
 ## [1.9.0]
 
 The fallback now checks what the addon checks, spends an effort budget the same way and reports

@@ -22,7 +22,7 @@ export const FORMAT = 'packvium-operational-artifact/v1';
  * The engine's own name is deliberately not recorded: four correct builders naming themselves
  * would emit four different documents.
  */
-export const SUITE_VERSION = '1.9.0';
+export const SUITE_VERSION = '1.10.0';
 
 /** The deterministic part of `result.algorithm`; `duration_ms` is wall-clock time. */
 const SOLVER_FIELDS = ['profile', 'solver', 'seed', 'time_limit_reached', 'effort_limit_reached'];
@@ -52,7 +52,7 @@ export function buildOperationalArtifact(request, result, { loadingOrders } = {}
   if (!isMapping(request)) throw refusal('invalid_request', 'a request is a JSON object');
   if (!isMapping(result)) throw refusal('invalid_result', 'a result is a JSON object');
   requireObjects(result);
-  const plan = planOf(request, result, loadingOrders);
+  const plan = planOf(request, withoutPlacementIds(result), loadingOrders);
 
   const containers = list(get(result, 'containers'), 'result.containers');
   const { lengthUnit, weightUnit } = unitsOf(containers);
@@ -92,6 +92,27 @@ function planOf(request, result, loadingOrders) {
     if (error instanceof ExecutionPlanError) throw refusal('invalid_plan_input', error.message);
     throw error;
   }
+}
+
+/**
+ * The result as the v1 artifact reads it: every placement without its 1.10 `placement_id`.
+ * v1 is closed, and its embedded plan predates the id; the id stays recoverable from what v1
+ * carries -- the canonical JSON of `containers[container_index].id` and the reference's
+ * `position_ticks`, `item_type` and `orientation` (docs/OPERATIONAL-ARTIFACTS.md). Read after
+ * `requireObjects`, so every entry is an object; copies only what it changes, O(P).
+ */
+function withoutPlacementIds(result) {
+  const containers = list(get(result, 'containers'), 'result.containers');
+  return {
+    ...result,
+    containers: containers.map((container, index) => ({
+      ...container,
+      placements: placementsOf(index, container).map((placement) => {
+        const { placement_id: _identifier, ...rest } = placement;
+        return rest;
+      }),
+    })),
+  };
 }
 
 // ------------------------------------------------------------------------------ provenance

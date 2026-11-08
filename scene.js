@@ -9,6 +9,7 @@
  */
 
 import { buildOperationalArtifact } from './artifacts.js';
+import { ORIENTATIONS } from './request-errors.js';
 
 export const SCENE_FORMAT = 'packvium-visualization-scene/v1';
 
@@ -113,8 +114,8 @@ function sceneDimensions(raw, path) {
 /**
  * The scene item id for a plan placement reference, `<item_type>@<x>,<y>,<z>/<orientation>`.
  * Injective within a container even when `item_type` contains `@` or `/`: read from the right,
- * the orientation is one of six letter triples and the coordinates hold only digits, commas and
- * minus signs (docs/EXECUTION-PLAN.md). Exported so a caller can match a scene item to its step.
+ * the orientation is one of the 24 table codes, none of which holds `/` or `@`, and the
+ * coordinates hold only digits, commas and minus signs (docs/EXECUTION-PLAN.md). Exported so a caller can match a scene item to its step.
  * A reference without those fields is a `RangeError`.
  */
 export function sceneItemId(reference) {
@@ -126,7 +127,10 @@ function spellItemId({ item_type: itemType, orientation, position_ticks: { x, y,
   return `${itemType}@${x},${y},${z}/${orientation}`;
 }
 
-const ROTATIONS = new Set(['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL']);
+// All 24 proper rotations in table order (1.10): a hull may be placed in a signed code. A scene
+// item is drawn as its placed box -- the artifact's dimensions are already the rotated envelope --
+// so the code is carried, never applied a second time.
+const ROTATIONS = new Set(ORIENTATIONS);
 
 /** A placement reference holding every field a scene reads, or a `RangeError` naming the first that is not. */
 function readReference(raw, path) {

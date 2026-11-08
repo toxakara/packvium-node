@@ -16,7 +16,7 @@ body:
     id: package-version
     attributes:
       label: Package and version
-      placeholder: "@packvium/engine 1.9.0 (JavaScript)"
+      placeholder: "@packvium/engine 1.10.0 (JavaScript)"
     validations:
       required: false
   - type: textarea

@@ -68,7 +68,9 @@ test('without the addon, the JavaScript port answers', () => {
   const broken = JSON.parse(JSON.stringify(result));
   const placements = broken.containers[0].placements;
   placements[1].position = JSON.parse(JSON.stringify(placements[0].position));
-  assert.deepEqual(validateWith(null, REQUEST, broken).map((issue) => issue.code), ['collision']);
+  // Two cubes in one place name the same placement, so the restated id is a repeat (1.10).
+  placements[1].placement_id = placements[0].placement_id;
+  assert.deepEqual(validateWith(null, REQUEST, broken).map((issue) => issue.code), ['collision', 'duplicate_placement_id']);
   if (backend() === 'javascript') assert.deepEqual(validate(REQUEST, result), []);
 });
 

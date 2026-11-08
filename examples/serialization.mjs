@@ -101,13 +101,16 @@ try {
   console.log(`  unknown objective       -> ${error.reason}: ${error.message}`);
 }
 
-// A field the schema reserves but this engine has not implemented is refused by name,
-// so a request written for a newer engine fails loudly instead of being half-honoured.
+// A field or combination this engine has not implemented is refused by name, so a
+// request written for a newer engine fails loudly instead of being half-honoured.
 try {
-  packJson(variant((request) => { request.containers[0].pallet_overhang_limit = { length: '50', width: '50' }; }));
+  packJson(variant((request) => {
+    request.containers[0].pallet_overhang_limit = { length: '50', width: '50' };
+    request.containers[0].axles = [{ position: '0' }, { position: '100' }];
+  }));
 } catch (error) {
   if (!(error instanceof UnsupportedFeatureError)) throw error;
-  console.log(`  reserved, unimplemented -> ${error.code}: ${error.fields.join(', ')}`);
+  console.log(`  not implemented yet     -> ${error.code}: ${error.fields.join(', ')}`);
 }
 
 // And text that is not JSON at all never reaches the engine.

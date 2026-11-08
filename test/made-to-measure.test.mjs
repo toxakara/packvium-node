@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { InvalidRequestError, UnsupportedFeatureError, packFallback } from '../fallback.js';
+import { validateDocuments } from '../result-validation/index.js';
 import { boxCost, fabricate, grid, icbrtCeil, perSquareMetre, solvingEnvelopes } from '../made-to-measure.js';
 
 const MM = 16000;
@@ -129,7 +130,6 @@ test('each refused combination is named', () => {
   const cases = {
     'container.made_to_measure+axles': { axles: [{ position: '0' }, { position: '1510' }] },
     'container.made_to_measure+obstacles': { obstacles: [{ id: 'post', dimensions: mm(10, 10, 10) }] },
-    'container.made_to_measure+void_fill_reserve_ratio': { void_fill_reserve_ratio: 0.5 },
   };
   for (const [name, fields] of Object.entries(cases)) {
     assert.throws(() => packFallback(request(fields)), (error) => error instanceof UnsupportedFeatureError && error.fields.includes(name));
@@ -159,4 +159,37 @@ test('each request error names its rule', () => {
   }
   assert.throws(() => packFallback(request({ outer_dimensions: mm(1600, 1600, 1600) })),
     (error) => error.field === '/containers/0/outer_dimensions' && error.detail === 'cannot be combined with made_to_measure');
+});
+
+test('a reserve the tight box would break is kept by cutting the rung itself', () => {
+  const data = request({ void_fill_reserve_ratio: 0.5 }, { solver_profile: 'balanced' });
+  const result = packFallback(data);
+  const [container] = result.containers;
+  assert.equal(result.complete, true);
+  // Tight would be 210 mm a side: 8 cubes use 8e-3 m^3 of 9.261e-3, past half of it.
+  assert.deepEqual(['length', 'width', 'height'].map((side) => container.inner_dimensions[side].value), ['260', '260', '260']);
+  assert.ok(BigInt(container.used_volume_ticks3) <= BigInt(260 * MM) ** 3n - BigInt(container.void_fill_reserve_ticks3));
+  assert.deepEqual(validateDocuments(data, result).issues, []);
+});
+
+test('the validator admits a larger box only as a reserve cut on the grid', () => {
+  const data = request({ void_fill_reserve_ratio: 0.5 }, { solver_profile: 'balanced' });
+  const result = packFallback(data);
+  const codes = (edit, request = data) => {
+    const copy = JSON.parse(JSON.stringify(result));
+    edit(copy.containers[0]);
+    return validateDocuments(request, copy).issues.map((found) => found.code);
+  };
+  const side = (container, value) => { for (const axis of ['length', 'width', 'height']) container.inner_dimensions[axis] = { ticks: value * MM, value: String(value), unit: 'mm' }; };
+  // Off the 25 mm grid.
+  assert.ok(codes((container) => side(container, 261)).includes('fabricated_dimensions_mismatch'));
+  // Past the machine maximum.
+  assert.ok(codes((container) => side(container, 1535)).includes('fabricated_dimensions_mismatch'));
+  // A load the tight box would hold within its reserve leaves no reason to cut larger.
+  assert.ok(codes((container) => { container.used_volume_ticks3 = '0'; }).includes('fabricated_dimensions_mismatch'));
+  // A reported volume that is not an integer is not admitted as one.
+  assert.ok(codes((container) => { container.inner_dimensions.length.ticks = 260 * MM + 0.5; }).includes('fabricated_dimensions_mismatch'));
+  // Without a reserve the tight box is the only box.
+  const plain = request({}, { solver_profile: 'balanced' });
+  assert.ok(codes(() => {}, plain).includes('fabricated_dimensions_mismatch'));
 });
