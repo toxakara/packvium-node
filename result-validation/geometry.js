@@ -6,11 +6,29 @@
 import { abs, gcd, max, min } from './num.js';
 import { shape } from './outcome.js';
 
-/** Axis permutation each orientation code applies to (length, width, height), in order. */
+/**
+ * Each of the 24 proper rotations in canonical table order (1.10): the code, the declared side
+ * (length 0, width 1, height 2) each container axis takes its extent from, and the sign it
+ * carries. Written out rather than derived, so the table is a second statement of the contract
+ * and not a copy of an engine's. The legacy codes negate x exactly when their permutation is odd.
+ */
 export const ROTATIONS = Object.freeze([
-  ['LWH', [0, 1, 2]], ['LHW', [0, 2, 1]], ['WLH', [1, 0, 2]],
-  ['WHL', [1, 2, 0]], ['HLW', [2, 0, 1]], ['HWL', [2, 1, 0]],
+  ['LWH', [0, 1, 2], [1n, 1n, 1n]], ['LHW', [0, 2, 1], [-1n, 1n, 1n]], ['WLH', [1, 0, 2], [-1n, 1n, 1n]],
+  ['WHL', [1, 2, 0], [1n, 1n, 1n]], ['HLW', [2, 0, 1], [1n, 1n, 1n]], ['HWL', [2, 1, 0], [-1n, 1n, 1n]],
+  ['+L-W-H', [0, 1, 2], [1n, -1n, -1n]], ['-L+W-H', [0, 1, 2], [-1n, 1n, -1n]], ['-L-W+H', [0, 1, 2], [-1n, -1n, 1n]],
+  ['+L-H+W', [0, 2, 1], [1n, -1n, 1n]], ['+L+H-W', [0, 2, 1], [1n, 1n, -1n]], ['-L-H-W', [0, 2, 1], [-1n, -1n, -1n]],
+  ['+W-L+H', [1, 0, 2], [1n, -1n, 1n]], ['+W+L-H', [1, 0, 2], [1n, 1n, -1n]], ['-W-L-H', [1, 0, 2], [-1n, -1n, -1n]],
+  ['+W-H-L', [1, 2, 0], [1n, -1n, -1n]], ['-W+H-L', [1, 2, 0], [-1n, 1n, -1n]], ['-W-H+L', [1, 2, 0], [-1n, -1n, 1n]],
+  ['+H-L-W', [2, 0, 1], [1n, -1n, -1n]], ['-H+L-W', [2, 0, 1], [-1n, 1n, -1n]], ['-H-L+W', [2, 0, 1], [-1n, -1n, 1n]],
+  ['+H-W+L', [2, 1, 0], [1n, -1n, 1n]], ['+H+W-L', [2, 1, 0], [1n, 1n, -1n]], ['-H-W-L', [2, 1, 0], [-1n, -1n, -1n]],
 ]);
+
+/** The six legacy codes: every box a cuboid can make, and an item's default list. */
+export const BOX_ROTATIONS = Object.freeze(ROTATIONS.slice(0, 6).map(([name]) => name));
+
+/** The codes that keep the item's own height vertical and pointing up: z takes `+H`. */
+export const UPRIGHT_ROTATIONS = Object.freeze(ROTATIONS
+  .filter(([, axes, signs]) => axes[2] === 2 && signs[2] === 1n).map(([name]) => name));
 
 /** An axis-aligned box; its far corner and base area are computed once. */
 export function cuboid(x, y, z, length, width, height) {
@@ -66,19 +84,16 @@ function primitiveAxis(axis) {
 }
 
 /**
- * Reorient a hull the way `ROTATIONS` reorients its box, flipping one axis on an odd
- * permutation so it stays a proper rotation, then translated so its bounds start at 0.
+ * Reorient a hull by one of the 24 proper rotations, `v'[i] = s[i] * v[src[i]]` from the row
+ * `ROTATIONS` gives the code `orientation`, then translated so its bounds start at 0. Every code has
+ * determinant +1, so the result is never the item's mirror image.
  */
-export function rotateHull(points, axes) {
+export function rotateHull(points, orientation) {
+  const row = ROTATIONS.find(([name]) => name === orientation);
+  if (row === undefined) throw shape(`unknown orientation ${JSON.stringify(orientation)}`);
+  const [, axes, signs] = row;
   if (points.length === 0) throw shape('min() of an empty hull');
-  let inversions = 0;
-  for (let first = 0; first < 3; first += 1) {
-    for (let second = first + 1; second < 3; second += 1) {
-      if (axes[first] > axes[second]) inversions += 1;
-    }
-  }
-  const sign = inversions % 2 === 1 ? -1n : 1n;
-  const turned = points.map((vertex) => [sign * vertex[axes[0]], vertex[axes[1]], vertex[axes[2]]]);
+  const turned = points.map((vertex) => [0, 1, 2].map((axis) => signs[axis] * vertex[axes[axis]]));
   const low = [0, 1, 2].map((axis) => turned.reduce((least, vertex) => min(least, vertex[axis]), turned[0][axis]));
   return turned.map((vertex) => difference(vertex, low));
 }

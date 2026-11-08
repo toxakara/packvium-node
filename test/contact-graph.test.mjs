@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendContactBox, buildContactGraph } from '../contact-graph.js';
+import { appendContactBox, buildContactGraph, contactsAbove, contactsBelow } from '../contact-graph.js';
 
 const overlapXY = (left, right) => {
   const x = Math.max(0, Math.min(left.x + left.d[0], right.x + right.d[0]) - Math.max(left.x, right.x));
@@ -169,5 +169,28 @@ test('the delta matches a rebuild across scene shapes', () => {
         `${name} trial ${trial}`);
     }
   });
+});
+
+test('plane bucket threshold 32 vs 33 and zero-area knife-edge touches produce identical edges', () => {
+  for (const count of [0, 1, 31, 32, 33, 34, 65]) {
+    const boxes = Array.from({ length: count }, (_, i) => ({
+      x: i * 10, y: 0, z: 0, d: [10, 10, 10],
+    }));
+    const hint = Math.max(10, count * 10);
+    const query = { x: 0, y: 9, z: 10, d: [hint, 2, 10] };
+    const graph = buildContactGraph(boxes, overlapXY, hint);
+    assert.deepEqual(
+      contactsBelow(graph, query, overlapXY),
+      Array.from({ length: count }, (_, i) => [i, 10]),
+    );
+    // Touching only along y=10 (0 overlap area) produces no edges.
+    const touchingOnly = { x: 0, y: 10, z: 10, d: [hint, 5, 10] };
+    assert.deepEqual(contactsBelow(graph, touchingOnly, overlapXY), []);
+    assert.deepEqual(contactsAbove(graph, { x: 0, y: 9, z: -10, d: [hint, 2, 10] }, overlapXY),
+      Array.from({ length: count }, (_, i) => [i, 10]));
+    const appended = appendContactBox(graph, query, overlapXY);
+    const rebuilt = buildContactGraph([...boxes, query], overlapXY, hint);
+    assert.deepEqual(edges(appended), edges(rebuilt));
+  }
 });
 

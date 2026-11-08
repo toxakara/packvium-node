@@ -8,11 +8,11 @@
  */
 
 import { cuboid, hullVolume, intersects, overlapAreaXY, rotateHull, vertices } from './geometry.js';
-import { at, hashKey, int, pyCmp, pyEq, sortPy, text } from './json.js';
+import { at, hashKey, int, pyCmp, pyEq, sortPy } from './json.js';
 import { Ratio, ceilDiv, fixed6, floorDiv, max, min, ratioPpm } from './num.js';
 import { issue, shape } from './outcome.js';
 import { list, pyRepr, pyStr } from './pyfmt.js';
-import { EXIT_DIRECTIONS, holds, rotated, rotationAxes } from './spec.js';
+import { EXIT_DIRECTIONS, holds, isRotation, rotated } from './spec.js';
 import { TICKS_PER_KG, TICKS_PER_MM } from './units.js';
 
 /** One square metre in length ticks squared. */
@@ -113,6 +113,29 @@ export function checkSupportAndLoad(entries, graph, globalSupport, issues) {
       issues.push(issue('max_stacked_items_exceeded', `${pyStr(rawId)}: ${above} above > limit ${limit}`));
     }
   });
+}
+
+/**
+ * A floor placement on a pallet rests on its overlap with the deck alone, judged by
+ * the ratio and centre-of-gravity rule a supporting item would be. O(p).
+ */
+export function checkDeckSupport(entries, [x, y, length, width], globalSupport, issues) {
+  const surface = cuboid(x, y, -1n, length, width, 1n);
+  for (const [rawId, { spec, envelope }] of entries) {
+    if (spec === undefined || envelope.z !== 0n) continue;
+    const required = globalSupport.compare(spec.minimumSupportRatio) < 0 ? spec.minimumSupportRatio : globalSupport;
+    if (required.compare(Ratio.of(0n)) <= 0) continue;
+    const dx = min(envelope.x2, x + length) - max(envelope.x, x);
+    const dy = min(envelope.y2, y + width) - max(envelope.y, y);
+    const area = dx > 0n && dy > 0n ? dx * dy : 0n;
+    const itemId = pyStr(rawId);
+    if (area < requiredSupportArea(envelope.baseArea, ratioPpm(required))) {
+      issues.push(issue('insufficient_support',
+        `${itemId}: ${fixed6(new Ratio(area, envelope.baseArea).toDouble())} < ${fixed6(required.toDouble())} on the deck`));
+    } else if (area * 2n <= envelope.baseArea && !centroidSupported(envelope, [surface])) {
+      issues.push(issue('centre_of_gravity_unsupported', `${itemId}: centroid outside the deck`));
+    }
+  }
 }
 
 /** What one direct supporter allows to rest on it. */
@@ -364,8 +387,6 @@ export function validNesting(left, right) {
   return lower.z !== upper.z && lower.z2 - upper.z === nesting;
 }
 
-const orientationAxes = (placement) => rotationAxes(text(at(placement, 'orientation'), 'orientation'));
-
 /**
  * The solid a placement occupies, as vertices in container coordinates: the exact hull when the
  * request allows it and the reported box matches, otherwise the envelope's corners.
@@ -374,11 +395,14 @@ export function placedHull(envelope, placement, spec) {
   if (spec === undefined || spec.hullVertices === null || spec.shapeType !== 'convex_hull' || spec.stopIndex !== null) {
     return vertices(envelope);
   }
-  const expected = rotated(spec, text(at(placement, 'orientation'), 'orientation'));
+  // An orientation outside the table is `unknown_orientation`'s to report; the whole box stands.
+  const orientation = at(placement, 'orientation');
+  if (!isRotation(orientation)) return vertices(envelope);
+  const expected = rotated(spec, orientation);
   if (envelope.length !== expected[0] || envelope.width !== expected[1] || envelope.height !== expected[2]) {
     return vertices(envelope);
   }
-  return rotateHull(spec.hullVertices, orientationAxes(placement))
+  return rotateHull(spec.hullVertices, orientation)
     .map(([x, y, z]) => [envelope.x + x, envelope.y + y, envelope.z + z]);
 }
 
@@ -389,7 +413,8 @@ export function occupiedVolume(envelope, placement, spec, load) {
     return length * width * compressedHeight(height, length * width, spec, load);
   }
   if (spec !== undefined && spec.shapeType === 'convex_hull' && spec.hullVertices !== null) {
-    return hullVolume(rotateHull(spec.hullVertices, orientationAxes(placement)));
+    // A proper rotation keeps the volume, so the authored vertices answer for every orientation.
+    return hullVolume(spec.hullVertices);
   }
   // Only an exact hull makes `_placed_hull` differ from the envelope's corners, and a hull was
   // answered above, so the reference's remaining `_hull_volume(solid)` arm is never reached.

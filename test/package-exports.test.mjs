@@ -22,7 +22,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.jso
 
 test('the main entry resolves by package name and carries the packing surface', async () => {
   const main = await import(manifest.name);
-  for (const name of ['pack', 'packJson', 'rebalanceWeight', 'commerce', 'backend']) {
+  for (const name of ['pack', 'packJson', 'packNested', 'rebalanceWeight', 'commerce', 'backend']) {
     assert.equal(typeof main[name], name === 'commerce' ? 'object' : 'function', name);
   }
 });
@@ -50,7 +50,7 @@ test('the operational artifact and its exports resolve by package name', async (
 
 test('plan revisions resolve by package name', async () => {
   const revisions = await import(`${manifest.name}/revisions.js`);
-  for (const name of ['rootRevision', 'deriveRevision', 'applyEvents', 'verifyRevisionChain',
+  for (const name of ['rootRevision', 'deriveRevision', 'applyEvents', 'stockCutBoxes', 'verifyRevisionChain',
     'documentDigest', 'canonicalRevisionJson', 'PlanRevisionError']) {
     assert.equal(typeof revisions[name], 'function', name);
   }
@@ -69,8 +69,9 @@ test('a module an export imports is published even when it is not exported itsel
   // `canonical-json.js` is internal: absent from `exports` on purpose, but `artifacts.js` and
   // `execution.js` import it, so a tarball without it would break both at load time.
   const published = new Set(manifest.files);
-  // `revisions.js` imports `commerce-model.js` and `artifacts.js` the same way.
-  for (const name of ['canonical-json.js', 'commerce-model.js', 'artifacts.js', 'artifact-exports.js', 'revisions.js',
+  // `revisions.js` imports `commerce-model.js` and `artifacts.js` the same way, and `index.js`
+  // imports `nested.js`; `fallback.js` imports `pallet-overhang.js`.
+  for (const name of ['canonical-json.js', 'nested.js', 'pallet-overhang.js', 'commerce-model.js', 'artifacts.js', 'artifact-exports.js', 'revisions.js',
     'artifacts.d.ts', 'artifact-exports.d.ts', 'revisions.d.ts']) {
     assert.ok(published.has(name), `"files" does not publish ${name}`);
   }

@@ -16,7 +16,9 @@
  * memory. Integers are `BigInt`, so nothing is bounded by 2^53.
  */
 
-import { checkAccounting, checkStructure, containerTagRules } from './accounting.js';
+import {
+  checkAccounting, checkCurrency, checkStructure, containerTagRules,
+} from './accounting.js';
 import { checkOptimalityBound } from './bound.js';
 import { checkAchievedExtent, checkContainer, checkMadeToMeasure } from './container.js';
 import { checkAlgorithmMetrics, checkEffortBudget, checkResultFacts } from './facts.js';
@@ -24,6 +26,7 @@ import {
   PyDict, at, flag, getNull, getOr, has, list, optInt,
 } from './json.js';
 import { materialize } from './lattice.js';
+import { checkPlacementIds } from './placement-ids.js';
 import { Refusal, contract, issue, shape } from './outcome.js';
 import { pyStr, strRepr } from './pyfmt.js';
 import { checkFixedPlacements, checkGroups, checkObjective, checkSolverSelection } from './objective.js';
@@ -104,6 +107,7 @@ function judge(request, result) {
   const issues = [];
   const validated = materialize(coordinatesRequired, result, items, containers, clearance, issues);
   checkStructure(validated, issues);
+  checkCurrency(request, validated, issues);
   checkAlgorithmMetrics(validated, issues);
   checkEffortBudget(request, validated, issues);
   checkResultFacts(validated, issues);
@@ -113,6 +117,7 @@ function judge(request, result) {
   const fabricated = checkContainers(validated, result, context, globalSupport, issues);
   checkContainerCounts(validated, configuration, containers, issues);
   checkFixedPlacements(request, validated, unit, issues);
+  checkPlacementIds(result, issues);
   checkGroups(request, validated, issues);
   checkSolverSelection(request, validated, issues);
   const score = checkObjective(request, validated, { items, containers, fabricated, clearance }, issues);

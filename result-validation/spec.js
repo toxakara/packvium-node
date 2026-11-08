@@ -3,18 +3,16 @@
  * `ContainerSpec` and `MachineSpec`).
  */
 
-import { ROTATIONS, cuboid } from './geometry.js';
+import { BOX_ROTATIONS, ROTATIONS, UPRIGHT_ROTATIONS, cuboid } from './geometry.js';
 import {
   PyDict, at, compareCodePoints, flag, getNull, getOr, hashKey, int, isDict, list, optInt, pyEq, pyInt, text, truthy,
 } from './json.js';
 import { ratioPpm } from './num.js';
-import { shape } from './outcome.js';
+import { contract, shape } from './outcome.js';
 import { LENGTH, WEIGHT, dimensions, ratioOf, toTicks } from './units.js';
 
 /** The six axis-aligned exit directions a placement could be slid out through. */
 export const EXIT_DIRECTIONS = Object.freeze(['+x', '-x', '+y', '-y', '+z', '-z']);
-
-const UPRIGHT_ROTATIONS = ['LWH', 'WLH'];
 
 /** `ROTATIONS[orientation]`. */
 export function rotationAxes(orientation) {
@@ -65,10 +63,19 @@ function optional(raw, key, read) {
 
 const weightTicks = (value) => toTicks(value, 'g', WEIGHT);
 
+/**
+ * The codes an item may be placed in: its list, or the six legacy codes, narrowed to the upright
+ * ones under `keep_upright`. A signed code counts only on a hull -- the engines refuse it
+ * anywhere else -- so a box placed in one reads as a forbidden rotation (1.10).
+ */
 function allowedRotations(raw, keepUpright) {
   const listed = getNull(raw, 'allowed_rotations');
-  if (listed !== null) return list(listed, 'allowed_rotations').slice();
-  return keepUpright ? UPRIGHT_ROTATIONS.slice() : ROTATIONS.map(([name]) => name);
+  let rotations = listed === null ? BOX_ROTATIONS.slice() : list(listed, 'allowed_rotations').slice();
+  if (!pyEq(getNull(raw, 'shape_type'), 'convex_hull')) {
+    rotations = rotations.filter((code) => BOX_ROTATIONS.some((name) => pyEq(code, name)));
+  }
+  if (keepUpright) rotations = rotations.filter((code) => UPRIGHT_ROTATIONS.some((name) => pyEq(code, name)));
+  return rotations;
 }
 
 function hullVertices(value, unit) {
@@ -80,9 +87,13 @@ function parseItem(raw, unit, index) {
   const keepUpright = flag(raw, 'keep_upright', false, owner);
   const stackable = flag(raw, 'stackable', true, owner);
   const mustBeOnFloor = flag(raw, 'must_be_on_floor', false, owner);
+  const rotations = allowedRotations(raw, keepUpright);
+  if (rotations.length === 0) {
+    throw contract(`${owner}.allowed_rotations must allow at least one rotation after keep_upright`);
+  }
   const groups = getNull(raw, 'accepts_stacking_groups');
   return Object.freeze({
-    allowedRotations: allowedRotations(raw, keepUpright),
+    allowedRotations: rotations,
     id: text(at(raw, 'id'), 'an item id'),
     dimensions: dimensions(at(raw, 'dimensions'), unit),
     weight: weightTicks(getOr(raw, 'weight', 0)),
@@ -170,10 +181,27 @@ function axles(value, unit) {
   }));
 }
 
+/** A pallet's solving frame and the deck `[x, y, length, width]` inside it, else the declared size. */
+function frameAndDeck(declared, limit, unit) {
+  if (limit === null) return [declared, null];
+  const overhangX = toTicks(at(limit, 'length'), unit, LENGTH);
+  const overhangY = toTicks(at(limit, 'width'), unit, LENGTH);
+  return [[declared[0] + 2n * overhangX, declared[1] + 2n * overhangY, declared[2]],
+    Object.freeze([overhangX, overhangY, declared[0], declared[1]])];
+}
+
+/** A gusseted bag's side gusset depth in ticks, else 0n. */
+function sideGusset(boundary, unit) {
+  if (boundary === null) return 0n;
+  const depth = getNull(boundary, 'side_gusset_depth');
+  return depth === null ? 0n : toTicks(depth, unit, LENGTH);
+}
+
 function parseContainer(raw, unit) {
+  const [inner, deck] = frameAndDeck(dimensions(at(raw, 'inner_dimensions'), unit), getNull(raw, 'pallet_overhang_limit'), unit);
   return Object.freeze({
     id: at(raw, 'id'),
-    inner: dimensions(at(raw, 'inner_dimensions'), unit),
+    inner,
     accessDirections: accessDirections(raw),
     outer: optional(raw, 'outer_dimensions', (value) => dimensions(value, unit)),
     costMinor: int(getOr(raw, 'cost_minor', 0), 'cost_minor'),
@@ -189,8 +217,14 @@ function parseContainer(raw, unit) {
     maxStackDensity: optional(raw, 'max_stack_density', weightTicks),
     rateTable: getNull(raw, 'rate_table'),
     flatBag: getNull(raw, 'deformable_boundary') !== null,
-    reportsAchievedExtent: getNull(raw, 'deformable_boundary') !== null || getNull(raw, 'made_to_measure') !== null,
+    // 1.10: a gusseted bag's side gusset depth G in ticks, widening the width girth to
+    // b + c <= W + G; 0n for a flat bag and every rigid container.
+    sideGusset: sideGusset(getNull(raw, 'deformable_boundary'), unit),
+    reportsAchievedExtent: getNull(raw, 'deformable_boundary') !== null || getNull(raw, 'made_to_measure') !== null
+      || deck !== null,
     madeToMeasure: optional(raw, 'made_to_measure', (machine) => parseMachine(machine, unit)),
+    // The weight-bearing deck inside a pallet's frame, which `inner` then is; else null.
+    deck,
   });
 }
 

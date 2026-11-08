@@ -1,6 +1,6 @@
 /** Measures to exact ticks, re-derived from the unit tables rather than taken from the engine. */
 
-import { at, get, getNull, isDict, isPythonSpace, pyIntInstance, pyStrip, text } from './json.js';
+import { at, compareCodePoints, get, getNull, isDict, isPythonSpace, pyIntInstance, pyStrip, text } from './json.js';
 import { Ratio, parseFraction } from './num.js';
 import { contract, shape } from './outcome.js';
 import { pyStr } from './pyfmt.js';
@@ -29,13 +29,15 @@ const REQUEST_LENGTH_UNITS = new Map([
 
 /**
  * `units.length` as every engine reads it: `units` or `units.length` absent or null
- * is millimetres; `units` that is not an object, or a length unit the engines do not know, is
- * refused naming the field.
+ * is millimetres; `units` that is not an object, a key other than `length` (the first
+ * in code-point order), or a length unit the engines do not know, is refused naming the field.
  */
 export function lengthUnit(request) {
   const units = getNull(request, 'units');
   if (units === null) return 'mm';
   if (!isDict(units)) throw contract('units must be an object');
+  const unknown = Object.keys(units).filter((key) => key !== 'length').sort(compareCodePoints);
+  if (unknown.length > 0) throw contract(`units.${unknown[0]} is not a known field`);
   const length = getNull(units, 'length');
   if (length === null) return 'mm';
   const key = typeof length === 'string'

@@ -38,6 +38,18 @@ export function canonicalJson(value) {
 }
 
 /**
+ * `canonicalJson` of an array, except that a lone UTF-16 surrogate in a string is written as its
+ * lowercase `\udxxx` escape instead of refused, as `packvium._canonical_json.canonical_identifier`
+ * writes it. For an identifier built from caller-chosen ids (`placement_id`, 1.10): a request may
+ * name a container that way, and an answer must still name its placements. O(length).
+ */
+export function canonicalIdentifier(values) {
+  // ES2019's well-formed `JSON.stringify` escapes a lone surrogate as lowercase `\udxxx` and
+  // every other character exactly as `spellString` does.
+  return `[${values.map((value) => (typeof value === 'string' ? JSON.stringify(value) : canonicalJson(value))).join(',')}]`;
+}
+
+/**
  * The integer a JSON value is, judged by value as every engine can judge it: `1.0` is `1`
  * (JavaScript cannot tell them apart once the text is parsed); `true`, `"1"` and `1.5` are
  * not integers, and neither is anything past 2^53 - 1. Null when it is not one.

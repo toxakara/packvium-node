@@ -12,10 +12,13 @@
  * - `obstacles` on a container, with `additional_boxes` for a shape made of several boxes;
  * - `max_items` on a container: pieces per container, whatever their size;
  * - `tag_limits` on a container: pieces carrying a given tag, per container;
- * - `quantity` on a container, and `configuration.max_containers`: how many may be opened.
+ * - `quantity` on a container, and `configuration.max_containers`: how many may be opened;
+ * - `pallet_overhang_limit` on a pallet: how far a load may pass the deck's edges;
+ * - `deformable_boundary` on a mailer: a flat or gusseted bag, bounded by its film.
  *
- * The first three change *where* things go. The last two decide what happens when there
- * is nowhere left, and there the answer is an item left out, never an error.
+ * The first three change *where* things go. The next two decide what happens when there
+ * is nowhere left, and there the answer is an item left out, never an error. The last two
+ * move the edge of the container itself.
  */
 
 import { pack } from '../index.js';
@@ -107,3 +110,47 @@ console.log('  answer across every type. Either way one battery is left out, the
 console.log('  so, and nothing is thrown: a limit reached is an answer, not a bad request.');
 console.log('  Which instance stays behind, and the reason code it is given, is the search\'s');
 console.log('  own account and can differ between engines; that one is left out does not.');
+
+// ------------------------------------------------------------------------------------
+section('4. A load that overhangs its pallet');
+
+// A crate 50 mm longer and wider than the deck. Without a limit it does not go on at all.
+// `pallet_overhang_limit` lets the load pass the deck by the stated length at each end and
+// width at each side. Positions are measured from the corner of that overhang zone, so the
+// deck starts at x = 50, y = 50 here, and the crate centred on it sits at (25, 25).
+const pallet = { id: 'pallet', inner_dimensions: { length: '1200', width: '800', height: '1000' },
+  max_payload: '1000 kg' };
+const palletLoad = [
+  { id: 'crate', quantity: 1, weight: '10 kg', allowed_rotations: ['LWH'],
+    dimensions: { length: '1250', width: '850', height: '400' } },
+  { id: 'carton', quantity: 4, weight: '5 kg', dimensions: { length: '400', width: '300', height: '200' } },
+];
+const overhang = { minimum_support_ratio: 0.75 };
+summarize('deck only', solve(palletLoad, [pallet], overhang));
+const overhung = solve(palletLoad, [{ ...pallet, pallet_overhang_limit: { length: '50', width: '50' } }], overhang);
+summarize('50 mm overhang allowed', overhung);
+const [deck] = overhung.containers;
+const crateOnDeck = deck.placements.find((placement) => placement.item_type === 'crate');
+const side = (dimensions) => `${dimensions.length.value} x ${dimensions.width.value}`;
+console.log(`      crate at (${crateOnDeck.position.x.value}, ${crateOnDeck.position.y.value}), ` +
+  `support_ratio ${crateOnDeck.support_ratio}: only the deck bears weight`);
+console.log(`      declared ${side(deck.inner_dimensions)} mm, achieved ${side(deck.achieved_dimensions)} mm`);
+console.log('\n  The pallet reports its declared size and the size the load reached. It is billed,');
+console.log('  and handed up a nested level, at the larger of the two. A load the deck holds is');
+console.log('  never overhung.');
+
+// ------------------------------------------------------------------------------------
+section('5. Flat and gusseted bags');
+
+// A mailer bag is bounded by its film, not by rigid walls: the film that wraps round a
+// thicker load is film the load cannot spread across, so the load's width plus its
+// thickness may not pass the bag's flat width (and its length plus thickness, the flat
+// length). A side gusset is film folded into each edge; it opens by `side_gusset_depth`
+// and the width rule becomes `load width + thickness <= flat width + gusset`.
+const pouch = (deformableBoundary) => ({ id: 'pouch', quantity: 1, deformable_boundary: deformableBoundary,
+  inner_dimensions: { length: '300', width: '150', height: '100' } });
+const books = [{ id: 'book', quantity: 4, weight: '300 g', allowed_rotations: ['LWH'],
+  dimensions: { length: '200', width: '100', height: '20' } }];
+summarize('flat bag', solve(books, [pouch({ kind: 'flat_bag' })]));
+summarize('25 mm side gusset', solve(books, [pouch({ kind: 'gusseted_bag', side_gusset_depth: '25' })]));
+console.log('\n  The flat bag closes over two books; the gusset takes a third.');

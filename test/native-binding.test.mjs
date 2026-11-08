@@ -139,7 +139,7 @@ const REFUSED = {
     containers: [{ id: 'box', inner_dimensions: SIDE }],
     fixed_placements: [{ ...fixed('0'), item_type: 'crate' }] },
   unsupported: { items: [{ id: 'cube', quantity: 1, dimensions: SIDE }],
-    containers: [{ id: 'box', inner_dimensions: SIDE, pallet_overhang_limit: '1' }] },
+    containers: [{ id: 'box', inner_dimensions: SIDE, pallet_overhang_limit: { length: '1', width: '1' }, axles: [] }] },
 };
 
 const describe = (error) => ({ name: error.name, code: error.code, reason: error.reason,

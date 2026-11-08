@@ -87,6 +87,48 @@ summarise('as hulls', {
 // One crate instead of two, for the same goods and the same crate. Nothing about the
 // request changed except the claim that the items are wedges rather than blocks.
 
+// --------------------------------------------------------- 24 rotations (1.10)
+//
+// Now two *identical* lower wedges. The six legacy codes turn an item so that the void
+// beside the first wedge is always on the wrong side for the second: what it needs is the
+// wedge spun half a turn about the vertical, and no swap of length, width and height does
+// that. A hull may list the 18 signed codes too -- `-L-W+H` reads "length along -x, width
+// along -y, height along +z" -- and with them the pair shares the crate.
+//
+// Signed codes are proper rotations, never mirror images, so a left-handed part is still
+// never packed as a right-handed one. They are opt-in: a hull that lists no signed code is
+// packed as before, and a signed code on a box is refused, because a box turned 180 degrees
+// occupies exactly what it did.
+
+const LEGACY_ROTATIONS = ['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL'];
+const SIGNED_ROTATIONS = [
+  '+L-W-H', '-L+W-H', '-L-W+H', '+L-H+W', '+L+H-W', '-L-H-W',
+  '+W-L+H', '+W+L-H', '-W-L-H', '+W-H-L', '-W+H-L', '-W-H+L',
+  '+H-L-W', '-H+L-W', '-H-L+W', '+H-W+L', '+H+W-L', '-H-W-L',
+];
+
+const twoLowerWedges = (allowedRotations) => pack({
+  ...MM,
+  ...SAFETY_FUSE,
+  items: [{ ...wedge('wedge', LOWER_WEDGE), quantity: 2, allowed_rotations: allowedRotations }],
+  containers: [{ ...crate('100', '100', '100')[0], quantity: 1 }],
+});
+
+console.log('\n24 rotations -- two copies of the same wedge');
+for (const [label, rotations] of [['6 legacy codes', LEGACY_ROTATIONS],
+  ['all 24 codes', [...LEGACY_ROTATIONS, ...SIGNED_ROTATIONS]]]) {
+  const result = twoLowerWedges(rotations);
+  const orientations = result.containers.flatMap((c) => c.placements.map((p) => p.orientation));
+  console.log(`  ${label.padEnd(22)} ${result.summary.packed_item_count} placed, ` +
+    `orientations ${JSON.stringify(orientations)}`);
+}
+try {
+  pack({ ...MM, ...SAFETY_FUSE, items: [{ ...wedge('block', null), allowed_rotations: ['-L-W+H'] }],
+    containers: crate('100', '100', '100') });
+} catch (refusal) {
+  console.log(`  ${'signed code on a box'.padEnd(22)} ${refusal.message}`);
+}
+
 // ----------------------------------------------------------------- compressible
 //
 // `compression_ratio` is the fraction of its own height an item may lose when something

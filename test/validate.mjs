@@ -117,14 +117,23 @@ function vprimitive(v) {
   const lead = r.find((x) => x !== 0n);
   return lead > 0n ? r : [-r[0], -r[1], -r[2]];
 }
-/** The rotation applied to a hull, as a proper rotation: three of the six orientations are odd
- *  permutations, and a bare permutation would return the item's mirror image. */
+/** The 24 proper rotations (1.10), written out as the contract states them: per code, the
+ *  declared side each container axis takes and the sign it carries. Legacy odd permutations
+ *  negate x, so no code is ever the item's mirror image. */
+const HULL_ROTATIONS = {
+  LWH: [[0, 1, 2], [1n, 1n, 1n]], LHW: [[0, 2, 1], [-1n, 1n, 1n]], WLH: [[1, 0, 2], [-1n, 1n, 1n]],
+  WHL: [[1, 2, 0], [1n, 1n, 1n]], HLW: [[2, 0, 1], [1n, 1n, 1n]], HWL: [[2, 1, 0], [-1n, 1n, 1n]],
+  '+L-W-H': [[0, 1, 2], [1n, -1n, -1n]], '-L+W-H': [[0, 1, 2], [-1n, 1n, -1n]], '-L-W+H': [[0, 1, 2], [-1n, -1n, 1n]],
+  '+L-H+W': [[0, 2, 1], [1n, -1n, 1n]], '+L+H-W': [[0, 2, 1], [1n, 1n, -1n]], '-L-H-W': [[0, 2, 1], [-1n, -1n, -1n]],
+  '+W-L+H': [[1, 0, 2], [1n, -1n, 1n]], '+W+L-H': [[1, 0, 2], [1n, 1n, -1n]], '-W-L-H': [[1, 0, 2], [-1n, -1n, -1n]],
+  '+W-H-L': [[1, 2, 0], [1n, -1n, -1n]], '-W+H-L': [[1, 2, 0], [-1n, 1n, -1n]], '-W-H+L': [[1, 2, 0], [-1n, -1n, 1n]],
+  '+H-L-W': [[2, 0, 1], [1n, -1n, -1n]], '-H+L-W': [[2, 0, 1], [-1n, 1n, -1n]], '-H-L+W': [[2, 0, 1], [-1n, -1n, 1n]],
+  '+H-W+L': [[2, 1, 0], [1n, -1n, 1n]], '+H+W-L': [[2, 1, 0], [1n, 1n, -1n]], '-H-W-L': [[2, 1, 0], [-1n, -1n, -1n]],
+};
+/** The rotation applied to a hull: `v'[i] = s[i] * v[src[i]]`, translated to the origin. */
 function rotateHull(vertices, orientation) {
-  const axes = { LWH: [0, 1, 2], LHW: [0, 2, 1], WLH: [1, 0, 2], WHL: [1, 2, 0], HLW: [2, 0, 1], HWL: [2, 1, 0] }[orientation];
-  let inversions = 0;
-  for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) if (axes[i] > axes[j]) inversions++;
-  const sign = inversions % 2 ? -1n : 1n;
-  const turned = vertices.map((v) => [sign * v[axes[0]], v[axes[1]], v[axes[2]]]);
+  const [axes, signs] = HULL_ROTATIONS[orientation];
+  const turned = vertices.map((v) => [signs[0] * v[axes[0]], signs[1] * v[axes[1]], signs[2] * v[axes[2]]]);
   const low = [0, 1, 2].map((a) => turned.reduce((m, v) => (v[a] < m ? v[a] : m), turned[0][a]));
   return turned.map((v) => [v[0] - low[0], v[1] - low[1], v[2] - low[2]]);
 }
@@ -257,11 +266,66 @@ function fixedPlacementIssues(request, result, lengthUnit) {
 }
 
 /**
- * A flat bag reports the package its placements make, and that package passes the
- * girth rule. Measured on the physical boxes, as the score below is: meaningful only when no
- * clearance was configured.
+ * Every reported placement names itself (1.10): `placement_id` is the canonical JSON of
+ * `[container id, x, y, z, item type, orientation]` with the position in ticks, which for an
+ * array of strings and integers is exactly what `JSON.stringify` writes. A lattice summary has
+ * no placement objects, so it has no ids.
  */
-function flatBagIssues(template, container, boxes, inner) {
+function placementIdIssues(result) {
+  const issues = [];
+  const seen = new Set();
+  for (const container of result.containers) {
+    for (const placement of container.placements) {
+      const expected = JSON.stringify([container.id, ...corner(placement.position), placement.item_type, placement.orientation]);
+      if (placement.placement_id !== expected) issues.push('placement_id_mismatch');
+      if (typeof placement.placement_id !== 'string') continue;
+      if (seen.has(placement.placement_id)) issues.push('duplicate_placement_id');
+      seen.add(placement.placement_id);
+    }
+  }
+  return issues;
+}
+
+/**
+ * A pallet's solving frame: the reported inner size is the declared deck, the load
+ * may pass it by the limit at each end and side, and coordinates start at the corner of the
+ * overhang zone. Without a limit the frame is the reported inner size and there is no deck.
+ */
+function palletFrame(template, container, lengthUnit) {
+  const inner = size(container.inner_dimensions);
+  const limit = template?.pallet_overhang_limit;
+  if (limit == null) return { frame: inner, deck: null };
+  const x = requestLengthTicks(limit.length, lengthUnit);
+  const y = requestLengthTicks(limit.width, lengthUnit);
+  return { frame: [inner[0] + 2 * x, inner[1] + 2 * y, inner[2]], deck: { x, y, length: inner[0], width: inner[1] } };
+}
+
+/** The deck grown by the overhang the boxes use past each edge, at the load's height. */
+function deckExtent(deck, boxes) {
+  let lowX = deck.x, lowY = deck.y, highX = deck.x + deck.length, highY = deck.y + deck.width, top = 0;
+  for (const box of boxes) {
+    lowX = Math.min(lowX, box.at[0]); lowY = Math.min(lowY, box.at[1]);
+    highX = Math.max(highX, box.at[0] + box.size[0]); highY = Math.max(highY, box.at[1] + box.size[1]);
+    top = Math.max(top, box.at[2] + box.size[2]);
+  }
+  return [highX - lowX, highY - lowY, top];
+}
+
+function palletIssues(container, boxes, deck) {
+  const [a, b, c] = deckExtent(deck, boxes);
+  const reported = container.achieved_dimensions == null ? null : size(container.achieved_dimensions);
+  return reported == null || reported[0] !== a || reported[1] !== b || reported[2] !== c
+    ? ['achieved_dimensions_mismatch'] : [];
+}
+
+/**
+ * A bag reports the package its placements make, and that package passes the girth
+ * rule a + c <= L, b + c <= W + G, G a gusseted bag's side gusset (1.10) and 0 for a flat one.
+ * Measured on the physical boxes, as the score below is: meaningful only when no clearance
+ * was configured.
+ */
+function flatBagIssues(template, container, boxes, inner, deck, lengthUnit) {
+  if (deck != null) return palletIssues(container, boxes, deck);
   if (template.deformable_boundary == null) {
     const soft = template.made_to_measure != null;
     return container.achieved_dimensions != null && !soft ? ['achieved_dimensions_mismatch'] : [];
@@ -270,7 +334,9 @@ function flatBagIssues(template, container, boxes, inner) {
   const issues = [];
   const reported = container.achieved_dimensions == null ? null : size(container.achieved_dimensions);
   if (reported == null || reported[0] !== a || reported[1] !== b || reported[2] !== c) issues.push('achieved_dimensions_mismatch');
-  if (a + c > inner[0] || b + c > inner[1]) issues.push('bag_girth_exceeded');
+  const depth = template.deformable_boundary.side_gusset_depth;
+  const gusset = depth == null ? 0 : requestLengthTicks(depth, lengthUnit);
+  if (a + c > inner[0] || b + c > inner[1] + gusset) issues.push('bag_girth_exceeded');
   return issues;
 }
 
@@ -296,11 +362,11 @@ export function validate(request, result) {
     }
     inventory.set(container.container_type, (inventory.get(container.container_type) ?? 0) + 1);
 
-    const inner = size(container.inner_dimensions);
+    const { frame: inner, deck } = palletFrame(template, container, lengthUnit);
     const boxes = boxesOf(container, latticeSequences);
 
     if (template.max_items != null && boxes.length > template.max_items) issues.push('max_items_exceeded');
-    issues.push(...flatBagIssues(template, container, boxes, inner));
+    issues.push(...flatBagIssues(template, container, boxes, inner, deck, lengthUnit));
 
     boxes.forEach((box, index) => {
       if (seen.has(box.id)) issues.push('duplicate_item');
@@ -374,6 +440,7 @@ export function validate(request, result) {
   }
 
   issues.push(...fixedPlacementIssues(request, result, lengthUnit));
+  issues.push(...placementIdIssues(result));
 
   const expected = new Set();
   for (const item of request.items) {
@@ -443,6 +510,8 @@ function containerCost(template, inner) {
   return fee + Number((price * area + squareMetre - 1n) / squareMetre);
 }
 
+const palletBilledSize = (base, achieved) => [Math.max(base[0], achieved[0]), Math.max(base[1], achieved[1]), base[2]];
+
 export function objective(request, result) {
   const containersById = new Map(request.containers.map((container) => [container.id, container]));
   const itemsById = new Map(request.items.map((item) => [item.id, item]));
@@ -456,9 +525,11 @@ export function objective(request, result) {
   const latticeSequences = new Map();
 
   for (const container of result.containers) {
-    const inner = size(container.inner_dimensions);
-    cost += containerCost(containersById.get(container.container_type), inner);
+    const template = containersById.get(container.container_type);
+    cost += containerCost(template, size(container.inner_dimensions));
 
+    // Utilization and height are measured against the frame the solver packed.
+    const { frame: inner, deck } = palletFrame(template, container, lengthUnit);
     const total = volume(inner);
     const boxes = boxesOf(container, latticeSequences);
     // Occupied volume follows the shape: a hull's own volume, a compressible item's height
@@ -499,9 +570,11 @@ export function objective(request, result) {
       const lengthTicks = BigInt(LENGTH_TICKS[request.configuration.dimensional_weight_length_unit ?? 'in']);
       const weightTicks = BigInt(WEIGHT_TICKS[request.configuration.dimensional_weight_weight_unit ?? 'lb']);
       const divisor = BigInt(request.configuration.dimensional_weight_divisor);
-      // A flat bag is billed on the package it conformed to.
-      const billedSize = containersById.get(container.container_type)?.deformable_boundary != null
-        ? bagExtent(boxes) : size(container.outer_dimensions);
+      // A flat bag is billed on the package it conformed to; a pallet on the larger
+      // of its declared footprint and the deck grown by the overhang used.
+      const billedSize = template?.deformable_boundary != null ? bagExtent(boxes)
+        : deck != null ? palletBilledSize(size(container.outer_dimensions), deckExtent(deck, boxes))
+          : size(container.outer_dimensions);
       const dimensional = volume(billedSize) * weightTicks
         / (lengthTicks ** 3n * divisor);
       const billed = BigInt(ticks(container.gross_weight)) > dimensional

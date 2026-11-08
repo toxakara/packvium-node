@@ -11,7 +11,8 @@
  *
  * `fixed_placements` says so. Each entry names an item type, a container type and
  * instance, a position and an orientation -- the same fields a result placement reports,
- * so a placement from an earlier result can be fixed by quoting it. Fixed items are real:
+ * so a placement from an earlier result can be fixed by quoting it, its `placement_id`
+ * included. Fixed items are real:
  * they carry weight, count against payload and can support what is stacked on them. They
  * come back unmoved, marked `"fixed": true`.
  *
@@ -69,7 +70,13 @@ const loaded = morning.containers[0].placements.slice(0, 4);
 console.log(`  morning plan: ${morning.summary.packed_item_count} placed; ` +
   `${loaded.length} are on the van when a late order arrives`);
 
-// A result placement already has every field a fixed placement needs. Quote them.
+// Every result placement carries a `placement_id`: the canonical JSON of its container,
+// position in ticks, item type and orientation. It names one placement in a result, so it
+// is the key to store a lock under or to match a plan step to the box on the van.
+console.log(`  first placement's id: ${loaded[0].placement_id}`);
+
+// A result placement already has every field a fixed placement needs. Quote them, the id
+// too: the engine checks that the id is the one those fields spell.
 const locked = loaded.map((placement) => ({
   item_type: placement.item_type,
   container_type: 'van',
@@ -80,6 +87,7 @@ const locked = loaded.map((placement) => ({
     z: { value: placement.position.z.value, unit: placement.position.z.unit },
   },
   orientation: placement.orientation,
+  placement_id: placement.placement_id,
 }));
 const lateOrder = { id: 'late-box', quantity: 3, weight: '8 kg',
   dimensions: { length: '400', width: '400', height: '300' } };
@@ -97,6 +105,23 @@ try {
   pack({ units: { length: 'mm' }, configuration, items: [fridge, box], containers: [van],
     fixed_placements: [strappedIn, { item_type: 'box', container_type: 'van',
       position: { x: '1500', y: '700', z: '0' }, orientation: 'LWH' }] });
+} catch (error) {
+  if (!(error instanceof FixedPlacementError)) throw error;
+  console.log(`  ${error.reason} at ${error.field}`);
+  console.log(`  ${error.message}`);
+}
+
+// ------------------------------------------------------------------------------------
+section('4. A placement id that names another placement is refused');
+
+// The id is not a free-form label. Copy the fridge's id onto a box and the entry
+// contradicts itself, so it is refused at the id, before any search.
+const fridgeId = locked.find((entry) => entry.item_type === 'fridge').placement_id;
+const mislabelled = locked.map((entry) => (entry.item_type === 'box'
+  ? { ...entry, placement_id: fridgeId } : entry));
+try {
+  pack({ units: { length: 'mm' }, configuration, items: [fridge, box], containers: [van],
+    fixed_placements: mislabelled });
 } catch (error) {
   if (!(error instanceof FixedPlacementError)) throw error;
   console.log(`  ${error.reason} at ${error.field}`);

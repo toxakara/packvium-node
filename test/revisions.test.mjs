@@ -7,13 +7,14 @@
  */
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import { SUITE_VERSION, buildOperationalArtifact } from '@packvium/engine/artifacts.js';
 import {
   FORMAT, PlanRevisionError, applyEvents, canonicalRevisionJson, deriveRevision, documentDigest,
-  rootRevision, verifyRevisionChain,
+  rootRevision, stockCutBoxes, verifyRevisionChain,
 } from '@packvium/engine/revisions.js';
 import { packFallback } from '../fallback.js';
 
@@ -203,6 +204,8 @@ const MALFORMED_EVENTS = [
   [[{ sequence: true, type: 'item_missing', item_type: 'cube', quantity: 1 }], 'event sequence true does not continue the chain at 1'],
   [[{ sequence: 1, type: 'placement_locked', placement: { ...locked().placement, orientation: 'XYZ' } }],
     'placement.orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]'],
+  [[{ sequence: 1, type: 'placement_locked', placement: { ...locked().placement, orientation: '-L-W+H' } }],
+    'placement.orientation: a signed rotation code requires shape_type convex_hull'],
   [[{ sequence: 1, type: 'placement_locked', placement: { ...locked().placement, container_instance: 0 } }],
     'placement.container_instance counts from 1'],
   [['item_missing'], 'an event is a JSON object'],
@@ -474,4 +477,85 @@ test('a parent that is not a digest is quoted as JSON', () => {
   revisions[0].parent = 5;
   assert.deepEqual(verifyRevisionChain(revisions.slice(0, 1)),
     [{ code: 'parent_mismatch', revision: 0, detail: 'parent 5, expected null' }]);
+});
+
+// ------------------------------------------------------------------ cut boxes
+
+function cutRequest(quantity = 2) {
+  return {
+    units: { length: 'mm' },
+    items: [{ id: 'cube', quantity: 1, dimensions: { length: '100', width: '100', height: '100' } }],
+    containers: [
+      { id: 'machine', quantity, cost_minor: 40, tare_weight: '50', inner_dimensions: { length: '310', width: '310', height: '610' },
+        made_to_measure: { minimum: { length: '60', width: '60', height: '60' }, increment: { length: '25', width: '25', height: '25' },
+          cost_per_square_metre_minor: 1000, tare_per_square_metre: '500', outer_allowance: { length: '3', width: '3' } } },
+      { id: 'crate', inner_dimensions: { length: '100', width: '100', height: '100' } },
+    ],
+    fixed_placements: [{ item_type: 'cube', container_type: 'machine', orientation: 'LWH' }],
+  };
+}
+
+const cutArtifact = (sides = ['1760000', '1760000', '1760000']) => ({
+  work_order: { containers: [{ container_type: 'crate' }, { container_type: 'machine' }] },
+  geometry: { containers: [{}, { inner_dimensions: { length: sides[0], width: sides[1], height: sides[2] } }] },
+});
+
+test('a box cut for the approved plan becomes a stock container after its machine', () => {
+  const request = cutRequest();
+  const stocked = stockCutBoxes(request, cutArtifact(), 3);
+  assert.deepEqual(stocked.containers.map((container) => [container.id, container.quantity ?? null]),
+    [['machine', 1], ['machine@3#1', 1], ['crate', null]]);
+  const box = stocked.containers[1];
+  assert.equal('made_to_measure' in box, false);
+  assert.deepEqual(box.inner_dimensions.length, { value: '1760000', unit: 'ticks' });
+  // 3 mm of allowance on two axes; none stated on the third.
+  assert.deepEqual([box.outer_dimensions.length.value, box.outer_dimensions.height.value], ['1808000', '1760000']);
+  // 6 x 0.11 m x 0.11 m of board at 1000 per square metre is 72.6, rounded up, on a fee of 40.
+  assert.equal(box.cost_minor, 113);
+  assert.deepEqual(stocked.fixed_placements[0], { item_type: 'cube', container_type: 'machine@3#1', orientation: 'LWH', container_instance: 1 });
+  assert.equal(request.containers.length, 2, 'the caller\'s request is not mutated');
+  // The last box of a counted machine takes the machine with it.
+  assert.deepEqual(stockCutBoxes(cutRequest(1), cutArtifact(), 3).containers.map((container) => container.id), ['machine@3#1', 'crate']);
+});
+
+test('a restocked fixed entry drops the placement id that named its cut box', () => {
+  const request = cutRequest();
+  request.fixed_placements[0].placement_id = '["machine#1",0,0,0,"cube","LWH"]';
+  const stocked = stockCutBoxes(request, cutArtifact(), 3);
+  assert.deepEqual(stocked.fixed_placements[0], { item_type: 'cube', container_type: 'machine@3#1', orientation: 'LWH', container_instance: 1 });
+  assert.equal(request.fixed_placements[0].placement_id, '["machine#1",0,0,0,"cube","LWH"]', 'the caller\'s request is not mutated');
+});
+
+test('a request with nothing cut to measure is returned as it was', () => {
+  const request = cutRequest();
+  request.fixed_placements[0].container_type = 'crate';
+  assert.deepEqual(stockCutBoxes(request, cutArtifact(), 1), request);
+  assert.deepEqual(stockCutBoxes({ containers: {} }, cutArtifact(), 1), { containers: {} });
+});
+
+test('a cut box the artifact cannot size, or a name already taken, is refused', () => {
+  const refused = (request, artifact) => { try { stockCutBoxes(request, artifact, 2); } catch (error) { return [error.code, error.message]; } return null; };
+  const second = cutRequest();
+  second.fixed_placements[0].container_instance = 2;
+  assert.deepEqual(refused(second, cutArtifact()), ['invalid_artifact', 'the approved plan holds no machine instance 2']);
+  assert.deepEqual(refused(cutRequest(), cutArtifact(['1760000', '17.5', '1'])), ['invalid_artifact', "a cut box's width is not a tick count"]);
+  const clash = cutRequest();
+  clash.containers[1].id = 'machine@2#1';
+  assert.deepEqual(refused(clash, cutArtifact()), ['event_conflict', 'a container is already named "machine@2#1"']);
+});
+
+test('fixed items in a cut box are checked against the approved artifact', (t) => {
+  const corpus = new URL('../../../../conformance/revisions/histories.json', import.meta.url);
+  if (!fs.existsSync(corpus)) {
+    t.skip('the shared revision history corpus lives in the workspace only');
+    return;
+  }
+  const cutHistory = JSON.parse(fs.readFileSync(corpus, 'utf8'))
+    .histories.find((history) => history.name === 'cut-to-measure');
+  const chain = cutHistory.chain.map((text) => JSON.parse(text));
+  const artifacts = [null, ...cutHistory.steps.map((step) => step.artifact)];
+  assert.deepEqual(verifyRevisionChain(chain, artifacts), []);
+  const unchecked = verifyRevisionChain(chain);
+  assert.ok(unchecked.some((found) => found.code === 'artifact_required'
+    && found.detail === 'fixed items in a made-to-measure box are checked against the approved artifact'), JSON.stringify(unchecked));
 });

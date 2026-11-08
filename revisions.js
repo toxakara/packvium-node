@@ -17,13 +17,14 @@ import { createHash } from 'node:crypto';
 import { FORMAT as ARTIFACT_FORMAT, SUITE_VERSION } from './artifacts.js';
 import { CanonicalJsonError, canonicalJson, jsonInteger, jsonSpelling } from './canonical-json.js';
 import { compareCodePoints } from './commerce-model.js';
-import { requirePointShape } from './fallback.js';
+import { lengthTicks, requirePointShape, weightTicks } from './fallback.js';
+import { hullItemTypes, refuseOrientation } from './request-errors.js';
+import { perSquareMetre, surfaceArea } from './made-to-measure.js';
 
 export const FORMAT = 'packvium-plan-revision/v1';
 
 export const EVENT_TYPES = Object.freeze(['item_missing', 'container_substituted', 'placement_locked', 'placement_verified']);
 
-const ORIENTATIONS = ['LWH', 'LHW', 'WLH', 'WHL', 'HLW', 'HWL'];
 
 const EVENT_FIELDS = new Map([
   ['item_missing', ['item_type', 'quantity']],
@@ -32,7 +33,8 @@ const EVENT_FIELDS = new Map([
   ['placement_verified', ['placement']],
 ]);
 
-const PLACEMENT_FIELDS = ['item_type', 'container_type', 'container_instance', 'position', 'orientation'];
+const PLACEMENT_FIELDS = ['item_type', 'container_type', 'container_instance', 'position', 'orientation',
+  'placement_id'];
 
 /**
  * A revision could not be built. `code` is one of a closed set shared by four engines:
@@ -83,13 +85,15 @@ export function deriveRevision(parent, approvedArtifact, events) {
     throw new PlanRevisionError('invalid_event', 'a revision records at least one event');
   }
   const first = lastSequence(parent) + 1;
-  const recorded = events.map((event, offset) => recordedEvent(event, first + offset));
-  const request = applyEvents(parent.request, recorded);
+  const hulls = hullTypes(parent.request);
+  const recorded = events.map((event, offset) => recordedEvent(event, first + offset, hulls));
+  const number = jsonInteger(parent.revision) + 1;
+  const request = stockCutBoxes(applyEvents(parent.request, recorded), approvedArtifact, number);
   const approved = {
     artifact: documentDigest(approvedArtifact),
     replay: clone(approvedArtifact.provenance.replay),
   };
-  const document = revisionDocument(jsonInteger(parent.revision) + 1, documentDigest(parent), approved, recorded, request);
+  const document = revisionDocument(number, documentDigest(parent), approved, recorded, request);
   canonicalRevisionJson(document);
   return document;
 }
@@ -103,8 +107,9 @@ export function applyEvents(request, events) {
   if (!Array.isArray(events)) throw new PlanRevisionError('invalid_event', 'events are a JSON array');
   const derived = clone(request);
   const placementSession = { fixed: null, keys: null, indexable: true };
+  const hulls = hullTypes(request);
   for (const event of events) {
-    requireShape(event);
+    requireShape(event, hulls);
     const given = get(event, 'sequence');
     if (jsonInteger(given) === null) {
       throw new PlanRevisionError('invalid_event', `event sequence ${jsonSpelling(given)} is not an integer`);
@@ -112,6 +117,161 @@ export function applyEvents(request, events) {
     APPLY[event.type](derived, event, placementSession);
   }
   return derived;
+}
+
+const SIDES = ['length', 'width', 'height'];
+
+/**
+ * `request` with every made-to-measure box that holds a fixed placement made a stock container
+ *. The box was cut for the approved plan, so a replan cannot recut it: instance `n` of
+ * made-to-measure type `T` -- the `n`-th container of type `T` in the artifact, in result order --
+ * becomes container `T@<revision>#<n>`, a copy of `T` without `made_to_measure`, quantity 1, at
+ * the cut inner and outer size, price and tare, each in ticks; it follows `T` in the container
+ * list. Its fixed placements move to its instance 1 and `T`'s own `quantity`, if stated, loses the
+ * boxes taken (`T` is dropped at zero). New boxes are still cut to measure. Pure; O(C + F + A)
+ * for containers, fixed placements and the artifact's containers.
+ */
+export function stockCutBoxes(request, approvedArtifact, revision) {
+  const derived = clone(request);
+  const fixed = get(derived, 'fixed_placements'), containers = get(derived, 'containers');
+  if (!Array.isArray(fixed) || !Array.isArray(containers)) return derived;
+  const machines = new Map();
+  for (const entry of containers) {
+    if (isMapping(entry) && typeof get(entry, 'id') === 'string' && get(entry, 'made_to_measure') !== null) machines.set(entry.id, entry);
+  }
+  const stocked = new Map([...machines.keys()].map((id) => [id, []]));
+  const named = new Map();
+  let cuts = null;
+  for (const entry of fixed) {
+    if (!isMapping(entry) || !machines.has(get(entry, 'container_type'))) continue;
+    const machineId = entry.container_type;
+    const instance = jsonInteger(hasOwn(entry, 'container_instance') ? entry.container_instance : 1);
+    const stockId = `${machineId}@${revision}#${instance === null ? 'None' : instance}`;
+    if (!named.has(stockId)) {
+      cuts ??= cutBoxes(approvedArtifact);
+      named.set(stockId, stockBox(derived, machines.get(machineId), stockId, cutInner(cuts, machineId, instance)));
+      stocked.get(machineId).push(named.get(stockId));
+    }
+    entry.container_type = stockId;
+    entry.container_instance = 1;
+    // A stated id named the cut box, which this entry no longer sits in (1.10).
+    delete entry.placement_id;
+  }
+  if (!named.size) return derived;
+  const existing = new Set(containers.filter(isMapping).map((container) => get(container, 'id')));
+  let clash = null;
+  for (const id of named.keys()) {
+    if (existing.has(id) && (clash === null || compareCodePoints(id, clash) < 0)) clash = id;
+  }
+  if (clash !== null) throw new PlanRevisionError('event_conflict', `a container is already named ${jsonSpelling(clash)}`);
+  const rebuilt = [];
+  for (const container of containers) {
+    const boxes = isMapping(container) ? stocked.get(get(container, 'id')) : undefined;
+    if (!boxes?.length) {
+      rebuilt.push(container);
+      continue;
+    }
+    const quantity = get(container, 'quantity') === null ? null : jsonInteger(container.quantity);
+    if (quantity === null || quantity > boxes.length) {
+      if (quantity !== null) container.quantity = quantity - boxes.length;
+      rebuilt.push(container);
+    }
+    rebuilt.push(...boxes);
+  }
+  derived.containers = rebuilt;
+  return derived;
+}
+
+/** Index raw shapes in artifact order; only selected dimensions are parsed. O(A). */
+function cutBoxes(artifact) {
+  const orders = get(get(artifact, 'work_order'), 'containers'), shapes = get(get(artifact, 'geometry'), 'containers');
+  const cuts = new Map();
+  if (Array.isArray(orders) && Array.isArray(shapes)) {
+    for (let index = 0; index < Math.min(orders.length, shapes.length); index += 1) {
+      const machineId = isMapping(orders[index]) ? get(orders[index], 'container_type') : null;
+      if (typeof machineId === 'string') {
+        if (!cuts.has(machineId)) cuts.set(machineId, []);
+        cuts.get(machineId).push(shapes[index]);
+      }
+    }
+  }
+  return cuts;
+}
+
+/** The selected box's ticks, read only when it is stocked. Expected O(1). */
+function cutInner(cuts, machineId, instance) {
+  const shapes = cuts.get(machineId) ?? [];
+  if (instance !== null && instance >= 1 && instance <= shapes.length) {
+    return SIDES.map((axis) => artifactTicks(shapes[instance - 1], axis));
+  }
+  throw new PlanRevisionError('invalid_artifact', `the approved plan holds no ${machineId} instance ${jsonSpelling(instance)}`);
+}
+
+function artifactTicks(shape, axis) {
+  const value = get(get(shape, 'inner_dimensions'), axis);
+  const ticks = typeof value === 'string' && /^[0-9]+$/.test(value) ? jsonInteger(Number(value)) : null;
+  if (ticks === null) throw new PlanRevisionError('invalid_artifact', `a cut box's ${axis} is not a tick count`);
+  return ticks;
+}
+
+/** The stock container a cut box becomes, priced as `made-to-measure.js` `fabricate` prices it. */
+function stockBox(request, machine, stockId, inner) {
+  const units = stockObject(get(request, 'units'), 'units', true);
+  const unit = get(units, 'length') ?? 'mm';
+  if (typeof unit !== 'string') throw new PlanRevisionError('invalid_revision', "a made-to-measure container's units.length is not a string");
+  const spec = stockObject(machine.made_to_measure, 'made_to_measure');
+  const allowance = stockObject(get(spec, 'outer_allowance'), 'outer_allowance', true);
+  const outer = SIDES.map((axis, index) => inner[index] + (get(allowance, axis) === null ? 0
+    : stockMeasure(() => lengthTicks(allowance[axis], unit), 'outer_allowance')));
+  const area = surfaceArea(inner);
+  const price = stockInteger(get(spec, 'cost_per_square_metre_minor'), 'cost_per_square_metre_minor');
+  const tareRate = get(spec, 'tare_per_square_metre') === null ? 0n
+    : stockMeasure(() => weightTicks(spec.tare_per_square_metre), 'tare_per_square_metre');
+  const declaredTare = get(machine, 'tare_weight') === null ? 0n
+    : stockMeasure(() => weightTicks(machine.tare_weight), 'tare_weight');
+  const box = {};
+  for (const [key, value] of Object.entries(machine)) {
+    if (key !== 'made_to_measure') Object.defineProperty(box, key, { value: clone(value), enumerable: true, writable: true, configurable: true });
+  }
+  Object.assign(box, {
+    id: stockId,
+    quantity: 1,
+    inner_dimensions: tickBox(inner),
+    outer_dimensions: tickBox(outer),
+    cost_minor: Number(BigInt(stockInteger(get(machine, 'cost_minor'), 'cost_minor')) + perSquareMetre(price, area)),
+    tare_weight: { value: String(BigInt(declaredTare) + perSquareMetre(tareRate, area)), unit: 'ticks' },
+  });
+  return box;
+}
+
+function stockObject(value, name, optional = false) {
+  if (value === null && optional) return {};
+  if (!isMapping(value)) throw new PlanRevisionError('invalid_revision', `a made-to-measure container's ${name} is not an object`);
+  return value;
+}
+
+function stockInteger(value, name) {
+  const integer = jsonInteger(value ?? 0);
+  if (integer === null) throw new PlanRevisionError('invalid_revision', `a made-to-measure container's ${name} is not an integer`);
+  return integer;
+}
+
+function stockMeasure(read, name) {
+  try { return read(); } catch (error) {
+    if (!(error instanceof RangeError || error instanceof TypeError || error instanceof SyntaxError)) throw error;
+    throw new PlanRevisionError('invalid_revision', `a made-to-measure container's ${name} is not a measure`);
+  }
+}
+
+const tickBox = (sides) => Object.fromEntries(SIDES.map((axis, index) => [axis, { value: String(sides[index]), unit: 'ticks' }]));
+
+/** Whether a fixed placement names a made-to-measure container type. */
+function holdsCutBoxes(request) {
+  const containers = get(request, 'containers'), fixed = get(request, 'fixed_placements');
+  if (!Array.isArray(containers) || !Array.isArray(fixed)) return false;
+  const machines = new Set(containers.filter((entry) => isMapping(entry) && get(entry, 'made_to_measure') !== null)
+    .map((entry) => get(entry, 'id')));
+  return fixed.some((entry) => isMapping(entry) && machines.has(get(entry, 'container_type')));
 }
 
 /**
@@ -145,8 +305,8 @@ export function verifyRevisionChain(revisions, artifacts = null) {
       issues.push(issue('parent_mismatch', position, `parent ${plain(recordedParent)}, expected ${plain(expectedParent)}`));
     }
     last = checkSequences(revision, position, last, issues);
-    if (parent !== null) checkRequest(revision, parent, position, issues);
     const artifact = artifacts == null || position >= artifacts.length ? null : artifacts[position];
+    if (parent !== null) checkRequest(revision, parent, artifact, position, issues);
     if (artifact != null && parent !== null) checkArtifact(revision, parent, artifact, position, issues);
   }
   return issues;
@@ -208,8 +368,8 @@ function lastSequence(revision) {
   return 0;
 }
 
-function recordedEvent(raw, sequence) {
-  requireShape(raw);
+function recordedEvent(raw, sequence, hulls) {
+  requireShape(raw, hulls);
   const given = get(raw, 'sequence');
   if (jsonInteger(given) !== sequence) {
     throw new PlanRevisionError('invalid_event', `event sequence ${jsonSpelling(given)} does not continue the chain at ${sequence}`);
@@ -217,7 +377,12 @@ function recordedEvent(raw, sequence) {
   return clone(raw);
 }
 
-function requireShape(raw) {
+/** The request's hull item types, which alone may be placed in a signed orientation (1.10). */
+function hullTypes(request) {
+  return isMapping(request) ? hullItemTypes(get(request, 'items')) : new Set();
+}
+
+function requireShape(raw, hulls) {
   if (!isMapping(raw)) throw new PlanRevisionError('invalid_event', 'an event is a JSON object');
   const kind = get(raw, 'type');
   const fields = typeof kind === 'string' ? EVENT_FIELDS.get(kind) : undefined;
@@ -227,7 +392,7 @@ function requireShape(raw) {
   if (unknown.length) throw new PlanRevisionError('invalid_event', `${kind} does not carry ${jsonSpelling(unknown)}`);
   const missing = fields.filter((field) => !hasOwn(raw, field));
   if (missing.length) throw new PlanRevisionError('invalid_event', `${kind} needs ${jsonSpelling(missing)}`);
-  VALIDATE[kind](raw);
+  VALIDATE[kind](raw, hulls);
 }
 
 function validateItemMissing(event) {
@@ -244,21 +409,26 @@ function validateContainerSubstituted(event) {
   requireName(get(event.replacement, 'id'), 'replacement.id');
 }
 
-function validatePlacement(event) {
+function validatePlacement(event, hulls) {
   const { placement } = event;
   if (!isMapping(placement)) throw new PlanRevisionError('invalid_event', 'a placement is a fixed-placement object');
   const unknown = Object.keys(placement).filter((key) => !PLACEMENT_FIELDS.includes(key)).sort(compareCodePoints);
   if (unknown.length) throw new PlanRevisionError('invalid_event', `a placement does not carry ${jsonSpelling(unknown)}`);
   requireName(get(placement, 'item_type'), 'placement.item_type');
   requireName(get(placement, 'container_type'), 'placement.container_type');
-  if (!ORIENTATIONS.includes(get(placement, 'orientation'))) {
-    throw new PlanRevisionError('invalid_event', `placement.orientation must be one of ${jsonSpelling(ORIENTATIONS)}`);
-  }
+  refuseOrientation(get(placement, 'orientation'), hulls.has(get(placement, 'item_type')), '',
+    (_reason, _field, detail) => new PlanRevisionError('invalid_event', detail), 'placement.orientation');
   const instance = jsonInteger(hasOwn(placement, 'container_instance') ? placement.container_instance : 1);
   if (instance === null || instance < 1) {
     throw new PlanRevisionError('invalid_event', 'placement.container_instance counts from 1');
   }
   requirePointShape(hasOwn(placement, 'position') ? placement.position : {}, 'placement.position', '', invalidEvent);
+  // Only its type is the event's to judge: whether it names this placement needs the request's
+  // unit, and is the engine's admission rule when the revision is solved (1.10).
+  const identifier = get(placement, 'placement_id');
+  if (identifier != null && typeof identifier !== 'string') {
+    throw new PlanRevisionError('invalid_event', 'placement.placement_id is a string');
+  }
 }
 
 function invalidEvent(message) {
@@ -317,12 +487,12 @@ function applyContainerSubstituted(request, event) {
 }
 
 function applyPlacement(request, event, session) {
-  const placement = withDefaultInstance(event.placement);
+  const placement = identity(event.placement);
   if (session.fixed === null) {
     session.fixed = fixedPlacements(request);
     request.fixed_placements = session.fixed;
     try {
-      session.keys = new Set(session.fixed.map((entry) => canonicalRevisionJson(withDefaultInstance(entry))));
+      session.keys = new Set(session.fixed.map((entry) => canonicalRevisionJson(identity(entry))));
     } catch (error) {
       if (!(error instanceof PlanRevisionError)) throw error;
       session.indexable = false;
@@ -345,12 +515,18 @@ function applyPlacement(request, event, session) {
   }
   // Direct callers may supply values outside canonical JSON. Keep the former first-match
   // refusal order rather than making construction of the index an earlier refusal.
-  if (fixed.some((entry) => same(withDefaultInstance(entry), placement))) return;
+  if (fixed.some((entry) => same(identity(entry), placement))) return;
   fixed.push(clone(event.placement));
 }
 
-function withDefaultInstance(placement) {
-  return { container_instance: 1, ...clone(placement) };
+/**
+ * What makes two fixed entries one box: everything but `placement_id`, which only restates the
+ * container and position (1.10), with the default instance spelled out.
+ */
+function identity(placement) {
+  const entry = { container_instance: 1, ...clone(placement) };
+  delete entry.placement_id;
+  return entry;
 }
 
 const APPLY = {
@@ -399,10 +575,18 @@ function checkSequences(revision, position, last, issues) {
   return next;
 }
 
-function checkRequest(revision, parent, position, issues) {
+function checkRequest(revision, parent, artifact, position, issues) {
   let derived;
   try {
     derived = applyEvents(parent.request, revision.events);
+    if (holdsCutBoxes(derived)) {
+      // The cut sizes live only in the approved artifact.
+      if (artifact == null) {
+        issues.push(issue('artifact_required', position, 'fixed items in a made-to-measure box are checked against the approved artifact'));
+        return;
+      }
+      derived = stockCutBoxes(derived, artifact, jsonInteger(revision.revision));
+    }
   } catch (error) {
     if (!(error instanceof PlanRevisionError)) throw error;
     issues.push(issue('request_mismatch', position, `the events do not apply: ${error.message}`));

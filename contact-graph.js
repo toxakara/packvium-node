@@ -58,6 +58,15 @@ function levelIndex(boxes, indices, cell) {
 function overlapsOnPlane(graph, buckets, cache, plane, box, overlapXY) {
   const indices = buckets.get(plane);
   if (!indices) return [];
+  if (indices.length <= 32) {
+    const found = [];
+    for (let i = 0; i < indices.length; i++) {
+      const other = indices[i];
+      const area = overlapXY(graph.boxes[other], box);
+      if (area > 0) found.push([other, area]);
+    }
+    return found;
+  }
   let level = cache.get(plane);
   if (level == null) {
     level = levelIndex(graph.boxes, indices, graph.cell);
@@ -73,6 +82,14 @@ function overlapsOnPlane(graph, buckets, cache, plane, box, overlapXY) {
     if (area > 0) found.push([other, area]);
   }
   return found;
+}
+
+export function contactsBelow(graph, box, overlapXY) {
+  return overlapsOnPlane(graph, graph.byTop, graph.topLevels, box.z, box, overlapXY);
+}
+
+export function contactsAbove(graph, box, overlapXY) {
+  return overlapsOnPlane(graph, graph.byBottom, graph.bottomLevels, topOf(box), box, overlapXY);
 }
 
 /**

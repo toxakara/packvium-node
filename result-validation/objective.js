@@ -3,7 +3,7 @@
  * the whole result can answer: fixed placements, groups and solver selection.
  */
 
-import { achievedExtent } from './container.js';
+import { billedSize } from './container.js';
 import {
   PyDict, at, compareCodePoints, getNull, getOr, has, hashKey, int, list, pyCmp, pyEq, pyInt, sortPy, text, truthy,
 } from './json.js';
@@ -59,7 +59,7 @@ function topOf(packed, clearance) {
 function billedWeight(packed, spec, inputs, billing) {
   const divisor = int(billing.divisor, 'dimensional_weight_divisor');
   const gross = pyInt(getOr(getOr(packed, 'gross_weight', {}), 'ticks', 0), 'gross_weight');
-  const size = spec.flatBag ? achievedExtent(packed, inputs.clearance) : spec.outer ?? spec.inner;
+  const size = billedSize(packed, spec, inputs.clearance);
   const dimensional = dimensionalWeight(size, divisor, text(billing.lengthUnit, 'dimensional_weight_length_unit'),
     text(billing.weightUnit, 'dimensional_weight_weight_unit'));
   return max(gross, dimensional);

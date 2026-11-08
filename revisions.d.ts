@@ -25,14 +25,16 @@ export type RevisionEvent =
 export interface PlanRevision{format:'packvium-plan-revision/v1';suite_version:string;revision:number;parent:string|null;approved:{artifact:string;replay:ArtifactReplay}|null;events:RevisionEvent[];request:PackingRequest}
 
 /** One way a chain fails its audit, anchored on the revision where it shows. */
-export interface RevisionIssue{code:'invalid_revision'|'revision_number'|'parent_mismatch'|'sequence_gap'|'request_mismatch'|'artifact_mismatch';revision:number;detail:string}
+export interface RevisionIssue{code:'invalid_revision'|'revision_number'|'parent_mismatch'|'sequence_gap'|'request_mismatch'|'artifact_mismatch'|'artifact_required';revision:number;detail:string}
 
 /** Revision 0: the request as first approved, with nothing recorded against it. */
 export function rootRevision(request:PackingRequest):PlanRevision;
 /** The next revision: `events`, observed against `approvedArtifact`, applied to `parent`. Throws `PlanRevisionError`. */
 export function deriveRevision(parent:PlanRevision,approvedArtifact:OperationalArtifact,events:RevisionEvent[]):PlanRevision;
-/** The request these events derive. Refuses a contradiction (`event_conflict`), never physics. */
+/** The request these events derive. Refuses a contradiction (`event_conflict`), never physics; a placement's signed orientation needs a `convex_hull` item (`invalid_event`, 1.10). */
 export function applyEvents(request:PackingRequest,events:RevisionEvent[]):PackingRequest;
+/** `request` with every made-to-measure box holding a fixed placement made the stock container `T@<revision>#<n>` cut for `approvedArtifact`. Throws `PlanRevisionError`. */
+export function stockCutBoxes(request:PackingRequest,approvedArtifact:OperationalArtifact,revision:number):PackingRequest;
 /** Every way the chain fails to be what its root and events derive, without stopping at the first. */
 export function verifyRevisionChain(revisions:PlanRevision[],artifacts?:(OperationalArtifact|null)[]|null):RevisionIssue[];
 /** `sha256:` and the lowercase hex SHA-256 of a document's canonical bytes. */

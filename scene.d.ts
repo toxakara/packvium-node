@@ -2,7 +2,7 @@
 //
 // visualizer/spec/scene.md and scene.schema.json are the contract: one scene is one container,
 // every length an exact tick string beside a display-only `mm` decimal.
-import type { PackingRequest, PackingResult } from './index.js';
+import type { Orientation, PackingRequest, PackingResult } from './index.js';
 
 export const SCENE_FORMAT: 'packvium-visualization-scene/v1';
 
@@ -10,7 +10,8 @@ export const SCENE_FORMAT: 'packvium-visualization-scene/v1';
 export interface SceneLength{ticks:string;mm:string}
 export interface ScenePoint{x:SceneLength;y:SceneLength;z:SceneLength}
 export interface SceneDimensions{length:SceneLength;width:SceneLength;height:SceneLength}
-export type SceneRotation='LWH'|'LHW'|'WLH'|'WHL'|'HLW'|'HWL';
+/** One of the 24 table codes (1.10); the item's `dimensions` are already its rotated envelope. */
+export type SceneRotation=Orientation;
 export interface SceneItem{id:string;position:ScenePoint;dimensions:SceneDimensions;rotation:SceneRotation}
 export interface SceneStep{step:number;item_id:string}
 

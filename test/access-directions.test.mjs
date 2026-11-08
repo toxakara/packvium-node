@@ -123,7 +123,7 @@ test('a non-string entry is refused', () => {
 
 test('with access_directions -x and stops, all items are packed', () => {
   const req = {
-    units: { length: 'mm', weight: 'g' },
+    units: { length: 'mm' },
     configuration: { solver_profile: 'fast' },
     containers: [{
       id: 'truck',

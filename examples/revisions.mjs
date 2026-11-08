@@ -121,3 +121,59 @@ console.log(`
   An edited request no longer equals what its parent's request and its own events
   produce, and any later revision would stop naming it as a parent. An event that
   contradicts the request is refused by name rather than applied as a best guess.`);
+
+// --------------------------------------------------------------------------------------
+section('5. A box already cut to measure becomes stock');
+
+// A box machine cuts each carton to its load. `void_fill_reserve_ratio` keeps a share of
+// the box free for dunnage: when the box cut tight to the load would break it, the
+// machine cuts a larger one instead.
+const machine = (reserve) => ({
+  id: 'machine', quantity: 3, cost_minor: 40,
+  inner_dimensions: { length: '610', width: '610', height: '610' },
+  made_to_measure: {
+    minimum: { length: '60', width: '60', height: '60' },
+    increment: { length: '25', width: '25', height: '25' },
+    cost_per_square_metre_minor: 1000,
+    outer_allowance: { length: '3', width: '3', height: '3' },
+  },
+  void_fill_reserve_ratio: reserve,
+});
+const cutRequest = (reserve) => ({
+  ...request,
+  items: [{ id: 'cube', quantity: 4, weight: '1 kg', dimensions: { length: '100', width: '100', height: '100' } }],
+  containers: [machine(reserve)],
+});
+const cutSize = (result) => {
+  const { length, width, height } = result.containers[0].inner_dimensions;
+  return `${length.value} x ${width.value} x ${height.value} mm`;
+};
+console.log(`  no reserve:  cut ${cutSize(pack(cutRequest(0)))}`);
+const cutRoot = rootRevision(cutRequest(0.3));
+const cutResult = pack(structuredClone(cutRoot.request));
+console.log(`  30% reserve: cut ${cutSize(cutResult)}`);
+
+// The box is cut and a cube is already in it when the order changes. A revision that
+// locks the cube cannot ask the machine to cut that box again: it turns the box into a
+// stock container named `<type>@<revision>#<instance>`, at the size, price and tare the
+// approved artifact recorded, and takes it from the machine's stock.
+const cutApproved = buildOperationalArtifact(cutRoot.request, cutResult);
+const inBox = cutResult.containers[0].placements[0];
+const cutRevision = deriveRevision(cutRoot, cutApproved, [{ sequence: 1, type: 'placement_locked', placement: {
+  item_type: 'cube', container_type: 'machine', container_instance: 1,
+  position: { x: inBox.position.x.value, y: inBox.position.y.value, z: inBox.position.z.value },
+  orientation: inBox.orientation, placement_id: inBox.placement_id,
+} }]);
+for (const container of cutRevision.request.containers) {
+  console.log(`  container ${container.id.padEnd(11)} quantity ${container.quantity}` +
+    `${container.made_to_measure ? ', cut to measure' : ''}`);
+}
+const restocked = pack(structuredClone(cutRevision.request));
+console.log(`  replan: ${restocked.containers.map((container) => `${container.id} holding ` +
+  `${container.placements.length}, ${container.placements.filter((placement) => placement.fixed).length} fixed`).join('; ')}`);
+console.log(`  audit with the artifact:    ${codes(verifyRevisionChain([cutRoot, cutRevision], [null, cutApproved]))}`);
+console.log(`  audit without the artifact: ${codes(verifyRevisionChain([cutRoot, cutRevision]))}`);
+console.log(`
+  The size of a box already cut is read from the approved artifact, so the audit can
+  only confirm that revision when it is given the artifact, and says so by name rather
+  than passing it unchecked. \`stockCutBoxes\` is the same step on its own.`);

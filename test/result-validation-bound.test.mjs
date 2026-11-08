@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 
-import { lowerBound } from '../result-validation/bound.js';
+import { lowerBound, objectiveLowerBound, smallestUnsorted } from '../result-validation/bound.js';
 import { validateWith } from '../index.js';
 
 const SCENE = new URL('../../../../conformance/scene/objective-bounds.json', import.meta.url);
@@ -21,7 +21,7 @@ const optional = (value) => (value === null ? null : BigInt(value));
 const runs = (instances, field) => instances.map((instance) => [integer(instance[field]), 1n])
   .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
 
-function sceneBound(scenario) {
+function sceneInputs(scenario) {
   const containers = scenario.containers.map((container) => ({
     innerVolume: integer(container.inner),
     baseArea: integer(container.base_area),
@@ -33,7 +33,18 @@ function sceneBound(scenario) {
     quantity: optional(container.quantity),
   }));
   const shrinks = scenario.instances.some((instance) => instance.shrinks);
-  return lowerBound(runs(scenario.instances, 'volume'), runs(scenario.instances, 'weight'), shrinks, containers);
+  return [runs(scenario.instances, 'volume'), runs(scenario.instances, 'weight'), shrinks, containers];
+}
+
+const sceneBound = (scenario) => lowerBound(...sceneInputs(scenario));
+
+/** Every covered objective's vector for one scenario, `null` where a ceiling withholds it. */
+function sceneObjectives(scenario) {
+  const values = () => scenario.instances.map((instance) => [integer(instance.value), 1n]);
+  return Object.fromEntries(Object.keys(scenario.objectives).map((objective) => {
+    const { bound } = objectiveLowerBound(objective, values, ...sceneInputs(scenario));
+    return [objective, bound && bound.map(Number)];
+  }));
 }
 
 if (!fs.existsSync(SCENE)) {
@@ -41,11 +52,22 @@ if (!fs.existsSync(SCENE)) {
 } else {
   test('the validator bound matches every case and refusal edge of the shared scene', () => {
     const scene = JSON.parse(fs.readFileSync(SCENE, 'utf8'));
+    assert.equal(scene.format, 'packvium-objective-bounds/v2');
     const disagreements = [...scene.cases, ...scene.edges]
       .map((scenario) => ({ name: scenario.name || scenario.fixture, computed: sceneBound(scenario), expected: scenario.bounds }))
       .filter(({ computed, expected }) => JSON.stringify(computed && computed.map(String)) !== JSON.stringify(expected && expected.map(String)));
     assert.deepEqual(disagreements, []);
     assert.ok(scene.cases.length + scene.edges.length > 400);
+  });
+
+  test('every covered objective\'s vector matches the shared scene', () => {
+    const scene = JSON.parse(fs.readFileSync(SCENE, 'utf8'));
+    const covered = ['default', 'lowest_cost', 'maximum_value', 'maximum_volume', 'open_dimension_height'];
+    const disagreements = [...scene.cases, ...scene.edges]
+      .filter((scenario) => JSON.stringify(Object.keys(scenario.objectives).sort()) !== JSON.stringify(covered)
+        || JSON.stringify(sceneObjectives(scenario)) !== JSON.stringify(scenario.objectives))
+      .map((scenario) => scenario.name || scenario.fixture);
+    assert.deepEqual(disagreements, []);
   });
 }
 
@@ -56,6 +78,58 @@ test('an unlimited capacity, a negative one and zero-volume instances are read a
   assert.deepEqual(lowerBound([[0n, 2n]], [[1n, 2n]], false, [container]), [2n, 0n, 0n, 0n, 0n]);
   assert.deepEqual(lowerBound([[0n, 2n]], [[1n, 2n]], false, [{ ...container, quantity: null }]), [0n, 1n, 3n, 1000000n, 0n]);
   assert.deepEqual(lowerBound([[1n, 1n]], [[0n, 1n]], false, []), [1n, 0n, 0n, 0n, 0n]);
+});
+
+test('each objective-only key is withheld or zero exactly where the reference says', () => {
+  const box = {
+    innerVolume: 1000n, baseArea: 100n, height: 10n, usable: 1000n, costMinor: 0n, payload: null, maxItems: null, quantity: 1n,
+  };
+  const three = [[600n, 3n]];
+  const valued = (values) => () => values;
+  const vector = (objective, volumes, shrinks, containers, values = valued([[0n, 3n]])) => (
+    objectiveLowerBound(objective, values, volumes, [[0n, 3n]], shrinks, containers));
+  assert.deepEqual(vector('maximum_value', three, false, [box], valued([[10n, 1n], [50n, 1n], [90n, 1n]])).bound, [2n, 60n, 1n, 0n, 400000n]);
+  assert.deepEqual(vector('maximum_value', three, false, [box], valued([[1n, 1n], [2n ** 53n - 1n, 2n]])),
+    { bound: null, withheld: 'the maximum_value key is past the portable ceiling' });
+  assert.deepEqual(vector('open_dimension_height', three, false, [box]).bound, [2n, 6n, 1n, 0n, 400000n]);
+  assert.deepEqual(vector('open_dimension_height', three, false, [{ ...box, baseArea: 0n }]).bound[1], 0n);
+  assert.deepEqual(vector('open_dimension_height', three, false, [{ ...box, usable: 0n }]).bound[1], 0n);
+  assert.deepEqual(vector('open_dimension_height', three, true, [box]).bound[1], 0n);
+  assert.deepEqual(vector('maximum_volume', three, false, [box]).bound, [444445n, 2n, 1n, 0n, 400000n]);
+  assert.deepEqual(vector('maximum_volume', three, false, [{ ...box, quantity: null }]).bound[0], 0n);
+  assert.deepEqual(vector('maximum_volume', [[0n, 3n]], false, [box]).bound[0], 0n);
+  assert.deepEqual(vector('maximum_volume', three, true, [box]).bound[0], 0n);
+  assert.deepEqual(vector('maximum_volume', [[10n ** 30n, 3n]], false, [box]),
+    { bound: null, withheld: 'the request is past a declared ceiling' });
+});
+
+test('the smallest values are selected from unsorted runs exactly as a sort would take them', () => {
+  const runsList = [[5n, 2n], [1n, 3n], [9n, 1n], [1n, 0n], [3n, 2n], [5n, 1n], [0n, 1n]];
+  const flat = runsList.flatMap(([value, count]) => Array.from({ length: Number(count) }, () => value))
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  for (let count = 0; count <= flat.length + 1; count += 1) {
+    const expected = flat.slice(0, count).reduce((total, value) => total + value, 0n);
+    assert.equal(smallestUnsorted(runsList, BigInt(count)), expected, `count ${count}`);
+    assert.equal(smallestUnsorted(runsList.slice().reverse(), BigInt(count)), expected, `reversed, count ${count}`);
+  }
+});
+
+test('maximum_value reads each item type\'s declared value from the request', () => {
+  const request = {
+    items: [
+      { id: 'cheap', quantity: 2, value: 3, dimensions: { length: '10', width: '10', height: '10' } },
+      { id: 'dear', value: 7, dimensions: { length: '10', width: '10', height: '10' } },
+      { id: 'free', dimensions: { length: '10', width: '10', height: '10' } },
+    ],
+    containers: [{ id: 'box', quantity: 1, inner_dimensions: { length: '20', width: '10', height: '10' } }],
+    configuration: { objective: 'maximum_value' },
+  };
+  const packed = validateWith(null, request, { ...result({ code: 'not_proven', lower_bound: [2, 3] }), score: [2, 3, 1, 0, 1000000] })
+    .map((found) => found.code);
+  assert.ok(!packed.includes('optimality_bound_mismatch'), packed.join());
+  const forged = validateWith(null, request, { ...result({ code: 'not_proven', lower_bound: [2, 4] }), score: [2, 4, 1, 0, 1000000] })
+    .map((found) => found.code);
+  assert.ok(forged.includes('optimality_bound_mismatch'), forged.join());
 });
 
 /** One cube in a box for two: attains every position but the height, 1000000 against 500000. */
@@ -106,6 +180,7 @@ function result(optimality) {
       used_volume_ticks3: String(1000 * MM3),
       centre_of_mass_offset_ppm: 0,
       placements: [{
+        placement_id: '["box#1",0,0,0,"cube","LWH"]',
         item_id: 'cube#1',
         item_type: 'cube',
         orientation: 'LWH',
